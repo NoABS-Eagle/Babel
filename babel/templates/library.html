@@ -1,0 +1,78 @@
+{% extends "layout.html" %}
+{% block title %}{{ lib_name }} — Babel{% endblock %}
+
+{% block body %}
+<div class="card save-as-card">
+  <div class="card-title">Сохранить как</div>
+  <div class="save-as-row">
+    <a href="/export?format=swlib" class="save-btn swift" download>
+      <span class="save-icon">↓</span>
+      <span class="save-label">swift</span>
+      <span class="save-ext">.swlib</span>
+    </a>
+    <a href="/export?format=lbr" class="save-btn eagle" download>
+      <span class="save-icon">↓</span>
+      <span class="save-label">Eagle</span>
+      <span class="save-ext">.lbr</span>
+    </a>
+    <a href="/export?format=kicad" class="save-btn kicad" download>
+      <span class="save-icon">↓</span>
+      <span class="save-label">KiCad</span>
+      <span class="save-ext">.zip</span>
+    </a>
+    <span class="save-btn altium disabled" title="Скоро">
+      <span class="save-icon">↓</span>
+      <span class="save-label">Altium</span>
+      <span class="save-ext">.SchLib</span>
+    </span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">Components ({{ components|length }})</div>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Symbol</th>
+        <th>Footprints</th>
+        <th>Pins</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in components %}
+      <tr>
+        <td><a href="/library/{{ c.id }}">{{ c.id }}</a></td>
+        <td>
+          {% if c.has_symbol %}
+            <span class="badge ok">✓</span>
+          {% else %}
+            <span class="badge err">✗</span>
+          {% endif %}
+        </td>
+        <td>
+          {% for fp in c.footprints %}
+            <span class="badge">{{ fp }}</span>
+          {% endfor %}
+        </td>
+        <td>{{ c.pin_count }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if orphans %}
+<div class="card">
+  <div class="card-title">Orphan Footprints ({{ orphans|length }}) <span class="badge warn" style="vertical-align:middle">без символа</span></div>
+  <div class="artifact-grid">
+    {% for name in orphans %}
+    <div class="artifact-btn passive" style="min-width:0">
+      <span class="artifact-icon">📦</span>
+      <span class="artifact-name">{{ name }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+
+# Runtime session cache (babel/app.py) — regenerated per session, not source
+babel/.session.3d/
+babel/.session.ir.xml
+
+# Downloaded at first run by _ensure_3d_assets() in babel/app.py
+babel/static/occt-import-js.js
+babel/static/occt-import-js.wasm
+
+# Third-party installer, unrelated to source
+accessdatabaseengine_X64.exe
+
+# Generated exporter output (regenerate via babel/altium_exporter.py etc.)
+testData/out/
+
+# Eagle editor auto-backup files (.l#1, .l#2, .s#1, ...)
+*.l#*
+*.s#*
+*.b#*

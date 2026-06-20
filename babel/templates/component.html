@@ -1,0 +1,85 @@
+{% extends "layout.html" %}
+{% block title %}{{ comp_id }} — Babel{% endblock %}
+
+{% block head %}
+{% if footprints | selectattr('step_url') | list %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js"></script>
+<script src="/static/occt-import-js.js"></script>
+<script src="/static/model3d.js"></script>
+<style>
+  .viewer3d-wrap { margin-top: 16px; }
+  .viewer3d-label { color: var(--muted); font-size: 11px; text-transform: uppercase;
+                    letter-spacing: 1px; margin-bottom: 6px; }
+  canvas.viewer3d { border: 1px solid var(--border); border-radius: 4px;
+                    display: block; max-width: 100%; }
+</style>
+{% endif %}
+{% endblock %}
+
+{% block body %}
+<nav class="back"><a href="/library">← Library</a></nav>
+<h2 class="comp-name">{{ comp_id }}</h2>
+
+<div class="grid-2">
+  <!-- Symbol -->
+  <div class="card">
+    <div class="card-title">Symbol</div>
+    {% if sym_svg %}
+      <div style="text-align:center">{{ sym_svg|safe }}</div>
+    {% else %}
+      <span class="badge warn">No symbol</span>
+    {% endif %}
+  </div>
+
+  <!-- Attributes -->
+  <div class="card">
+    <div class="card-title">Attributes</div>
+    <table>
+      <thead><tr><th>Name</th><th>Value</th></tr></thead>
+      <tbody>
+        {% for a in attributes %}
+        <tr>
+          <td class="attr-name">{{ a.name }}</td>
+          <td class="attr-value">{{ a.value or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Footprints -->
+<div class="card">
+  <div class="card-title">Footprints ({{ footprints|length }})</div>
+  {% for fp in footprints %}
+  <div style="margin-bottom:24px; border-bottom:1px solid var(--border); padding-bottom:24px">
+    <div style="color:var(--accent); margin-bottom:12px; font-size:13px">{{ fp.id }}</div>
+    <div class="fp-card">
+      <div class="svg-wrap">
+        {{ fp.svg|safe }}
+        {% if fp.step_url %}
+        <div class="viewer3d-wrap">
+          <div class="viewer3d-label">3D</div>
+          <canvas class="viewer3d" data-step-url="{{ fp.step_url }}"
+                  width="300" height="260"></canvas>
+        </div>
+        {% endif %}
+      </div>
+      <div class="fp-table">
+        <table>
+          <thead><tr><th>Pin</th><th>Pad</th></tr></thead>
+          <tbody>
+            {% for m in fp.pin_map %}
+            <tr>
+              <td>{{ m.pin }}</td>
+              <td>{{ m.pad }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

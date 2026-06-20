@@ -1,0 +1,56 @@
+{% extends "layout.html" %}
+{% block title %}KiCad Import — Babel{% endblock %}
+
+{% block body %}
+<nav class="back"><a href="/">← Workspace</a></nav>
+<h2 class="page-title">Импорт KiCad библиотеки</h2>
+
+<div class="card">
+  <div class="card-title">Шаг 1 — Символы</div>
+  <div class="artifact-btn kicad selected passive">
+    <span class="artifact-icon">Ω</span>
+    <span class="artifact-name">{{ sym_name }}</span>
+    <span class="badge ok">выбрано</span>
+  </div>
+</div>
+
+{% if not_yet %}
+<div class="card">
+  <div class="empty-msg">
+    KiCad-парсер ещё в разработке. Скоро!
+  </div>
+</div>
+
+{% elif fp_libs %}
+<div class="card">
+  <div class="card-title">Шаг 2 — Папка с футпринтами</div>
+  <div class="empty-msg" style="margin-bottom: 12px">
+    Babel сопоставит символы с футпринтами по имени,
+    игнорируя префикс библиотеки KiCad.
+  </div>
+  <form action="/import/kicad" method="post">
+    <input type="hidden" name="sym_path" value="{{ sym_path }}">
+    <div class="artifact-grid">
+      {% for fp in fp_libs %}
+      <button type="submit" name="fp_path" value="{{ fp.paths[0] }}"
+              class="artifact-btn kicad">
+        <span class="artifact-icon">📦</span>
+        <span class="artifact-name">{{ fp.label }}</span>
+      </button>
+      {% endfor %}
+    </div>
+  </form>
+</div>
+
+{% else %}
+<div class="card">
+  <div class="card-title">Шаг 2 — Папка с футпринтами</div>
+  <div class="empty-msg">
+    Папок с .kicad_mod файлами не найдено рядом с символами.<br>
+    Убедись, что папка с футпринтами находится в той же директории,
+    и открой workspace заново.
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}
