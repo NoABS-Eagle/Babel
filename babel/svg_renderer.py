@@ -225,6 +225,66 @@ def _pad_label(x_ir, y_ir, name, x_min, y_max, scale):
 
 
 # ---------------------------------------------------------------------------
+# Placeholder resolution + pin number lookup (shared by render_symbol and
+# render_schematic)
+# ---------------------------------------------------------------------------
+
+def _component_attrs(comp_el):
+    """{attr_name: value} from <component>/<attributes>."""
+    attrs_el = comp_el.find('attributes')
+    if attrs_el is None:
+        return {}
+    return {a.get('name'): a.get('value', '') for a in attrs_el.findall('attr')}
+
+
+def _resolve_placeholder(txt, designator, attrs):
+    """`>NAME`/`>VALUE`/`>whatever` -> the real value if one is set, else the
+    literal placeholder text unchanged — per the user, a placeholder is only
+    ever shown literally when there's genuinely nothing to substitute (see
+    ir_schema.md "Component instance": resolution order is instance override
+    -> component attribute -> literal placeholder).
+
+    `designator` may be None (library-only preview, no placed instance to
+    substitute `>NAME` with — left as the literal placeholder there, same
+    "nothing to show" case).
+    """
+    if not txt.startswith('>'):
+        return txt
+    key = txt[1:]
+    if key == 'NAME':
+        return designator if designator else txt
+    value = attrs.get(key.lower())
+    return value if value else txt
+
+
+def _pin_pad_map(comp_el, gate_letter=None):
+    """{ir_pin_name: pad_designator} from the first <footprint>'s
+    <pin-mapping> — same "first/representative" convention already used for
+    picking a gate to preview. A component without a footprint at all
+    (power-flag/frame symbols) has no pad mapping, same as real Eagle: a
+    device without a package can't show a pad number either.
+    """
+    fp_el = comp_el.find('footprint')
+    if fp_el is None:
+        return {}
+    pm_el = fp_el.find('pin-mapping')
+    if pm_el is None:
+        return {}
+    prefix = f'{gate_letter}.' if gate_letter else ''
+    out = {}
+    for m in pm_el.findall('map'):
+        pin = m.get('pin', '')
+        if gate_letter:
+            if not pin.startswith(prefix):
+                continue
+            pin = pin[len(prefix):]
+        elif '.' in pin:
+            continue
+        out[pin] = m.get('pad', '')
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -236,12 +296,17 @@ def render_symbol(comp_el, root, scale=10):
     pool = symbol_pool(root)
     gates = component_gates(comp_el)
     sym_el = None
-    for _gname, sname in gates:
+    gate_letter = None
+    for gname, sname in gates:
         sym_el = pool.get(sname)
         if sym_el is not None:
+            gate_letter = gname
             break
     if sym_el is None:
         return '<svg xmlns="http://www.w3.org/2000/svg"><text fill="red">no symbol</text></svg>'
+
+    attrs = _component_attrs(comp_el)
+    pad_map = _pin_pad_map(comp_el, gate_letter)
 
     all_els = list(sym_el)
     x_min, x_max, y_min, y_max = _bounds(all_els)
@@ -284,8 +349,9 @@ def render_symbol(comp_el, root, scale=10):
             out.append(f'<polygon points="{pts_str}" fill="{_SYM_BODY}" stroke="none"/>')
 
         elif t == 'text':
+            txt = _resolve_placeholder(el.text or '', None, attrs)
             out.append(_text(_v(el.get('x')), _v(el.get('y')),
-                              el.text or '', _v(el.get('size', '1270')),
+                              txt, _v(el.get('size', '1270')),
                               float(el.get('rot', 0)), el.get('align', 'bottom-left'),
                               _SYM_NAMES, **kw))
 
@@ -295,6 +361,8 @@ def render_symbol(comp_el, root, scale=10):
             length = _v(el.get('length', '2540'))
             direction = el.get('direction', 'pas')
             name = el.get('name', '')
+            pinvis = el.get('pinvis', '1') == '1'
+            padvis = el.get('padvis', '1') == '1'
 
             rad = math.radians(rot)
             ex = px + length * math.cos(rad)
@@ -306,9 +374,11 @@ def render_symbol(comp_el, root, scale=10):
             out.append(_line(pxs, pys, exs, eys, pc, pin_lw))
             out.append(f'<circle cx="{pxs:.1f}" cy="{pys:.1f}" r="{pin_lw * 1.5:.1f}" fill="{pc}"/>')
 
-            if name:
-                cos_r = math.cos(rad)
-                ta = 'end' if cos_r > 0.01 else ('start' if cos_r < -0.01 else 'middle')
+            cos_r = math.cos(rad)
+            ta = 'end' if cos_r > 0.01 else ('start' if cos_r < -0.01 else 'middle')
+            ta_inner = 'start' if cos_r > 0.01 else ('end' if cos_r < -0.01 else 'middle')
+
+            if pinvis and name:
                 # place label outside body (opposite to stub direction), 0.8mm offset
                 nx, ny = px - 0.8 * math.cos(rad), py - 0.8 * math.sin(rad)
                 nxs, nys = _tr(nx, ny, **kw)
@@ -317,8 +387,402 @@ def render_symbol(comp_el, root, scale=10):
                             f'font-family="monospace" fill="{pc}" text-anchor="{ta}" '
                             f'dominant-baseline="central">{name}</text>')
 
+            if padvis:
+                pad = pad_map.get(name, '')
+                if pad:
+                    # number sits toward the body end, opposite side from name
+                    nx, ny = px + 0.6 * math.cos(rad), py + 0.6 * math.sin(rad)
+                    nxs, nys = _tr(nx, ny, **kw)
+                    sp = max(scale * 0.8, 6)
+                    out.append(f'<text x="{nxs:.1f}" y="{nys:.1f}" font-size="{sp:.0f}" '
+                                f'font-family="monospace" fill="{_SYM_INFO}" text-anchor="{ta_inner}" '
+                                f'dominant-baseline="central">{pad}</text>')
+
     out.append('</svg>')
     return '\n'.join(out)
+
+
+# ---------------------------------------------------------------------------
+# Schematic canvas (.swprj <schematic>: placed <instance>s + <net>s)
+# ---------------------------------------------------------------------------
+
+_NET_WIRE = '#66DD66'
+_NET_LABEL = '#FFAA33'
+_DESIGNATOR_COLOR = '#88CCFF'
+
+
+def _inst_point(x, y, inst):
+    """Symbol-local mm (Y-up) -> absolute canvas mm (Y-up), via this
+    instance's placement. Same mirror-then-rotate composition as
+    kicad_schematic.py's KiCad-side transform, just without that module's
+    extra Y-down/Y-up detour — IR's own canvas is already Y-up everywhere,
+    symbol-local included, so no flip is needed here at all.
+    """
+    if inst['mirror']:
+        x = -x
+    rad = math.radians(inst['rot'])
+    xr = x * math.cos(rad) - y * math.sin(rad)
+    yr = x * math.sin(rad) + y * math.cos(rad)
+    return inst['x'] + xr, inst['y'] + yr
+
+
+def _inst_dir_angle(angle_deg, inst):
+    """Direction (not position) transform for this instance — same
+    mirror-then-rotate as _inst_point, just on a unit vector instead of a
+    point (no translation to apply). Used for anything carrying its own
+    rotation (pin stub via two transformed points instead, text/arc via
+    this) so the math is derived once, not re-guessed per primitive.
+    """
+    rad = math.radians(angle_deg)
+    dx, dy = math.cos(rad), math.sin(rad)
+    if inst['mirror']:
+        dx = -dx
+    rrad = math.radians(inst['rot'])
+    dxr = dx * math.cos(rrad) - dy * math.sin(rrad)
+    dyr = dx * math.sin(rrad) + dy * math.cos(rrad)
+    return math.degrees(math.atan2(dyr, dxr)) % 360
+
+
+def render_schematic(root, scale=8, canvas_el=None):
+    """Render a project's `<schematic>` (placed `<instance>`s + `<net>`s) to
+    one SVG — sanity-check view for the KiCad project importer, not a
+    polished schematic renderer (no de-overlap of text, no print frame).
+
+    `canvas_el` overrides which canvas to draw: pass a `<module>` element
+    to render that module's own inner canvas instead of the top-level
+    `<schematic>` (same content model — ir_schema.md "Модуль": внутри — та
+    же структура, что у <schematic>; the module's <port> children are
+    simply not instances/nets and are skipped by the loops below).
+    """
+    schem_el = canvas_el if canvas_el is not None else root.find('schematic')
+    if schem_el is None:
+        return '<svg xmlns="http://www.w3.org/2000/svg"><text fill="red">no schematic</text></svg>'
+
+    pool = symbol_pool(root)
+
+    instances = []
+    for inst_el in schem_el.findall('instance'):
+        comp_el = root.find(f'.//component[@name="{inst_el.get("component")}"]')
+        if comp_el is None:
+            continue
+        sym_el = None
+        gate_letter = None
+        for gname, sname in component_gates(comp_el):
+            sym_el = pool.get(sname)
+            if sym_el is not None:
+                gate_letter = gname
+                break
+        if sym_el is None:
+            continue
+
+        designator = inst_el.get('name', '')
+        # Instance overrides take priority over the component's own
+        # (shared, device-level) attributes — see ir_schema.md "Component
+        # instance" resolution order.
+        attrs = dict(_component_attrs(comp_el))
+        attrs.update({a.get('name'): a.get('value', '') for a in inst_el.findall('attr')})
+
+        instances.append({
+            'sym_el': sym_el,
+            'x': _v(inst_el.get('x')), 'y': _v(inst_el.get('y')),
+            'rot': float(inst_el.get('rot', 0)),
+            'mirror': inst_el.get('mirror', '0') == '1',
+            'name': designator,
+            'attrs': attrs,
+            'pad_map': _pin_pad_map(comp_el, gate_letter),
+        })
+
+    # Collect drawable primitives in absolute mm first (tracking bounds as
+    # we go), then size/scale the SVG once and draw — same two-pass shape
+    # render_symbol/render_footprint use, just across many instances+nets
+    # instead of one local symbol frame.
+    prims = []
+    xs, ys = [], []
+
+    def _track(x, y):
+        xs.append(x)
+        ys.append(y)
+
+    for inst in instances:
+        for el in inst['sym_el']:
+            t = el.tag
+            if t == 'line':
+                x1, y1 = _inst_point(_v(el.get('x1')), _v(el.get('y1')), inst)
+                x2, y2 = _inst_point(_v(el.get('x2')), _v(el.get('y2')), inst)
+                _track(x1, y1); _track(x2, y2)
+                prims.append(('line', x1, y1, x2, y2, _v(el.get('width', '152')), _SYM_BODY))
+            elif t == 'arc':
+                cx, cy = _inst_point(_v(el.get('cx')), _v(el.get('cy')), inst)
+                r = _v(el.get('r'))
+                start = _inst_dir_angle(float(el.get('start')), inst)
+                sweep = -float(el.get('sweep')) if inst['mirror'] else float(el.get('sweep'))
+                _track(cx - r, cy - r); _track(cx + r, cy + r)
+                prims.append(('arc', cx, cy, r, start, sweep, _v(el.get('width', '152'))))
+            elif t == 'shape':
+                x, y = _inst_point(_v(el.get('x')), _v(el.get('y')), inst)
+                w, h = _v(el.get('w')), _v(el.get('h'))
+                rot = _inst_dir_angle(float(el.get('rot', 0)), inst)
+                d = math.hypot(w, h) / 2
+                _track(x - d, y - d); _track(x + d, y + d)
+                prims.append(('shape', x, y, w, h, int(el.get('roundness', 0)),
+                              _v(el.get('outline', '0')), rot))
+            elif t == 'polygon':
+                vs = [_inst_point(_v(v.get('x')), _v(v.get('y')), inst) for v in el.findall('vertex')]
+                for vx, vy in vs:
+                    _track(vx, vy)
+                prims.append(('polygon', vs))
+            elif t == 'text':
+                x, y = _inst_point(_v(el.get('x')), _v(el.get('y')), inst)
+                rot = _inst_dir_angle(float(el.get('rot', 0)), inst)
+                txt = _resolve_placeholder(el.text or '', inst['name'], inst['attrs'])
+                _track(x, y)
+                prims.append(('text', x, y, txt, _v(el.get('size', '1270')),
+                              rot, el.get('align', 'bottom-left'), _SYM_NAMES))
+            elif t == 'pin':
+                px, py = _v(el.get('x')), _v(el.get('y'))
+                rad = math.radians(float(el.get('rot', 0)))
+                length = _v(el.get('length', '2540'))
+                ax, ay = _inst_point(px, py, inst)
+                bx, by = _inst_point(px + length * math.cos(rad), py + length * math.sin(rad), inst)
+                name = el.get('name', '')
+                pinvis = el.get('pinvis', '1') == '1'
+                padvis = el.get('padvis', '1') == '1'
+                pad = inst['pad_map'].get(name, '') if padvis else ''
+                # Name/pad offset points computed in LOCAL space (same 0.8/
+                # 0.6mm convention as render_symbol), then transformed —
+                # an isometry (rotate+optional reflect), so the offset
+                # survives the instance transform unchanged in magnitude.
+                nx, ny = _inst_point(px - 0.8 * math.cos(rad), py - 0.8 * math.sin(rad), inst) \
+                    if pinvis and name else (None, None)
+                qx, qy = _inst_point(px + 0.6 * math.cos(rad), py + 0.6 * math.sin(rad), inst) \
+                    if pad else (None, None)
+                _track(ax, ay); _track(bx, by)
+                if nx is not None:
+                    _track(nx, ny)
+                if qx is not None:
+                    _track(qx, qy)
+                prims.append(('pin', ax, ay, bx, by, el.get('direction', 'pas'),
+                              name if pinvis else '', nx, ny, pad, qx, qy))
+
+        ox, oy = _inst_point(0, 0, inst)
+        _track(ox, oy)
+        prims.append(('designator', ox, oy, inst['name']))
+
+    # Module instances (ir_schema.md "Модуль") — drawn as the block
+    # rectangle the module declares (dx/dy, origin = center) with its ports
+    # as dots+names on the edges; the module's INNER content is a separate
+    # canvas, not rendered here (pass the <module> element as canvas_el to
+    # see it).
+    for inst_el in schem_el.findall('instance'):
+        mod_name = inst_el.get('module')
+        if not mod_name:
+            continue
+        mod_el = root.find(f'module[@name="{mod_name}"]')
+        if mod_el is None:
+            continue
+        inst = {'x': _v(inst_el.get('x')), 'y': _v(inst_el.get('y')),
+                'rot': float(inst_el.get('rot', 0)),
+                'mirror': inst_el.get('mirror', '0') == '1'}
+        dxm, dym = _v(mod_el.get('dx')), _v(mod_el.get('dy'))
+        x, y = inst['x'], inst['y']
+        half_diag = math.hypot(dxm, dym) / 2
+        _track(x - half_diag, y - half_diag)
+        _track(x + half_diag, y + half_diag)
+        prims.append(('shape', x, y, dxm, dym, 0, _v('152'),
+                      _inst_dir_angle(0, inst)))
+        prims.append(('text', x, y, f"{inst_el.get('name', '')}: {mod_name}",
+                      _v('1270'), 0, 'center', _SYM_NAMES))
+        for p in mod_el.findall('port'):
+            # side/coord -> block-local point (coord is measured from the
+            # block CENTER along the edge, ir_schema.md "Модуль"), then the
+            # same instance transform as any symbol-local geometry.
+            side, coord = p.get('side'), _v(p.get('coord'))
+            local = {'left': (-dxm / 2, coord), 'right': (dxm / 2, coord),
+                     'top': (coord, dym / 2), 'bottom': (coord, -dym / 2)}.get(side)
+            if local is None:
+                continue
+            ax, ay = _inst_point(local[0], local[1], inst)
+            _track(ax, ay)
+            prims.append(('junction', ax, ay))
+            prims.append(('text', ax, ay, p.get('name', ''), _v('1270'),
+                          0, 'bottom-left', _SYM_NAMES))
+
+    for net_el in schem_el.findall('net'):
+        for seg_el in net_el.findall('segment'):
+            for line_el in seg_el.findall('line'):
+                x1, y1 = _v(line_el.get('x1')), _v(line_el.get('y1'))
+                x2, y2 = _v(line_el.get('x2')), _v(line_el.get('y2'))
+                _track(x1, y1); _track(x2, y2)
+                w = _v(line_el.get('width', '0')) or _v('152')
+                prims.append(('line', x1, y1, x2, y2, w, _NET_WIRE))
+            for j_el in seg_el.findall('junction'):
+                jx, jy = _v(j_el.get('x')), _v(j_el.get('y'))
+                _track(jx, jy)
+                prims.append(('junction', jx, jy))
+            for l_el in seg_el.findall('label'):
+                lx, ly = _v(l_el.get('x')), _v(l_el.get('y'))
+                _track(lx, ly)
+                prims.append(('label', lx, ly, net_el.get('name', ''),
+                              _v(l_el.get('size', '1270')), float(l_el.get('rot', 0))))
+
+    # Decorative canvas geometry — direct <line>/<shape>/<arc> children of
+    # <schematic> itself (ir_schema.md "Декоративная геометрия схемы"),
+    # not inside any <instance>/<net> — drawn in the GRAPHIC color, same
+    # primitive shapes as symbol-body geometry, just already in absolute
+    # canvas mm (no instance transform to apply).
+    for el in schem_el:
+        t = el.tag
+        if t == 'line':
+            x1, y1 = _v(el.get('x1')), _v(el.get('y1'))
+            x2, y2 = _v(el.get('x2')), _v(el.get('y2'))
+            _track(x1, y1); _track(x2, y2)
+            prims.append(('line', x1, y1, x2, y2, _v(el.get('width', '152')), _SYM_INFO))
+        elif t == 'arc':
+            cx, cy = _v(el.get('cx')), _v(el.get('cy'))
+            r = _v(el.get('r'))
+            _track(cx - r, cy - r); _track(cx + r, cy + r)
+            prims.append(('arc', cx, cy, r, float(el.get('start', 0)),
+                          float(el.get('sweep', 360)), _v(el.get('width', '152'))))
+        elif t == 'shape':
+            x, y = _v(el.get('x')), _v(el.get('y'))
+            w, h = _v(el.get('w')), _v(el.get('h'))
+            d = math.hypot(w, h) / 2
+            _track(x - d, y - d); _track(x + d, y + d)
+            prims.append(('shape', x, y, w, h, int(el.get('roundness', 0)),
+                          _v(el.get('outline', '0')), float(el.get('rot', 0))))
+        elif t == 'text' and el.text:
+            # Decorative canvas text — only elements WITH content:
+            # placeholder <text> lives inside symbols, never here.
+            x, y = _v(el.get('x')), _v(el.get('y'))
+            _track(x, y)
+            prims.append(('text', x, y, el.text, _v(el.get('size', '1270')),
+                          float(el.get('rot', 0)), el.get('align', 'bottom-left'),
+                          _SYM_INFO))
+        elif t == 'note' and el.text:
+            # <note> (markdown, ir_schema.md) — sanity-view rendering only:
+            # dashed-ish bounding hint via the top edge + raw markdown text
+            # (no markdown rendering here; that's the future editor's job).
+            x, y = _v(el.get('x')), _v(el.get('y'))
+            w = _v(el.get('w'))
+            _track(x, y); _track(x + w, y)
+            prims.append(('line', x, y, x + w, y, _v('76'), _SYM_INFO))
+            prims.append(('text', x, y, el.text, _v('1270'),
+                          float(el.get('rot', 0)), 'top-left', _SYM_INFO))
+
+    if not xs:
+        return '<svg xmlns="http://www.w3.org/2000/svg"><text fill="red">empty schematic</text></svg>'
+
+    x_min, x_max, y_min, y_max = min(xs), max(xs), min(ys), max(ys)
+    w_mm = max(x_max - x_min, 1.0)
+    h_mm = max(y_max - y_min, 1.0)
+    scale = min(scale, 2000 / (w_mm + 2 * _MARGIN), 2000 / (h_mm + 2 * _MARGIN))
+    W = int((w_mm + 2 * _MARGIN) * scale)
+    H = int((h_mm + 2 * _MARGIN) * scale)
+    kw = dict(x_min=x_min, y_max=y_max, scale=scale)
+    pin_lw = max(scale * 0.08, 0.8)
+    junction_r = max(scale * 0.12, 1.5)
+
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">',
+           f'<rect width="{W}" height="{H}" fill="{_BG}"/>']
+
+    for p in prims:
+        kind = p[0]
+        if kind == 'line':
+            _, x1, y1, x2, y2, w, color = p
+            x1s, y1s = _tr(x1, y1, **kw)
+            x2s, y2s = _tr(x2, y2, **kw)
+            out.append(_line(x1s, y1s, x2s, y2s, color, max(w * scale, 0.5)))
+        elif kind == 'arc':
+            _, cx, cy, r, start, sweep, w = p
+            out.append(_arc(cx, cy, r, start, sweep, _SYM_BODY, max(w * scale, 0.5), **kw))
+        elif kind == 'shape':
+            _, x, y, w, h, roundness, outline, rot = p
+            xs2, ys2 = _tr(x, y, **kw)
+            wp, hp = w * scale, h * scale
+            filled = (outline == 0)
+            fc = _SYM_BODY if filled else 'none'
+            sw = max(outline * scale, 0.5) if not filled else 0
+            rot_attr = f' transform="rotate({-rot:.1f},{xs2:.1f},{ys2:.1f})"' if rot else ''
+            if roundness == 100:
+                out.append(f'<circle cx="{xs2:.1f}" cy="{ys2:.1f}" r="{wp/2:.1f}" '
+                           f'stroke="{_SYM_BODY}" stroke-width="{sw:.1f}" fill="{fc}"{rot_attr}/>')
+            else:
+                rx = (roundness / 100) * min(wp, hp) / 2
+                out.append(f'<rect x="{xs2-wp/2:.1f}" y="{ys2-hp/2:.1f}" width="{wp:.1f}" height="{hp:.1f}" '
+                           f'rx="{rx:.1f}" stroke="{_SYM_BODY}" stroke-width="{sw:.1f}" fill="{fc}"{rot_attr}/>')
+        elif kind == 'polygon':
+            coords = [_tr(vx, vy, **kw) for vx, vy in p[1]]
+            pts_str = ' '.join(f'{xs2:.1f},{ys2:.1f}' for xs2, ys2 in coords)
+            out.append(f'<polygon points="{pts_str}" fill="{_SYM_BODY}" stroke="none"/>')
+        elif kind == 'text':
+            _, x, y, txt, size, rot, align, color = p
+            out.append(_text(x, y, txt, size, rot, align, color, **kw))
+        elif kind == 'pin':
+            _, ax, ay, bx, by, direction, name, nx, ny, pad, qx, qy = p
+            axs, ays = _tr(ax, ay, **kw)
+            bxs, bys = _tr(bx, by, **kw)
+            pc = _PIN_COLORS.get(direction, '#aaaaaa')
+            out.append(_line(axs, ays, bxs, bys, pc, pin_lw))
+            out.append(f'<circle cx="{axs:.1f}" cy="{ays:.1f}" r="{pin_lw*1.5:.1f}" fill="{pc}"/>')
+
+            # Anchor from the TRANSFORMED stub direction (bx-ax), not the
+            # symbol-local rot — after an arbitrary instance rotation/mirror
+            # the local angle no longer says which screen-side the body is
+            # on, but _tr never flips X, so the absolute-mm delta does.
+            dx = bx - ax
+            ta = 'end' if dx > 0.01 else ('start' if dx < -0.01 else 'middle')
+            ta_inner = 'start' if dx > 0.01 else ('end' if dx < -0.01 else 'middle')
+
+            if name and nx is not None:
+                nxs, nys = _tr(nx, ny, **kw)
+                sp = max(scale * 0.9, 7)
+                out.append(f'<text x="{nxs:.1f}" y="{nys:.1f}" font-size="{sp:.0f}" '
+                           f'font-family="monospace" fill="{pc}" text-anchor="{ta}" '
+                           f'dominant-baseline="central">{name}</text>')
+            if pad and qx is not None:
+                qxs, qys = _tr(qx, qy, **kw)
+                sp = max(scale * 0.8, 6)
+                out.append(f'<text x="{qxs:.1f}" y="{qys:.1f}" font-size="{sp:.0f}" '
+                           f'font-family="monospace" fill="{_SYM_INFO}" text-anchor="{ta_inner}" '
+                           f'dominant-baseline="central">{pad}</text>')
+        elif kind == 'designator':
+            _, x, y, name = p
+            xs2, ys2 = _tr(x, y, **kw)
+            out.append(f'<text x="{xs2:.1f}" y="{ys2 - scale * 1.2:.1f}" '
+                       f'font-size="{max(scale * 0.9, 7):.0f}" font-family="monospace" '
+                       f'fill="{_DESIGNATOR_COLOR}" text-anchor="middle">{name}</text>')
+        elif kind == 'junction':
+            _, jx, jy = p
+            jxs, jys = _tr(jx, jy, **kw)
+            out.append(f'<circle cx="{jxs:.1f}" cy="{jys:.1f}" r="{junction_r:.1f}" fill="{_NET_WIRE}"/>')
+        elif kind == 'label':
+            _, lx, ly, name, size, rot = p
+            out.append(_text(lx, ly, name, size, rot, 'bottom-left', _NET_LABEL, **kw))
+
+    out.append('</svg>')
+    return '\n'.join(out)
+
+
+def render_all_symbols(root, out_dir, scale=10):
+    """render_symbol() for every <component> directly under root (works for
+    both a `.swlib` <library> and a `.swprj` <project> — components sit at
+    the same depth in both), written one file per component into out_dir.
+
+    A quick browseable gallery — looking at one symbol in isolation (e.g.
+    "is this 48-pin MCU's layout actually sane?") beats squinting at it
+    buried inside a whole rendered schematic.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for comp in root.findall('component'):
+        if not component_gates(comp):
+            continue   # no symbol at all (shouldn't happen, but be defensive)
+        svg = render_symbol(comp, root, scale=scale)
+        p = out_dir / f'{comp.get("name")}.svg'
+        p.write_text(svg, encoding='utf-8')
+        written.append(p)
+    return written
 
 
 def render_footprint(fp_el, scale=20, fixed_size=None):
@@ -433,6 +897,19 @@ if __name__ == '__main__':
 
     tree = ET.parse(ir_path)
     root = tree.getroot()
+
+    symbols_dir = Path('outputs') / f'{Path(ir_path).stem}_symbols'
+    written = render_all_symbols(root, symbols_dir)
+    print(f'Written: {len(written)} symbol SVG(s) in {symbols_dir}')
+
+    if root.find('schematic') is not None:
+        svg = render_schematic(root)
+        out_p = Path('outputs') / f'{Path(ir_path).stem}_schematic.svg'
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(svg, encoding='utf-8')
+        print(f'Written: {out_p}')
+        sys.exit(0)
+
     comp = (root.find(f'.//component[@name="{comp_name}"]') if comp_name
             else root.find('.//component'))
 

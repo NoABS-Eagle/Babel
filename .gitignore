@@ -19,3 +19,16 @@ testData/out/
 *.l#*
 *.s#*
 *.b#*
+
+# KiCad local-history plugin artifacts (embedded git repos, break `git add`)
+.history/
+
+# KiCad lock files
+~*.lck
+*.lck
+
+# Test-run output (regenerated each run — feedback_outputs_dir)
+outputs/
+
+# Official KiCad symbol library (reference only — re-download from GitLab)
+testData/kicad-symbols-master/

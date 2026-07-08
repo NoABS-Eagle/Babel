@@ -1,0 +1,309 @@
+(footprint "HVSON-8-1EP_3x3mm_P0.65mm_EP1.6x2.4mm"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(descr "HVSON, 8 Pin (https://www.nxp.com/docs/en/data-sheet/TJA1051.pdf#page=16), generated with kicad-footprint-generator ipc_noLead_generator.py")
+	(tags "HVSON NoLead")
+	(property "Reference" "REF**"
+		(at 0 -2.45 180)
+		(layer "F.SilkS")
+		(uuid "6af6c3ea-d3da-48fc-936f-5e8196fe95fe")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "TJA1051TK-3"
+		(at -1.4 2.38 180)
+		(layer "F.Fab")
+		(uuid "c9747574-87a0-4849-afe9-f3d7167751b4")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" "http://www.nxp.com/documents/data_sheet/TJA1051.pdf"
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "819ea211-7469-463c-9519-bb24ac873f38")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "6d01fabc-e3d8-4705-ad5e-458925fe9e35")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property ki_fp_filters "DFN*1EP*3x3mm*P0.65mm*")
+	(sheetname "/vimdrones_esc_development_board/")
+	(sheetfile "vimdrones_esc_development_board.kicad_sch")
+	(attr smd)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_line
+		(start -1.5 -1.61)
+		(end 1.5 -1.61)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "0de251a1-c208-4beb-972e-23e238a014a2")
+	)
+	(fp_line
+		(start -1.5 1.61)
+		(end 1.5 1.61)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "2eb77b56-6e19-402f-855b-1e3776c2965f")
+	)
+	(fp_poly
+		(pts
+			(xy -2.04 -1.29) (xy -2.52 -1.29) (xy -2.04 -1.77) (xy -2.04 -1.29)
+		)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(fill yes)
+		(layer "F.SilkS")
+		(uuid "9cb623d2-6fac-4cee-91f5-5b18e9916918")
+	)
+	(fp_line
+		(start -2.13 -1.75)
+		(end -2.13 1.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "32760faf-57b9-4bce-93f5-da39e3a32be4")
+	)
+	(fp_line
+		(start -2.13 1.75)
+		(end 2.13 1.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "5d016839-16c3-4db1-b256-85ab63a7694e")
+	)
+	(fp_line
+		(start 2.13 -1.75)
+		(end -2.13 -1.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "32c90670-c199-456d-912b-3f52abbebe55")
+	)
+	(fp_line
+		(start 2.13 1.75)
+		(end 2.13 -1.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "db39a129-1672-4e63-b0e3-5e8f724379a8")
+	)
+	(fp_line
+		(start -1.5 -0.75)
+		(end -0.75 -1.5)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "42a5747d-36a6-4a55-b4c3-11c61c07d57d")
+	)
+	(fp_line
+		(start -1.5 1.5)
+		(end -1.5 -0.75)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "698a4090-ef01-4282-8e5c-7a7102881173")
+	)
+	(fp_line
+		(start -0.75 -1.5)
+		(end 1.5 -1.5)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "6b7d0125-443c-450b-a693-5c0679fb2a86")
+	)
+	(fp_line
+		(start 1.5 -1.5)
+		(end 1.5 1.5)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "70d401a0-1a21-40f8-b137-c4153471f754")
+	)
+	(fp_line
+		(start 1.5 1.5)
+		(end -1.5 1.5)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "1393b46c-b43c-4110-bdfa-17a87d7aa7a4")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 0 180)
+		(layer "F.Fab")
+		(uuid "59e93bbe-c496-46e7-8573-0771e7ad0617")
+		(effects
+			(font
+				(size 0.75 0.75)
+				(thickness 0.11)
+			)
+		)
+	)
+	(pad "" smd roundrect
+		(at -0.4 -0.6)
+		(size 0.64 0.97)
+		(layers "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "f603d57a-a272-4539-8fb5-5c4e1267f392")
+	)
+	(pad "" smd roundrect
+		(at -0.4 0.6)
+		(size 0.64 0.97)
+		(layers "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "a72cae7a-440a-4d52-9c3a-ef1722fa9b99")
+	)
+	(pad "" smd roundrect
+		(at 0.4 -0.6)
+		(size 0.64 0.97)
+		(layers "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "e37e2cc1-8b1c-43b9-9819-4ade6678c8a5")
+	)
+	(pad "" smd roundrect
+		(at 0.4 0.6)
+		(size 0.64 0.97)
+		(layers "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "2054040e-5e76-4e16-9955-5747ce13dd2f")
+	)
+	(pad "1" smd roundrect
+		(at -1.45 -0.975)
+		(size 0.85 0.3)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "424af839-b928-46fb-a913-f585df029a42")
+	)
+	(pad "2" smd roundrect
+		(at -1.45 -0.325)
+		(size 0.85 0.3)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "7fd4a134-917f-4827-a6b1-9d495e6d4d04")
+	)
+	(pad "3" smd roundrect
+		(at -1.45 0.325)
+		(size 0.85 0.3)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "2042406c-b8d2-4a0f-810a-984c566835b1")
+	)
+	(pad "4" smd roundrect
+		(at -1.45 0.975)
+		(size 0.85 0.3)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "be41f35e-34a6-4cd5-860a-1303e017fa06")
+	)
+	(pad "5" smd roundrect
+		(at 1.45 0.975)
+		(size 0.85 0.3)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "80174540-90c4-485b-9282-cd5fd842b1f2")
+	)
+	(pad "6" smd roundrect
+		(at 1.45 0.325)
+		(size 0.85 0.3)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "205e1018-3c72-4906-9dd7-9b15b4081e5f")
+	)
+	(pad "7" smd roundrect
+		(at 1.45 -0.325)
+		(size 0.85 0.3)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "786bfe73-0146-427f-863e-daf464ad9dd5")
+	)
+	(pad "8" smd roundrect
+		(at 1.45 -0.975)
+		(size 0.85 0.3)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.25)
+		(uuid "19d5022d-08f1-41ca-a964-0a1f42cfbeb9")
+	)
+	(pad "9" smd rect
+		(at 0 0)
+		(size 1.6 2.4)
+		(property pad_prop_heatsink)
+		(layers "F.Cu" "F.Mask")
+		(zone_connect 2)
+		(uuid "5ef6dbc9-347b-439f-a041-751a12147334")
+	)
+	(embedded_fonts no)
+	(model "${KICAD8_3DMODEL_DIR}/Package_SON.3dshapes/HVSON-8-1EP_3x3mm_P0.65mm_EP1.6x2.4mm.wrl"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+	(model "${VIMDRONES_MCU}/HVSON08_3X3_NXP.step"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)

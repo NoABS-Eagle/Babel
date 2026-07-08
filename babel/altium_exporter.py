@@ -15,8 +15,9 @@ from altium_monkey import (
 from altium_monkey.altium_sch_enums import PinElectrical, TextJustification, TextOrientation
 from altium_monkey.altium_pcb_enums import PadShape, PcbTextJustification
 from altium_monkey.altium_record_types import PcbLayer, LineWidth
+from altium_monkey.altium_sch_svg_renderer import LINE_WIDTH_MILS
 
-from babel.ir_util import component_gates, is_multi_gate
+from babel.ir_util import component_gates, is_multi_gate, resolve_model3d_file
 
 
 def _mils(v):
@@ -75,20 +76,46 @@ def _orient(rot_deg):
 def _altium_arc_angles(start, sweep):
     """IR (start, sweep) → Altium (start_angle, end_angle).
     IR positive sweep = CCW. Altium draws CCW from start to end.
-    For negative sweep (CW arc), swap endpoints so path is unchanged."""
+    For negative sweep (CW arc), swap endpoints so path is unchanged.
+
+    Full circle (|sweep| >= 360) is special-cased: '% 360' would otherwise
+    fold end_angle back onto start_angle (e.g. 0,360 -> 0,0), the same
+    degenerate-chord problem as Eagle's start==end wire — Altium needs an
+    explicit start/end pair that's 360° apart, not equal, to render a circle."""
+    if abs(sweep) >= 360:
+        s = start % 360
+        return s, s + 360
     if sweep >= 0:
         return start % 360, (start + sweep) % 360
     else:
         return (start + sweep) % 360, start % 360
 
 
+# altium_monkey's own LINE_WIDTH_MILS (used internally for SVG rendering of
+# every schematic primitive) is scaled for SVG preview, not true Altium mils —
+# real native widths are 10x those values (confirmed against real Altium).
+_LINE_WIDTH_UM = {lw: mils * 25.4 * 10 for lw, mils in LINE_WIDTH_MILS.items()}
+
+
 def _lw(um):
-    """IR µm line width → Altium LineWidth enum."""
+    """IR µm line width → Altium LineWidth enum.
+
+    SMALLEST and SMALL render identically (1 mil each); 0 maps to SMALLEST as
+    the "no explicit width" default, anything up to the midpoint with MEDIUM
+    still counts as SMALL.
+    """
     w = float(um)
-    if w == 0:   return LineWidth.SMALLEST
-    if w < 762:  return LineWidth.SMALL
-    if w < 1270: return LineWidth.MEDIUM
+    if w <= 0: return LineWidth.SMALLEST
+    mid_small_medium  = (_LINE_WIDTH_UM[LineWidth.SMALL]  + _LINE_WIDTH_UM[LineWidth.MEDIUM]) / 2
+    mid_medium_large  = (_LINE_WIDTH_UM[LineWidth.MEDIUM] + _LINE_WIDTH_UM[LineWidth.LARGE]) / 2
+    if w < mid_small_medium: return LineWidth.SMALL
+    if w < mid_medium_large: return LineWidth.MEDIUM
     return LineWidth.LARGE
+
+
+def _um_lw(line_width):
+    """Altium LineWidth enum → IR µm. Inverse of _lw(), same source table."""
+    return round(_LINE_WIDTH_UM.get(LineWidth(line_width), _LINE_WIDTH_UM[LineWidth.SMALL]))
 
 
 def _sym_add_arc(sym, x, y, radius_mils, **kwargs):
@@ -135,6 +162,13 @@ _DIR_TO_ELEC = {
     'hiz': PinElectrical.HIZ,
     'pwr': PinElectrical.POWER,
 }
+# No entry for IR's `nc` (KiCad/Eagle no-connect-ERC pin direction) on
+# purpose — Altium's own PinElectrical enum has no equivalent member at all
+# (decisions.md "KiCad: `no_connect` тип пина"). Falls through to this
+# dict's call-site default (PinElectrical.PASSIVE) below — the pin's own
+# NAME ("NC" or similar) still carries through untouched, only the
+# special ERC-silencing behavior is lost, which Altium has no slot for
+# regardless of what we do here.
 
 _IR_TO_PCB_LAYER = {
     'top':          PcbLayer.TOP,
@@ -241,7 +275,6 @@ def _add_gate_to_symbol(sym, sym_el, des_map, schlib, owner_part_id=None):
         rad       = math.radians(rot)
         bx = _mils(str(x_um + length_um * math.cos(rad)))
         by = _mils(str(y_um + length_um * math.sin(rad)))
-        visible = pin_el.get('visible', 'both')
         pads = des_map.get(name) or []
         sym.add_pin(AltiumSchPin(
             designator         = pads[0] if pads else '',
@@ -252,8 +285,8 @@ def _add_gate_to_symbol(sym, sym_el, des_map, schlib, owner_part_id=None):
             length             = _mils(pin_el.get('length', '2540')),
             electrical_type    = _DIR_TO_ELEC.get(pin_el.get('direction', 'pas'),
                                                    PinElectrical.PASSIVE),
-            name_visible       = visible in ('both', 'pin'),
-            designator_visible = visible in ('both', 'pad'),
+            name_visible       = pin_el.get('pinvis', '1') == '1',
+            designator_visible = pin_el.get('padvis', '1') == '1',
             owner_part_id      = owner_part_id,
         ))
 
@@ -529,13 +562,16 @@ def _export_schlib_multipart(comp_el, sym_pool, schlib):
 # ─── component table helpers ──────────────────────────────────────────────────
 
 def _custom_attrs(comp_el):
-    """Return dict of custom attributes, skipping 'value' (mapped to Comment)."""
+    """Return dict of custom attributes, skipping 'value' (mapped to Comment)
+    and 'description' (mapped to the standard Description column — see
+    _build_component_rows; same idea as eagle_exporter routing it to Eagle's
+    native deviceset <description> instead of the generic attribute table)."""
     out = {}
     attrs_el = comp_el.find('attributes')
     if attrs_el is not None:
         for a in attrs_el.findall('attr'):
             n, v = a.get('name', ''), a.get('value', '')
-            if n and n.lower() != 'value':
+            if n and n.lower() not in ('value', 'description'):
                 out[n] = v
     return out
 
@@ -556,7 +592,6 @@ def _build_component_rows(ir_root, schlib_name, pcblib_name):
     for comp_el in ir_root.findall('component'):
         cname  = comp_el.get('name', '')
         prefix = comp_el.get('prefix') or 'U'
-        desc   = comp_el.findtext('description') or ''
 
         gates    = component_gates(comp_el)
         # Multi-gate: Library Ref points to the multi-part SchLib entry (named after
@@ -565,14 +600,21 @@ def _build_component_rows(ir_root, schlib_name, pcblib_name):
 
         fp_els = comp_el.findall('footprint')
 
-        # Eagle 'value' attribute → Altium Comment (shown on BOM / schematic)
+        # 'value'/'description' are plain IR attributes (no dedicated
+        # element — see ir_schema.md), routed to their own standard columns
+        # here same as eagle_exporter routes 'description' to Eagle's native
+        # deviceset <description>: 'value' → Altium Comment (BOM/schematic),
+        # 'description' → the standard Description column.
         value = ''
+        desc = ''
         attrs_el = comp_el.find('attributes')
         if attrs_el is not None:
             for a in attrs_el.findall('attr'):
-                if a.get('name', '').lower() == 'value':
+                name = a.get('name', '').lower()
+                if name == 'value':
                     value = a.get('value', '')
-                    break
+                elif name == 'description':
+                    desc = a.get('value', '')
         comment = value or cname
 
         # Component-level custom attrs (base)
@@ -878,28 +920,27 @@ def _export_footprint(fp_el, pcblib, step_dir=None):
     # 3D model — embed STEP file if available
     m3d = fp_el.find('model3d')
     if m3d is not None and step_dir is not None:
-        fname = m3d.get('file', '')
-        if fname:
-            step_path = Path(step_dir) / fname
-            if step_path.exists():
-                try:
-                    model = pcblib.add_embedded_model(
-                        name               = fname,
-                        model_data         = step_path.read_bytes(),
-                        rotation_x_degrees = float(m3d.get('rx', 0)),
-                        rotation_y_degrees = float(m3d.get('ry', 0)),
-                        rotation_z_degrees = float(m3d.get('rz', 0)),
-                        z_offset_mils      = round(float(m3d.get('tz', 0)) / 25.4),
-                    )
-                    fp.add_embedded_3d_model(
-                        model,
-                        location_mils      = (_mils(m3d.get('tx', '0')),
-                                              _mils(m3d.get('ty', '0'))),
-                        standoff_height_mils = round(float(m3d.get('tz', 0)) / 25.4),
-                    )
-                    print(f'  3D: {fname} -> {fp_el.get("name", "")}')
-                except Exception as e:
-                    print(f'  ! 3D {fname}: {e}')
+        step_path = resolve_model3d_file(fp_el, step_dir)
+        if step_path is not None:
+            fname = step_path.name
+            try:
+                model = pcblib.add_embedded_model(
+                    name               = fname,
+                    model_data         = step_path.read_bytes(),
+                    rotation_x_degrees = float(m3d.get('rx', 0)),
+                    rotation_y_degrees = float(m3d.get('ry', 0)),
+                    rotation_z_degrees = float(m3d.get('rz', 0)),
+                    z_offset_mils      = round(float(m3d.get('tz', 0)) / 25.4),
+                )
+                fp.add_embedded_3d_model(
+                    model,
+                    location_mils        = (_mils(m3d.get('tx', '0')),
+                                            _mils(m3d.get('ty', '0'))),
+                    standoff_height_mils = round(float(m3d.get('tz', 0)) / 25.4),
+                )
+                print(f'  3D: {fname} -> {fp_el.get("name", "")}')
+            except Exception as e:
+                print(f'  ! 3D {fname}: {e}')
 
 
 # ─── entry point ─────────────────────────────────────────────────────────────

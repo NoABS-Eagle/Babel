@@ -1,0 +1,8 @@
+(module IKCM15L60GD (layer F.Cu) (tedit 5F6A44DD)
+  (fp_text reference REF** (at 0 0.5) (layer F.SilkS)
+    (effects (font (size 1 1) (thickness 0.15)))
+  )
+  (fp_text value IKCM15L60GD (at 0 -0.5) (layer F.Fab)
+    (effects (font (size 1 1) (thickness 0.15)))
+  )
+)

@@ -1,0 +1,227 @@
+(footprint "IND-SMD_L7.5-W7.2-1"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(property "Reference" "REF**"
+		(at -4.902485 -1.14567 0)
+		(layer "F.SilkS")
+		(uuid "01742947-a624-47ed-a51b-3475b6d2df30")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "4.7uH"
+		(at 0 4 0)
+		(layer "F.Fab")
+		(uuid "8c2165c3-19e9-4719-9ace-5e1488529d6f")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" "~"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "fe928b77-42fc-41d7-b2fd-520d5761edc5")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" "Inductor"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "197e97be-3d61-42b8-8172-284ef2faba4d")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "LCSC Part" "C3911513"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "f5dd65cf-a5f0-4c52-8f04-7bae93cd4370")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property ki_fp_filters "Choke_* *Coil* Inductor_* L_*")
+	(sheetname "/")
+	(sheetfile "4S_Battery_Charger.kicad_sch")
+	(attr smd)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_line
+		(start -3.7 -3.8)
+		(end -3.4 -3.8)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "2b7a02c3-c31a-4019-aa58-1b8ae03f515c")
+	)
+	(fp_line
+		(start -3.7 3.8)
+		(end -3.7 -3.8)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "11ac1abf-ece5-4818-87fe-655a2c07d2c8")
+	)
+	(fp_line
+		(start -3.6 -3.8)
+		(end 3.7 -3.8)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "4a552221-88b3-4cc3-9375-5916bf775fec")
+	)
+	(fp_line
+		(start 3.7 -3.8)
+		(end 3.7 3.8)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "cd67d4a2-a7d6-4b3d-91cb-79772431aac5")
+	)
+	(fp_line
+		(start 3.7 3.8)
+		(end -3.7 3.8)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "621133c9-20c9-40ae-8636-4957e2afc1f5")
+	)
+	(fp_circle
+		(center -3.6 3.75)
+		(end -3.57 3.75)
+		(stroke
+			(width 0.06)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.SilkS")
+		(uuid "836c41e6-b80f-4ec4-849e-76622f0dd397")
+	)
+	(fp_line
+		(start -3.6 -3.75)
+		(end 3.6 -3.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "3013222b-2658-4a97-ac39-016fa8a05eb9")
+	)
+	(fp_line
+		(start -3.6 3.75)
+		(end -3.6 -3.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "6687c061-80aa-4938-ba46-8e424e681827")
+	)
+	(fp_line
+		(start 3.6 -3.75)
+		(end 3.6 3.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "da881685-cfbf-4b5f-8c1c-ce75793fcc66")
+	)
+	(fp_line
+		(start 3.6 3.75)
+		(end -3.6 3.75)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "5ac8c0ac-775b-4f4d-8f2c-9eb162a4f1ff")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(uuid "69461b03-0495-4197-9e16-49e8ef335c1f")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "1" smd rect
+		(at -2.41 0)
+		(size 1.92 6.5)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(teardrops
+			(best_length_ratio 0.5)
+			(max_length 1)
+			(best_width_ratio 1)
+			(max_width 2)
+			(curved_edges yes)
+			(filter_ratio 0.9)
+			(enabled yes)
+			(allow_two_segments yes)
+			(prefer_zone_connections yes)
+		)
+		(uuid "d50881b6-32bd-4bc1-baca-9d22ed1d88cf")
+	)
+	(pad "2" smd rect
+		(at 2.41 0)
+		(size 1.92 6.5)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(teardrops
+			(best_length_ratio 0.5)
+			(max_length 1)
+			(best_width_ratio 1)
+			(max_width 2)
+			(curved_edges yes)
+			(filter_ratio 0.9)
+			(enabled yes)
+			(allow_two_segments yes)
+			(prefer_zone_connections yes)
+		)
+		(uuid "13a2283c-2bba-4594-8923-98e9d633bd88")
+	)
+	(embedded_fonts no)
+	(model "D:/KiCad/Libraries/MyModels/IND-SMD_L7.0-W6.6-H5.0_MCW-0650-220.step"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)

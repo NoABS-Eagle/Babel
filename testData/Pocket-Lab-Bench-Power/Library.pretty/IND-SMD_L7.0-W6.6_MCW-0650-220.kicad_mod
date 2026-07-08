@@ -1,0 +1,210 @@
+(footprint "IND-SMD_L7.0-W6.6_MCW-0650-220"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(property "Reference" "REF**"
+		(at -5.55 -2.070112 0)
+		(layer "F.SilkS")
+		(uuid "31b5f2bc-0ba8-44b5-9a4f-e2fc8b81feb0")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "2.2uH"
+		(at 0 4 0)
+		(layer "F.Fab")
+		(uuid "2c5fff79-1d5d-4ddd-acfa-81e332828d47")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" "~"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "f95b16d6-51b4-4eaa-9557-e57ec91e4da5")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" "Inductor"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "f8080ab5-788f-4010-9b28-5a16068876a9")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "LCSC Part" "C5349701"
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "5586e33b-3ac0-4453-a4f5-58ac188c5ba0")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property ki_fp_filters "Choke_* *Coil* Inductor_* L_*")
+	(sheetname "/")
+	(sheetfile "4S_Battery_Charger.kicad_sch")
+	(attr smd)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_line
+		(start -3.47 -3.3)
+		(end 3.48 -3.3)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "df775cec-6f3d-4035-808d-e9bfcc83f9bb")
+	)
+	(fp_line
+		(start -3.47 -1.99)
+		(end -3.47 -3.3)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "6df0f3ff-f774-4bbb-bcc5-b94813a8c199")
+	)
+	(fp_line
+		(start -3.47 3.3)
+		(end -3.47 1.98)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "a1849606-2c15-47b1-a5c1-cfe720a1255b")
+	)
+	(fp_line
+		(start -3.47 3.3)
+		(end 3.48 3.3)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "248c475a-f81c-4990-b6b3-241ef31b837e")
+	)
+	(fp_line
+		(start 3.48 -1.99)
+		(end 3.48 -3.3)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "ce395600-b60a-49e5-b4ed-4f10109db662")
+	)
+	(fp_line
+		(start 3.48 3.3)
+		(end 3.48 1.98)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "73a18beb-eca7-4a1f-9bff-99c1f6aa4f5c")
+	)
+	(fp_poly
+		(pts
+			(xy -4.3 -3.5) (xy 4.3 -3.5) (xy 4.3 3.5) (xy -4.3 3.5)
+		)
+		(stroke
+			(width 0.05)
+			(type default)
+		)
+		(fill no)
+		(layer "F.CrtYd")
+		(uuid "3d27e6de-e608-4554-82a7-45687ececbdc")
+	)
+	(fp_circle
+		(center -3.48 3.3)
+		(end -3.45 3.3)
+		(stroke
+			(width 0.06)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.Fab")
+		(uuid "7970b76d-9f7e-42c9-b80f-cf777d1dd1ef")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(uuid "0ee3c345-f7d8-4196-a39a-fa430a4b9ad1")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "1" smd rect
+		(at -3.030001 0)
+		(size 2.35 3.5)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(teardrops
+			(best_length_ratio 0.5)
+			(max_length 1)
+			(best_width_ratio 1)
+			(max_width 2)
+			(curved_edges yes)
+			(filter_ratio 0.9)
+			(enabled yes)
+			(allow_two_segments yes)
+			(prefer_zone_connections yes)
+		)
+		(uuid "b1b28edf-9a1f-4468-ab2e-532c8a30fe6d")
+	)
+	(pad "2" smd rect
+		(at 3.019999 0)
+		(size 2.35 3.5)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(teardrops
+			(best_length_ratio 0.5)
+			(max_length 1)
+			(best_width_ratio 1)
+			(max_width 2)
+			(curved_edges yes)
+			(filter_ratio 0.9)
+			(enabled yes)
+			(allow_two_segments yes)
+			(prefer_zone_connections yes)
+		)
+		(uuid "6d852305-fac4-447a-b00f-ffa483149f3f")
+	)
+	(embedded_fonts no)
+	(model "D:/KiCad/Libraries/MyModels/IND-SMD_L7.0-W6.6-H5.0_MCW-0650-220.step"
+		(offset
+			(xyz 0 -0 -0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)

@@ -1,0 +1,250 @@
+(footprint "LED_WS2812B-2020_PLCC4_2.0x2.0mm"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(descr "2.0mm x 2.0mm Addressable RGB LED NeoPixel Nano, 12 mA, https://cdn-shop.adafruit.com/product-files/4684/4684_WS2812B-2020_V1.3_EN.pdf")
+	(tags "LED RGB NeoPixel Nano PLCC-4 2020")
+	(property "Reference" "REF**"
+		(at 0 -2 0)
+		(layer "F.SilkS")
+		(uuid "fa072902-6596-450d-923b-617d690f4fba")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "WS2812B-2020"
+		(at 0 2.2 0)
+		(layer "F.Fab")
+		(uuid "cf06a3d1-4315-415e-9dea-af6e3e392a45")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" "https://cdn-shop.adafruit.com/product-files/4684/4684_WS2812B-2020_V1.3_EN.pdf"
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "649683a0-b9e6-4bd2-a129-10b33baa3e2d")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" "RGB LED with integrated controller, 2.0 x 2.0 mm, 12 mA"
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "c829def1-e76d-4441-95ed-b65e44548b08")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property ki_fp_filters "LED*WS2812*-2020_PLCC4*")
+	(sheetname "/vimdrones_esc_development_board/")
+	(sheetfile "vimdrones_esc_development_board.kicad_sch")
+	(attr smd)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_line
+		(start -1.42 -1.15)
+		(end -1.42 -0.5)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "dd3dd5c4-0fad-4904-8492-2bdfcf9986e6")
+	)
+	(fp_line
+		(start -1.42 -1.15)
+		(end 1.42 -1.15)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "2736d7cf-af1a-4a3c-8262-20eafc611f10")
+	)
+	(fp_line
+		(start -1.42 1.15)
+		(end 1.42 1.15)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "9c722633-5ce0-401b-95b3-526ee8a3fed7")
+	)
+	(fp_line
+		(start -1.52 -1.25)
+		(end -1.52 1.25)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "d36e94a7-542f-4705-8629-260a3a9f2532")
+	)
+	(fp_line
+		(start -1.52 1.25)
+		(end 1.52 1.25)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "0a91f8c8-a859-4819-b52a-d9d5bb11391d")
+	)
+	(fp_line
+		(start 1.52 -1.25)
+		(end -1.52 -1.25)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "143d3b5f-5180-4a6e-a72d-8e6cb8832763")
+	)
+	(fp_line
+		(start 1.52 1.25)
+		(end 1.52 -1.25)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "5a192510-37bc-41b5-9566-545d1209923d")
+	)
+	(fp_line
+		(start -1.1 -0.45)
+		(end -1.1 1)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "31d1929c-0025-4d57-b4d8-060e2c53ce6f")
+	)
+	(fp_line
+		(start -1.1 1)
+		(end 1.1 1)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "b6c2420e-b77a-4a20-853f-ba5fba337129")
+	)
+	(fp_line
+		(start -0.55 -1)
+		(end -1.1 -0.45)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "dbec57ae-790e-4c78-bf5c-70d135ef894d")
+	)
+	(fp_line
+		(start 1.1 -1)
+		(end -0.55 -1)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "65d62a91-ad01-473c-b9f1-af0851060479")
+	)
+	(fp_line
+		(start 1.1 -1)
+		(end 1.1 1)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "7974c232-3010-4b89-a25d-9c6b0513d192")
+	)
+	(fp_rect
+		(start -0.5 -1)
+		(end -0.05 -0.45)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(fill yes)
+		(layer "F.Fab")
+		(uuid "27e04ff6-c772-40a1-81c2-f72537ba21cb")
+	)
+	(fp_rect
+		(start -0.5 0.4)
+		(end -0.05 1)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(fill yes)
+		(layer "F.Fab")
+		(uuid "64ffec8c-6a07-4abf-92f0-505614b44266")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(uuid "12de48f6-1169-467f-ab4a-90020b257974")
+		(effects
+			(font
+				(size 0.5 0.5)
+				(thickness 0.075)
+			)
+		)
+	)
+	(pad "1" smd rect
+		(at -0.915 -0.55)
+		(size 0.7 0.7)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(uuid "cb731a9f-778d-44b6-9e73-9422bd6b11b6")
+	)
+	(pad "2" smd rect
+		(at -0.915 0.55)
+		(size 0.7 0.7)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(uuid "b96ab940-ac03-464c-baa0-cfe4e5bc6e25")
+	)
+	(pad "3" smd rect
+		(at 0.915 0.55)
+		(size 0.7 0.7)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(uuid "c4ce38f6-73fd-480e-b213-4ceb54e4527c")
+	)
+	(pad "4" smd rect
+		(at 0.915 -0.55)
+		(size 0.7 0.7)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(uuid "ea71903a-309e-4ab9-9885-ff2d986e81a2")
+	)
+	(embedded_fonts no)
+	(model "${VIMDRONES_3D}/LED/WS2812-2020.STEP"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz -90 0 0)
+		)
+	)
+)

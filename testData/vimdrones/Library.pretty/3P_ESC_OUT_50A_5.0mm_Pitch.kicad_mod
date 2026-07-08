@@ -1,0 +1,95 @@
+(footprint "3P_ESC_OUT_50A_5.0mm_Pitch"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(property "Reference" "REF**"
+		(at 0 -0.5 180)
+		(unlocked yes)
+		(layer "F.SilkS")
+		(uuid "01e77d58-91d1-4c30-bc62-63540ac4a0a0")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.1)
+			)
+		)
+	)
+	(property "Value" "NC"
+		(at 0 1 180)
+		(unlocked yes)
+		(layer "F.Fab")
+		(uuid "8e807f9e-6250-44b1-a824-b3c2f292c077")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 180)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "248e3863-a0b2-4e74-903f-10d94f5ca91e")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" "Generic connector, single row, 01x03, script generated"
+		(at 0 0 180)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "16a27aa9-6e4a-489d-89dc-d1e0023801dc")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property ki_fp_filters "Connector*:*_1x??_*")
+	(sheetname "/vimdrones_esc_development_board/")
+	(sheetfile "vimdrones_esc_development_board.kicad_sch")
+	(attr smd)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_text user "${REFERENCE}"
+		(at 0 2.5 180)
+		(unlocked yes)
+		(layer "F.Fab")
+		(uuid "ab0ad23d-b721-4f59-9aa0-f8ac78f71259")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "1" smd rect
+		(at -5 0 270)
+		(size 4 2.5)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(thermal_bridge_angle 45)
+		(uuid "da2f949e-dc83-4397-8580-d34786c41612")
+	)
+	(pad "2" smd rect
+		(at 0 0 270)
+		(size 4 2.5)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(thermal_bridge_angle 45)
+		(uuid "13ee7810-71f5-4acb-8bbd-036fb0de33c7")
+	)
+	(pad "3" smd rect
+		(at 5 0 270)
+		(size 4 2.5)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(thermal_bridge_angle 45)
+		(uuid "134b0b9b-07fe-48a2-a0f9-731d80ca5881")
+	)
+	(embedded_fonts no)
+)

@@ -1,4 +1,5 @@
 """Altium .IntLib -> IR XML converter."""
+import hashlib
 import math
 import re
 import shutil
@@ -8,14 +9,20 @@ from xml.dom import minidom
 from pathlib import Path
 
 from altium_monkey import AltiumIntLib, AltiumSchLib, AltiumPcbLib
+from babel.ir_util import sanitize_filename, clean_attr_name
+from babel.altium_exporter import _um_lw
 
 _MILS_TO_UM = 25.4   # 1 mil = 25.4 µm
 
 
-def _clean_param_name(s):
-    """letter-space-letter → underscore; space adjacent to punctuation → remove."""
-    s = re.sub(r'([A-Za-z0-9]) ([A-Za-z0-9])', r'\1_\2', s or '')
-    return s.replace(' ', '')
+def _pt_to_um(pt):
+    """Altium font point size → IR text size, µm.
+
+    Inverse of altium_exporter._font_id: Altium's point size does not follow
+    the standard 72pt/inch typographic convention for rendered letter height —
+    empirically, an 8pt font renders ~1.2mm tall, i.e. 1pt ~= 150 µm.
+    """
+    return round(float(pt) * 150)
 
 _ELECTRICAL = {
     'Input':          'in',
@@ -26,8 +33,14 @@ _ELECTRICAL = {
     'Open Collector': 'out',
     'Open Emitter':   'out',
     'HiZ':            'out',
-    'Not Connected':  'pas',
 }
+# Altium's own PinElectrical enum has no "Not Connected"/`nc` member at all
+# (confirmed against altium_monkey's PIN_ELECTRICAL_NAMES — 8 values, none
+# of them this) — unlike KiCad's `no_connect` and Eagle's `nc`, Altium
+# genuinely has no electrical-type equivalent to import FROM. Falls through
+# to the dict's own `.get(..., 'pas')` default below, same as any other
+# unrecognized value — not a gap to plug, there's nothing on the Altium
+# side to read.
 
 _ORIENT_TO_ROT = {0: 0, 1: 90, 2: 180, 3: 270}  # for text
 
@@ -93,56 +106,126 @@ def _f(v):
     return str(int(r)) if r == int(r) else str(r)
 
 
-def _convert_symbol(sym, sym_name):
-    """Build a pool-ready <symbol name=...> from an altium-monkey symbol."""
+def _part_letter(n):
+    """1-indexed Altium part id -> letter gate suffix (1->A, 2->B, ...).
+
+    altium_monkey only exposes the numeric owner_part_id; the letter suffix
+    (HL1A/HL1B) is purely an Altium UI convention applied when placing a
+    multi-part symbol, not stored data — so this mapping is our own, chosen
+    to match what an Altium user would actually see on the sheet.
+    """
+    return chr(ord('A') + n - 1)
+
+
+def _iter_named_pins(sym, part_id=None):
+    """Yield (ir_pin_name, pin) for sym's pins, filtered to one multi-part
+    gate (part_id) or all of them (part_id=None), with the '@N' dedup-suffix
+    numbering used everywhere an IR pin name is derived from a pin.
+
+    Shared between symbol drawing and footprint pin-mapping so the two can't
+    drift apart and disagree on a pin's name.
+    """
+    def _keep(pin):
+        if part_id is None:
+            return True
+        opid = getattr(pin, 'owner_part_id', None)
+        return opid is None or opid in (-1, 0) or opid == part_id
+
+    seen: dict[str, int] = {}
+    for pin in sym.pins:
+        if not _keep(pin):
+            continue
+        pname = clean_attr_name(pin.name or str(pin.designator))
+        seen[pname] = seen.get(pname, 0) + 1
+        n = seen[pname]
+        yield (pname if n == 1 else f'{pname}@{n}', pin)
+
+
+def _convert_symbol(sym, sym_name, part_id=None):
+    """Build a pool-ready <symbol name=...> from an altium-monkey symbol.
+
+    part_id, if given, restricts graphics to one part of a multi-part Altium
+    symbol: objects owned by that part (owner_part_id == part_id) plus objects
+    shared across all parts (owner_part_id in (None, -1, 0) — e.g. the
+    >NAME/>Value placeholders) are kept; another part's objects are dropped.
+    With part_id=None (single-part symbols) everything is kept, matching the
+    old behaviour.
+    """
+    def _keep(obj):
+        if part_id is None:
+            return True
+        opid = getattr(obj, 'owner_part_id', None)
+        return opid is None or opid in (-1, 0) or opid == part_id
+
     sym_el = ET.Element('symbol', name=sym_name)
 
-    _RECT_W = '254'   # 0.254mm = 254µm — Eagle body wire aesthetic
-    _LINE_W = '152'   # 0.1524mm = 152µm (≈6mil)
-    for rect in sym.rectangles:
+    for rect in filter(_keep, sym.rectangles):
         loc = rect.location_mils
         cor = rect.corner_mils
         x1  = _um(loc.x_mils); y1 = _um(loc.y_mils)
         x2  = _um(cor.x_mils); y2 = _um(cor.y_mils)
+        w   = str(_um_lw(rect.line_width))
         for ax1, ay1, ax2, ay2 in [(x1,y1,x2,y1),(x2,y1,x2,y2),(x2,y2,x1,y2),(x1,y2,x1,y1)]:
             ET.SubElement(sym_el, 'line',
-                          x1=ax1, y1=ay1, x2=ax2, y2=ay2, width=_RECT_W)
+                          x1=ax1, y1=ay1, x2=ax2, y2=ay2, width=w)
 
-    for pl in sym.polylines:
+    for pl in filter(_keep, sym.polylines):
         pts = list(pl.points_mils)
+        w   = str(_um_lw(pl.line_width))
         for a, b in zip(pts, pts[1:]):
             ET.SubElement(sym_el, 'line',
                           x1=_um(a.x_mils), y1=_um(a.y_mils),
                           x2=_um(b.x_mils), y2=_um(b.y_mils),
-                          width=_LINE_W)
+                          width=w)
 
-    for ln in sym.lines:
+    for ln in filter(_keep, sym.lines):
         loc = ln.location_mils
         cor = ln.corner_mils
         ET.SubElement(sym_el, 'line',
                       x1=_um(loc.x_mils), y1=_um(loc.y_mils),
                       x2=_um(cor.x_mils), y2=_um(cor.y_mils),
-                      width=_LINE_W)
+                      width=str(_um_lw(ln.line_width)))
 
-    for arc in sym.arcs:
+    for arc in filter(_keep, sym.arcs):
         loc = arc.location_mils
+        radius_mils = arc.radius_mils
+        # AltiumSchEllipticalArc is a subclass of AltiumSchArc (so it's
+        # already included here) and adds a second, minor-axis radius. IR has
+        # no ellipse-arc primitive, so collapse to a circular arc using the
+        # smaller of the two radii — stays inside the original ellipse.
+        secondary_mils = getattr(arc, 'secondary_radius_mils', None)
+        if secondary_mils is not None:
+            radius_mils = min(radius_mils, secondary_mils)
+        # Same '% 360 or 360' fallback as the PCB arc loop below: a full
+        # circle drawn as start=0/end=360 must not collapse to a 0° sweep.
+        sweep = (arc.end_angle - arc.start_angle) % 360 or 360
         ET.SubElement(sym_el, 'arc',
                       cx=_um(loc.x_mils), cy=_um(loc.y_mils),
-                      r=_um(arc.radius),
+                      r=_um(radius_mils),
                       start=_f(arc.start_angle),
-                      sweep=_f((arc.end_angle - arc.start_angle) % 360),
-                      width=_LINE_W)
+                      sweep=_f(sweep),
+                      width=str(_um_lw(arc.line_width)))
 
-    for pol in sym.polygons:
+    for ell in filter(_keep, sym.ellipses):
+        # Same min-radius collapse as elliptical arcs, swept to a full circle.
+        loc = ell.location_mils
+        radius_mils = min(ell.radius_mils, ell.secondary_radius_mils)
+        ET.SubElement(sym_el, 'arc',
+                      cx=_um(loc.x_mils), cy=_um(loc.y_mils),
+                      r=_um(radius_mils),
+                      start='0', sweep='360',
+                      width=str(_um_lw(ell.line_width)))
+
+    for pol in filter(_keep, sym.polygons):
         pts = list(pol.points_mils)
+        w   = str(_um_lw(pol.line_width))
         for a, b in zip(pts, pts[1:] + [pts[0]]):
             ET.SubElement(sym_el, 'line',
                           x1=_um(a.x_mils), y1=_um(a.y_mils),
                           x2=_um(b.x_mils), y2=_um(b.y_mils),
-                          width=_RECT_W)
+                          width=w)
 
-    seen_pin_names: dict[str, int] = {}
-    for pin in sym.pins:
+    for ir_pin_name, pin in _iter_named_pins(sym, part_id):
         direction = _ELECTRICAL.get(pin.electrical_name, 'pas')
         orient    = pin.orientation  # 0-3
         rot       = _PIN_ORIENT_TO_ROT.get(orient, 180)
@@ -151,17 +234,6 @@ def _convert_symbol(sym, sym_name):
         length_um  = float(pin.length_mils) * _MILS_TO_UM
         px_um = float(pin.x_mils) * _MILS_TO_UM + length_um * math.cos(math.radians(orient_deg))
         py_um = float(pin.y_mils) * _MILS_TO_UM + length_um * math.sin(math.radians(orient_deg))
-        visible = 'both'
-        if not pin.show_name and not pin.show_designator:
-            visible = 'off'
-        elif not pin.show_name:
-            visible = 'pad'
-        elif not pin.show_designator:
-            visible = 'pin'
-        pname = _clean_param_name(pin.name or str(pin.designator))
-        seen_pin_names[pname] = seen_pin_names.get(pname, 0) + 1
-        n = seen_pin_names[pname]
-        ir_pin_name = pname if n == 1 else f'{pname}@{n}'
         ET.SubElement(sym_el, 'pin',
                       name=ir_pin_name,
                       x=str(round(px_um)),
@@ -169,51 +241,74 @@ def _convert_symbol(sym, sym_name):
                       rot=str(rot),
                       length=str(round(length_um)),
                       direction=direction,
-                      visible=visible)
+                      pinvis='1' if pin.show_name else '0',
+                      padvis='1' if pin.show_designator else '0')
 
-    for lbl in sym.labels:
+    for lbl in filter(_keep, sym.labels):
         if lbl.is_hidden or not lbl.text:
             continue
         lx    = _um(lbl.location.x_mils)
         ly    = _um(lbl.location.y_mils)
         lalign = _JUSTIFICATION.get(lbl.justification.value if hasattr(lbl.justification, 'value') else 0, 'bottom-left')
         lrot   = _ORIENT_TO_ROT.get(lbl.orientation.value if hasattr(lbl.orientation, 'value') else 0, 0)
+        lsz    = str(_pt_to_um(lbl.font.size)) if lbl.font else '1270'
         ET.SubElement(sym_el, 'text',
-                      x=lx, y=ly, size='1270', rot=str(lrot),
-                      align=lalign, layer='symbol').text = lbl.text
+                      x=lx, y=ly, size=lsz, rot=str(lrot),
+                      align=lalign, layer='SYMBOLS').text = lbl.text
 
     # >NAME from designator
-    desgns = list(sym.designators)
+    desgns = list(filter(_keep, sym.designators))
     if desgns:
         d     = desgns[0]
         nx    = _um(d.location.x_mils)
         ny    = _um(d.location.y_mils)
         align = _JUSTIFICATION.get(d.justification.value, 'bottom-left')
         rot   = _ORIENT_TO_ROT.get(d.orientation.value if hasattr(d.orientation, 'value') else 0, 0)
-        sz    = str(round(float(d.font.size) * 10 * _MILS_TO_UM)) if d.font else '1270'
+        sz    = str(_pt_to_um(d.font.size)) if d.font else '1270'
     else:
         nx, ny, align, rot, sz = '2540', '2540', 'bottom-left', 0, '1270'
     ET.SubElement(sym_el, 'text',
                   x=nx, y=ny, size=sz, rot=str(rot),
-                  align=align, layer='symbol_names').text = '>NAME'
+                  align=align, layer='NAMES').text = '>NAME'
 
     # Visible parameters → >CleanedName placeholder texts
-    for par in sym.parameters:
+    for par in filter(_keep, sym.parameters):
         if par.is_hidden:
             continue
-        pname = _clean_param_name(par.name)
+        pname = clean_attr_name(par.name)
         if not pname or pname.lower() == 'designator':
             continue
         px     = _um(par.location.x_mils)
         py     = _um(par.location.y_mils)
         palign = _JUSTIFICATION.get(par.justification.value if hasattr(par.justification, 'value') else 0, 'bottom-left')
         prot   = _ORIENT_TO_ROT.get(par.orientation.value if hasattr(par.orientation, 'value') else 0, 0)
-        psz    = str(round(float(par.font.size) * 10 * _MILS_TO_UM)) if par.font else '1270'
+        psz    = str(_pt_to_um(par.font.size)) if par.font else '1270'
+        # Altium has two parameters that both mean "device value" — Comment
+        # (the always-present schematic-visible field) and the ordinary,
+        # optional Value parameter some libraries place directly instead.
+        # Map either onto the canonical >VALUE placeholder, same field
+        # Eagle/KiCad use (see altium_exporter.py's reverse mapping).
+        placeholder = 'VALUE' if pname.lower() in ('value', 'comment') else pname
         ET.SubElement(sym_el, 'text',
                       x=px, y=py, size=psz, rot=str(prot),
-                      align=palign, layer='symbol_values').text = f'>{pname}'
+                      align=palign, layer='VALUES').text = f'>{placeholder}'
 
     return sym_el
+
+
+def _symbol_geometry_hash(sym_el):
+    """Hash a symbol's children (line/arc/pin/text/...), name-independent.
+
+    Same IntLib symbol record duplicated under different names (e.g. one per
+    DesignItemId/Part Number) serializes its geometry in the same child order,
+    since it comes from the same parser code path — so plain document-order
+    serialization is enough to detect a duplicate without sorting.
+    """
+    parts = []
+    for child in sym_el:
+        attrs = ' '.join(f'{k}={v}' for k, v in child.attrib.items())
+        parts.append(f'<{child.tag} {attrs}>{child.text or ""}')
+    return hashlib.sha256('\n'.join(parts).encode('utf-8')).hexdigest()
 
 
 # PcbTextJustification value → IR align
@@ -246,6 +341,12 @@ def _convert_footprint(fp, fp_el):
             layers[name] = ET.Element(name)
         return layers[name]
 
+    # Non-electrical pads (fiducials, mounting holes) carry an empty Altium
+    # designator. Eagle requires a non-empty smd/pad name, so number them,
+    # skipping any value already used by a real designator.
+    used_names = {str(p.designator).strip() for p in fp.pads if str(p.designator).strip()}
+    anon_n = 0
+
     for pad in fp.pads:
         bkt = _bucket(pad.layer)
         if bkt is None:
@@ -254,7 +355,13 @@ def _convert_footprint(fp, fp_el):
         y    = _um(pad.y_mils)
         w    = _um(pad.width_mils)
         h    = str(round(float(pad.height) * _INTERNAL_TO_UM))
-        name = str(pad.designator)
+        name = str(pad.designator).strip()
+        if not name:
+            anon_n += 1
+            while str(anon_n) in used_names:
+                anon_n += 1
+            name = str(anon_n)
+            used_names.add(name)
         shape_id = int(pad.effective_top_shape)
 
         if not pad.is_smt:
@@ -330,7 +437,7 @@ def _convert_footprint(fp, fp_el):
             fp_el.append(bkt)
 
 
-def _do_model_extraction(lib_el, intlib, pcblib_cache, models_dir):
+def _do_model_extraction(orig_to_compel, intlib, pcblib_cache, models_dir):
     """Extract embedded STEP models, copy to models_dir/{fp_name}.step, add <model3d> to IR."""
     models_dir = Path(models_dir)
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -352,7 +459,7 @@ def _do_model_extraction(lib_el, intlib, pcblib_cache, models_dir):
             pcblib_model_map[mvp] = id_map
 
         for comp in intlib.components:
-            comp_el = lib_el.find(f'component[@name="{comp.name}"]')
+            comp_el = orig_to_compel.get(comp.name)
             if comp_el is None:
                 continue
 
@@ -372,6 +479,12 @@ def _do_model_extraction(lib_el, intlib, pcblib_cache, models_dir):
                 if fp_el is None:
                     continue
 
+                # A merged generic component (e.g. "R") can hold one footprint
+                # shared by several original IntLib rows (R0603/R0603_1) — only
+                # extract/attach the model once.
+                if fp_el.find('model3d') is not None:
+                    continue
+
                 body = next((b for b in fp.component_bodies if b.model_is_embedded), None)
                 if body is None:
                     continue
@@ -380,9 +493,7 @@ def _do_model_extraction(lib_el, intlib, pcblib_cache, models_dir):
                 if src_path is None or not src_path.exists():
                     continue
 
-                # Sanitize footprint name for filesystem
-                safe_fp = re.sub(r'[<>:"/\\|?*]', '_', model.name)
-                step_file = f'{safe_fp}.step'
+                step_file = f'{sanitize_filename(model.name)}.step'
                 shutil.copy2(str(src_path), str(models_dir / step_file))
 
                 m3 = ET.Element('model3d')
@@ -395,8 +506,61 @@ def _do_model_extraction(lib_el, intlib, pcblib_cache, models_dir):
                 fp_el.insert(0, m3)
 
 
-def _convert_component(comp, schlib_cache, pcblib_cache, pool, symbols_el):
-    """Convert one IntLibComponent → <component> XML element, or None on error."""
+_PARAM_REF = re.compile(r'^=([A-Za-z_][A-Za-z0-9_ ]*)$')
+
+
+def _designator_prefix(sym):
+    """Strip the placeholder '?' from the symbol's designator pattern (R? -> R)."""
+    desgns = list(sym.designators)
+    if not desgns or not desgns[0].text:
+        return ''
+    return desgns[0].text.rstrip('?') or desgns[0].text
+
+
+def _is_param_alias(par, all_params):
+    """True if par's text is a '=OtherParamName' reference to a real sibling
+    parameter — Altium's way of mirroring one field onto another (e.g. a
+    Comment field that just displays Value). The referenced parameter already
+    carries the data under its own name, so the alias would only duplicate it.
+    """
+    m = _PARAM_REF.match((par.text or '').strip())
+    if not m:
+        return False
+    ref_name = m.group(1).strip()
+    return any(p.name == ref_name for p in all_params)
+
+
+def _register_symbol(pool, symbols_el, geom_pool, sym, name, part_id=None):
+    """Build (if needed) and register one symbol — or one part of a
+    multi-part symbol — in the library pool. Dedups by exact name first
+    (cheap, no rebuild needed); then by geometry hash, since IntLib gives
+    one symbol record per DesignItemId even when the Library Ref (and thus
+    the geometry) is shared — e.g. R0603/R0603_1 differing only in Value.
+    Returns the registered <symbol> Element (the canonical one on a hash hit).
+    """
+    if name not in pool:
+        sym_el = _convert_symbol(sym, name, part_id=part_id)
+        ghash = _symbol_geometry_hash(sym_el)
+        if ghash in geom_pool:
+            pool[name] = pool[geom_pool[ghash]]
+        else:
+            geom_pool[ghash] = name
+            pool[name] = sym_el
+            symbols_el.append(sym_el)
+    return pool[name]
+
+
+def _convert_component(comp, schlib_cache, pcblib_cache, pool, symbols_el, geom_pool):
+    """Convert one IntLibComponent → component info dict, or None on error.
+
+    Returns {'orig_name', 'prefix', 'is_generic', 'is_multi_gate', 'symbol_name',
+    'symbol_el', 'gates', 'description', 'footprints': [(name, <footprint> Element), ...],
+    'attrs': [(name, value), ...]}. ('symbol_name'/'symbol_el' are None for a
+    multi-gate component; 'gates' is None for a single-symbol one.)
+    Building plain Elements here (instead of attaching them to the tree) lets
+    the caller merge generic value-parametrized parts (R/C/...) that IntLib
+    splits into one row per catalog value, before deciding the final tree shape.
+    """
     vp = comp.virtual_path.lstrip(':\\').replace('\\', '/')
     sch_file = schlib_cache['paths'].get(vp)
     if sch_file is None:
@@ -413,18 +577,31 @@ def _convert_component(comp, schlib_cache, pcblib_cache, pool, symbols_el):
     if sym is None:
         return None
 
-    comp_el = ET.Element('component', name=comp.name)
-    if comp.description:
-        comp_el.set('description', comp.description)
+    # A multi-part Altium symbol (Part Count > 1, e.g. a 2-diode LED package)
+    # draws every part's geometry into the SAME symbol record, distinguished
+    # only by owner_part_id — converting it as one IR symbol would overlay
+    # all parts' geometry on top of each other. Split it into one IR symbol
+    # per part instead, wired up as an IR multi-gate component.
+    is_multi_gate = sym.part_count > 1
+    if is_multi_gate:
+        gates = []
+        for part_idx in range(1, sym.part_count + 1):
+            gate_name = _part_letter(part_idx)
+            part_sym_el = _register_symbol(pool, symbols_el, geom_pool, sym,
+                                            f'{sym.name}_{gate_name}', part_id=part_idx)
+            gates.append((gate_name, part_sym_el.get('name')))
+        canonical_sym_name, sym_el_for_info = None, None
+    else:
+        sym_el = _register_symbol(pool, symbols_el, geom_pool, sym, sym.name)
+        canonical_sym_name, sym_el_for_info, gates = sym_el.get('name'), sym_el, None
 
-    # Register the symbol in the library pool (dedup by symbol name) and
-    # reference it from the component (single-mode).
-    sym_name = sym.name
-    if sym_name not in pool:
-        pool[sym_name] = _convert_symbol(sym, sym_name)
-        symbols_el.append(pool[sym_name])
-    comp_el.set('symbol', sym_name)
+    all_params = list(sym.parameters)
+    # Generic value-parametrized merging (R/C/...) doesn't make sense for a
+    # multi-gate part (an LED pair isn't "the same device at a different
+    # catalog value"), so it's never treated as a merge candidate.
+    is_generic = (not is_multi_gate) and any(p.name == 'Value' for p in all_params)
 
+    footprints = []
     for model in comp.models:
         if model.model_type != 'PCBLIB':
             continue
@@ -444,31 +621,60 @@ def _convert_component(comp, schlib_cache, pcblib_cache, pool, symbols_el):
         if fp is None:
             continue
 
-        fp_el = ET.SubElement(comp_el, 'footprint', name=model.name)
+        fp_el = ET.Element('footprint', name=model.name)
         _convert_footprint(fp, fp_el)
 
         # Pin → pad mapping by matching designators
         pad_des = {str(p.designator) for p in fp.pads}
         pm_el = ET.SubElement(fp_el, 'pin-mapping')
-        seen_names: dict[str, int] = {}
-        for pin in sym.pins:
-            pname = _clean_param_name(pin.name or str(pin.designator))
-            seen_names[pname] = seen_names.get(pname, 0) + 1
-            n = seen_names[pname]
-            ir_name = pname if n == 1 else f'{pname}@{n}'
-            des = str(pin.designator)
-            if des in pad_des:
-                ET.SubElement(pm_el, 'map', pin=ir_name, pad=des)
+        if is_multi_gate:
+            for part_idx in range(1, sym.part_count + 1):
+                gate_name = _part_letter(part_idx)
+                for ir_name, pin in _iter_named_pins(sym, part_idx):
+                    des = str(pin.designator)
+                    if des in pad_des:
+                        ET.SubElement(pm_el, 'map', pin=f'{gate_name}.{ir_name}', pad=des)
+        else:
+            for ir_name, pin in _iter_named_pins(sym):
+                des = str(pin.designator)
+                if des in pad_des:
+                    ET.SubElement(pm_el, 'map', pin=ir_name, pad=des)
 
-    attrs_el = ET.SubElement(comp_el, 'attributes')
-    for par in sym.parameters:
+        footprints.append((model.name, fp_el))
+
+    attrs = []
+    for par in all_params:
         if par.name == 'Designator':
             continue
-        pname = _clean_param_name(par.name)
-        if pname:
-            ET.SubElement(attrs_el, 'attr', name=pname, value=par.text or '')
+        # Value/Comment are per-instance catalog data for generic parts
+        # (R/C/...) — they live on the schematic placement, not on the device
+        # record (Comment is Altium's schematic-visible "value" field, see
+        # the >VALUE mapping above).
+        if is_generic and par.name in ('Value', 'Comment'):
+            continue
+        if _is_param_alias(par, all_params):
+            continue
+        pname = clean_attr_name(par.name)
+        if not pname:
+            continue
+        # IR attribute names are canonically lowercase (see
+        # eagle_parser.convert_deviceset); Value/Comment both map onto the
+        # same canonical 'value' key (see the >VALUE mapping above).
+        key = 'value' if pname.lower() in ('value', 'comment') else pname.lower()
+        attrs.append((key, par.text or ''))
 
-    return comp_el
+    return {
+        'orig_name': comp.name,
+        'prefix': _designator_prefix(sym),
+        'is_generic': is_generic,
+        'is_multi_gate': is_multi_gate,
+        'symbol_name': canonical_sym_name,
+        'symbol_el': sym_el_for_info,
+        'gates': gates,
+        'description': comp.description,
+        'footprints': footprints,
+        'attrs': attrs,
+    }
 
 
 def convert(intlib_path: str, output_path: str):
@@ -490,15 +696,87 @@ def convert(intlib_path: str, output_path: str):
     lib_el     = ET.Element('library', name=lib_path.stem, source='altium')
     symbols_el = ET.SubElement(lib_el, 'symbols')
     pool: dict = {}
+    geom_pool: dict = {}   # geometry_hash -> canonical symbol name
+
+    # Generic value-parametrized parts (R/C/...) get one IR <component> per
+    # (prefix, symbol) — IntLib otherwise gives one row per catalog Value,
+    # which is schematic-instance data, not a distinct device.
+    # Keyed by (prefix, id(symbol_el)) rather than the symbol's name string:
+    # the symbol gets renamed to the prefix below, and a name-based key would
+    # go stale between the first group member (pre-rename) and the next one
+    # (post-rename) sharing the same aliased symbol Element.
+    generic_groups: dict = {}      # (prefix, id(symbol_el)) -> (comp_el, {fp_name: fp_el})
+    orig_to_compel: dict = {}      # original IntLib component name -> its <component> Element
 
     for comp in intlib.components:
-        comp_el = _convert_component(comp, schlib_cache, pcblib_cache,
-                                     pool, symbols_el)
-        if comp_el is not None:
+        info = _convert_component(comp, schlib_cache, pcblib_cache,
+                                   pool, symbols_el, geom_pool)
+        if info is None:
+            continue
+
+        if info['is_multi_gate']:
+            comp_el = ET.Element('component', name=info['orig_name'], prefix=info['prefix'])
+            # Altium has no on-sheet gate position to carry over (parts share
+            # one symbol record, distinguished only by owner_part_id) — stack
+            # the gates vertically, 0.5" apart, so identical-looking gates
+            # (e.g. two diodes in one LED package) don't render on top of
+            # each other at (0,0).
+            for i, (gate_name, gate_sym_name) in enumerate(info['gates']):
+                ET.SubElement(comp_el, 'gate', name=gate_name, symbol=gate_sym_name,
+                              x='0', y=str(i * 12700))
+            for fp_name, fp_el in info['footprints']:
+                comp_el.append(fp_el)
+            attrs_el = ET.SubElement(comp_el, 'attributes')
+            # `description` is a plain attribute in IR (same as KiCad/Eagle),
+            # not a dedicated element/component-attribute — kept first for
+            # readability, no semantic significance to the order.
+            if info['description']:
+                ET.SubElement(attrs_el, 'attr', name='description', value=info['description'])
+            for aname, avalue in info['attrs']:
+                ET.SubElement(attrs_el, 'attr', name=aname, value=avalue)
             lib_el.append(comp_el)
+            orig_to_compel[info['orig_name']] = comp_el
+        elif info['is_generic']:
+            sym_el = info['symbol_el']
+            prefix = info['prefix']
+            key = (prefix, id(sym_el))
+            if key not in generic_groups:
+                # Rename the pooled symbol from its catalog-row name (R0603)
+                # to the generic device name (R) — unless that name is
+                # already taken by some unrelated symbol.
+                clash = symbols_el.find(f'symbol[@name="{prefix}"]')
+                if clash is None or clash is sym_el:
+                    sym_el.set('name', prefix)
+                comp_el = ET.Element('component', name=prefix,
+                                      prefix=prefix, symbol=sym_el.get('name'))
+                attrs_el = ET.SubElement(comp_el, 'attributes')
+                if info['description']:
+                    ET.SubElement(attrs_el, 'attr', name='description', value=info['description'])
+                for aname, avalue in info['attrs']:
+                    ET.SubElement(attrs_el, 'attr', name=aname, value=avalue)
+                lib_el.append(comp_el)
+                generic_groups[key] = (comp_el, {})
+            comp_el, fp_map = generic_groups[key]
+            for fp_name, fp_el in info['footprints']:
+                if fp_name not in fp_map:
+                    comp_el.append(fp_el)
+                    fp_map[fp_name] = fp_el
+            orig_to_compel[info['orig_name']] = comp_el
+        else:
+            comp_el = ET.Element('component', name=info['orig_name'],
+                                  prefix=info['prefix'], symbol=info['symbol_name'])
+            for fp_name, fp_el in info['footprints']:
+                comp_el.append(fp_el)
+            attrs_el = ET.SubElement(comp_el, 'attributes')
+            if info['description']:
+                ET.SubElement(attrs_el, 'attr', name='description', value=info['description'])
+            for aname, avalue in info['attrs']:
+                ET.SubElement(attrs_el, 'attr', name=aname, value=avalue)
+            lib_el.append(comp_el)
+            orig_to_compel[info['orig_name']] = comp_el
 
     models_dir = Path(output_path).parent / lib_path.stem
-    _do_model_extraction(lib_el, intlib, pcblib_cache, models_dir)
+    _do_model_extraction(orig_to_compel, intlib, pcblib_cache, models_dir)
 
     raw   = minidom.parseString(ET.tostring(lib_el, encoding='unicode')).toprettyxml(indent='  ')
     clean = '\n'.join(l for l in raw.splitlines() if l.strip())

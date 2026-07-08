@@ -1,0 +1,169 @@
+(footprint "C_Axial_L12.0mm_D6.5mm_P20.00mm_Horizontal"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(descr "C, Axial series, Axial, Horizontal, pin pitch=20mm, length*diameter=12*6.5mm^2, http://cdn-reichelt.de/documents/datenblatt/B300/STYROFLEX.pdf")
+	(tags "C Axial series Axial Horizontal pin pitch 20mm  length 12mm diameter 6.5mm")
+	(property "Reference" "REF**"
+		(at 10 -4.37 0)
+		(layer "F.SilkS")
+		(uuid "32e617b0-7f47-4308-afef-c6635249cee3")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "22uF/25V"
+		(at 10 4.37 0)
+		(layer "F.Fab")
+		(uuid "3aedcb0a-10c2-4dc7-b773-7f84b12f0a59")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "b1987409-1f17-4213-9ea5-62b1e6ed44f9")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "78b4d231-07d5-4687-b352-6410296c7c6b")
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+	)
+	(property ki_fp_filters "CP* Elko* TantalC* C*elec c_elec* SMD*_Pol")
+	(sheetname "/")
+	(sheetfile "pic_programmer.kicad_sch")
+	(attr through_hole)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_line
+		(start 1.04 0)
+		(end 3.88 0)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "56a360c1-eeca-4ffc-8cde-9b58718a05c8")
+	)
+	(fp_line
+		(start 18.96 0)
+		(end 16.12 0)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "476a0349-7e1d-4a6d-8cde-251a912efba9")
+	)
+	(fp_rect
+		(start 3.88 -3.37)
+		(end 16.12 3.37)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.SilkS")
+		(uuid "004fae04-733d-4a2e-93ca-f494dc7071a6")
+	)
+	(fp_rect
+		(start -1.05 -3.5)
+		(end 21.05 3.5)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.CrtYd")
+		(uuid "799d21c6-0545-494c-b5f2-6edfee490644")
+	)
+	(fp_line
+		(start 0 0)
+		(end 4 0)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "0c1a6f36-a5e0-4859-8ba2-f5289c6cc4b5")
+	)
+	(fp_line
+		(start 20 0)
+		(end 16 0)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "48acae44-f8a9-42dc-b679-ad42a3a5dba1")
+	)
+	(fp_rect
+		(start 4 -3.25)
+		(end 16 3.25)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.Fab")
+		(uuid "7c16f794-21f1-4d9f-bcda-22347a5467ac")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 10 0 0)
+		(layer "F.Fab")
+		(uuid "996d497c-7328-4a00-8b35-5ae6e09c6e01")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "1" thru_hole circle
+		(at 0 0)
+		(size 1.6 1.6)
+		(drill 0.8)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers no)
+		(uuid "6f27262a-376c-4480-9c1c-ed2145b14989")
+	)
+	(pad "2" thru_hole circle
+		(at 20 0)
+		(size 1.6 1.6)
+		(drill 0.8)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers no)
+		(uuid "37dbdd95-a719-419e-8cc3-b3be517743bf")
+	)
+	(embedded_fonts no)
+	(model "${KICAD10_3DMODEL_DIR}/Capacitor_THT.3dshapes/C_Axial_L12.0mm_D6.5mm_P20.00mm_Horizontal.step"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)

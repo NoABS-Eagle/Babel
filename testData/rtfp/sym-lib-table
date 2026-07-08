@@ -1,0 +1,6 @@
+(sym_lib_table
+	(version 7)
+	(lib (name "cipos") (type "KiCad") (uri "${KIPRJMOD}/Libraries/cipos.kicad_sym") (options "") (descr ""))
+	(lib (name "door_controller-rescue") (type "KiCad") (uri "${KIPRJMOD}/Libraries/door_controller-rescue.kicad_sym") (options "") (descr ""))
+	(lib (name "Induct_bourns") (type "KiCad") (uri "${KIPRJMOD}/Libraries/Induct_bourns.kicad_sym") (options "") (descr ""))
+)

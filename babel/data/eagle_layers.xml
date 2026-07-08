@@ -3,7 +3,10 @@
   Canonical Eagle layer definitions for Babel exports.
   Copied verbatim into every exported Eagle file (.lbr, .sch, .brd).
   Edit this file to change layer colors, fill patterns, or visibility.
-  Standard Eagle 7.x layers only — no third-party custom layers.
+  Standard Eagle 7.x layers, plus one Babel-defined custom layer: 100
+  "GRAPHIC" — decorative canvas geometry (ir_schema.md "Слои" -> "GRAPHIC"),
+  no native Eagle equivalent (see decisions.md "Eagle-экспорт: слой GRAPHIC
+  для декоративной геометрии схемы").
   Layer 98 (Guide) intentionally omitted.
 -->
 <layers>
@@ -66,4 +69,5 @@
   <layer number="96" name="Values"     color="7"  fill="1"  visible="yes" active="yes"/>
   <layer number="97" name="Info"       color="7"  fill="1"  visible="yes" active="yes"/>
   <layer number="99" name="Invisibles" color="7"  fill="1"  visible="no"  active="no"/>
+  <layer number="100" name="GRAPHIC"   color="7"  fill="0"  visible="yes" active="yes"/>
 </layers>

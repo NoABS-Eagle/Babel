@@ -5,6 +5,7 @@ import shutil
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from pathlib import Path
+from babel.ir_util import resolve_model3d_file
 
 # Eagle layer number → IR layer name (None = ignore)
 LAYER_MAP = {
@@ -18,14 +19,12 @@ LAYER_MAP = {
     32: 'cream_bottom',
     39: 'courtyard',
     51: 'fab',
-    94: 'symbol',
-    95: 'symbol_names',
-    96: 'symbol_values',
-    97: 'symbol_info',
+    91: 'NETS',
+    94: 'SYMBOLS',
+    95: 'NAMES',
+    96: 'VALUES',
+    97: 'INFO',
 }
-
-_SYM_GEOMETRY_LAYERS = {'symbol'}
-_SYM_TEXT_LAYERS     = {'symbol', 'symbol_names', 'symbol_values', 'symbol_info'}
 
 DIR_MAP = {
     'in':  'in',
@@ -35,8 +34,8 @@ DIR_MAP = {
     'pwr': 'pwr',
     'pas': 'pas',
     'hiz': 'io',
-    'sup': 'pwr',
-    'nc':  None,
+    'sup': 'sup',
+    'nc':  'nc',
 }
 
 
@@ -139,11 +138,17 @@ def convert_symbol(sym_el, sym_name):
     for child in sym_el:
         tag = child.tag
         layer = int(child.get('layer', 0))
-        ir_layer = LAYER_MAP.get(layer)
+        # Eagle lets geometry/text sit on ANY layer inside a <symbol> (real
+        # Eagle, confirmed by the user drawing a rectangle on Names/95
+        # directly) — no layer filters what's a valid symbol object, so
+        # every wire/rectangle/circle/polygon/text is imported regardless
+        # of its layer number, carrying that layer's IR name through
+        # explicitly (falling back to the raw Eagle number as a string for
+        # anything not in LAYER_MAP, same as ir_schema.md "Слои": an
+        # unrecognized name is not an error).
+        ir_layer = LAYER_MAP.get(layer, str(layer))
 
         if tag == 'wire':
-            if ir_layer not in _SYM_GEOMETRY_LAYERS:
-                continue
             curve = float(child.get('curve', 0))
             x1, y1 = float(child.get('x1')), float(child.get('y1'))
             x2, y2 = float(child.get('x2')), float(child.get('y2'))
@@ -157,13 +162,15 @@ def convert_symbol(sym_el, sym_name):
                     el.set('r', str(round(r * 1000)))
                     el.set('start', fmt(start)); el.set('sweep', fmt(sweep))
                     el.set('width', _um(width))
+                    el.set('layer', ir_layer)
             else:
                 el = ET.SubElement(sym, 'line')
                 el.set('x1', str(round(x1 * 1000))); el.set('y1', str(round(y1 * 1000)))
                 el.set('x2', str(round(x2 * 1000))); el.set('y2', str(round(y2 * 1000)))
                 el.set('width', _um(width))
+                el.set('layer', ir_layer)
 
-        elif tag == 'rectangle' and ir_layer in _SYM_GEOMETRY_LAYERS:
+        elif tag == 'rectangle':
             x1, y1 = float(child.get('x1')), float(child.get('y1'))
             x2, y2 = float(child.get('x2')), float(child.get('y2'))
             rot, _ = parse_rot(child.get('rot'))
@@ -178,8 +185,9 @@ def convert_symbol(sym_el, sym_name):
             el.set('roundness', '0')
             el.set('rot', str(round(rot)))
             el.set('outline', _um(child.get('width', '0')))
+            el.set('layer', ir_layer)
 
-        elif tag == 'circle' and ir_layer in _SYM_GEOMETRY_LAYERS:
+        elif tag == 'circle':
             r_um = round(float(child.get('radius')) * 1000)
             el = ET.SubElement(sym, 'shape')
             el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
@@ -187,21 +195,21 @@ def convert_symbol(sym_el, sym_name):
             el.set('roundness', '100')
             el.set('rot', '0')
             el.set('outline', _um(child.get('width', '0')))
+            el.set('layer', ir_layer)
 
-        elif tag == 'polygon' and ir_layer in _SYM_GEOMETRY_LAYERS:
+        elif tag == 'polygon':
             width_um = round(float(child.get('width', '0')) * 1000)
             if 0 < width_um < 50:
                 width_um = 50
             pg = ET.SubElement(sym, 'polygon')
             pg.set('width', str(width_um))
+            pg.set('layer', ir_layer)
             for v in child.findall('vertex'):
                 ve = ET.SubElement(pg, 'vertex')
                 ve.set('x', str(round(float(v.get('x', '0')) * 1000)))
                 ve.set('y', str(round(float(v.get('y', '0')) * 1000)))
 
         elif tag == 'text':
-            if ir_layer not in _SYM_TEXT_LAYERS:
-                continue
             rot, _ = parse_rot(child.get('rot'))
             el = ET.SubElement(sym, 'text')
             el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
@@ -213,11 +221,43 @@ def convert_symbol(sym_el, sym_name):
                 el.set('font', 'vector')
             el.text = child.text or ''
 
+        elif tag == 'frame':
+            # ir_schema.md "Frame": a Frame-role symbol carries exactly one
+            # <shape> on the FRAME layer, geometric role only (bounding
+            # rectangle) — Eagle's own <frame> columns/rows/border-* are a
+            # print-tiling/decoration concern with no IR equivalent (same
+            # "IR doesn't store color/decoration" principle as everywhere
+            # else), dropped. This is Eagle's SECOND way to place a frame
+            # (the first being a bare <frame> directly in a sheet's <plain>,
+            # handled separately by the schematic importer, not here) — a
+            # stock "Frame" library deviceset (e.g. frames.lbr) whose SYMBOL
+            # itself contains a <frame> element; confirmed real
+            # (testData/maximus.sch, <symbol name="A3L-LOC">, no pins).
+            x1, y1 = float(child.get('x1')), float(child.get('y1'))
+            x2, y2 = float(child.get('x2')), float(child.get('y2'))
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            w, h = abs(x2 - x1), abs(y2 - y1)
+            el = ET.SubElement(sym, 'shape')
+            el.set('x', str(round(cx * 1000))); el.set('y', str(round(cy * 1000)))
+            el.set('w', str(round(w * 1000))); el.set('h', str(round(h * 1000)))
+            el.set('roundness', '0')
+            el.set('rot', '0')
+            el.set('outline', _um(child.get('width', '0')))
+            el.set('layer', 'FRAME')
+
         elif tag == 'pin':
             direction = child.get('direction', 'io')
-            ir_dir = DIR_MAP.get(direction)
-            if ir_dir is None:
-                continue  # skip NC pins
+            ir_dir = DIR_MAP.get(direction, 'io')
+            # Eagle's `visible` (off/pad/pin/both) controls ONLY the name/
+            # number LABELS, never the pin stub itself — Eagle always draws
+            # the pin body regardless (per the user, confirmed against the
+            # Eagle manual's own Direction section: `visible` is a separate
+            # axis entirely from `direction`/`nc`). Unlike KiCad's `(hide
+            # yes)` (which suppresses the WHOLE pin, stub included — see
+            # kicad_parser.py's "no_connect + hidden -> skip entirely"), an
+            # Eagle `nc` pin is ALWAYS imported as a real <pin>, visible or
+            # not — its own pinvis/padvis booleans (below) already capture
+            # whatever label visibility the source actually has.
             rot, _ = parse_rot(child.get('rot'))
             pin_len_um = {'point': 0, 'short': 2540, 'middle': 5080, 'long': 7620}.get(
                 child.get('length', 'long'), 7620)
@@ -228,7 +268,12 @@ def convert_symbol(sym_el, sym_name):
             el.set('length', str(pin_len_um))
             el.set('direction', ir_dir)
             el.set('function', child.get('function', 'none'))
-            el.set('visible', child.get('visible', 'both'))
+            # Eagle's single combined enum (off/pad/pin/both — 'pin' = name
+            # shown, 'pad' = number shown) split into two independent IR
+            # booleans, always written explicitly (per the user).
+            eagle_visible = child.get('visible', 'both')
+            el.set('pinvis', '1' if eagle_visible in ('both', 'pin') else '0')
+            el.set('padvis', '1' if eagle_visible in ('both', 'pad') else '0')
 
     return sym
 
@@ -414,76 +459,137 @@ def collect_attributes(ds_el):
 
 
 def convert_deviceset(ds_el, packages):
-    comp = ET.Element('component')
-    comp.set('name', ds_el.get('name'))
-    if ds_el.get('prefix'):
-        comp.set('prefix', ds_el.get('prefix'))
-    if ds_el.get('uservalue') == 'yes':
-        comp.set('uservalue', 'yes')
+    """One Eagle <deviceset> -> a LIST of IR <component> elements, one per
+    distinct technology name found across its devices.
 
-    desc_el = ds_el.find('description')
-    if desc_el is not None and desc_el.text:
-        d = ET.SubElement(comp, 'description')
-        d.text = desc_el.text
+    Eagle's <technology> (per-device, e.g. "-1%"/"-5%" tolerance variants
+    on the SAME footprint) has no IR equivalent — IR is two-level
+    (component -> footprint/variant), Eagle is three-level (deviceset ->
+    device -> technology). Per the user: this is a deliberate, honest
+    simplification, not a loss to patch around — "физически разные
+    устройства" (a 1.8V and a 3.3V regulator ARE two different real parts,
+    e.g. crystal:CRYSTAL-4P's "-16MHZ"/"-24MHZ" devices, or linear
+    regulators:XC6206P's "182"/"302"/"332" output-voltage variants) deserve
+    to be modeled as independent components, not squeezed into one with a
+    fake "technology" axis nobody but Eagle itself tracks. The previous
+    behavior (collapsing every technology's attributes into ONE merged set
+    per device, first non-empty value silently winning) was found to
+    actively corrupt device-specific facts on testData/maximus.sch's own
+    round-trip: "R" device "-0603"'s "-1%" and "-5%" technology variants
+    share one footprint but carry DIFFERENT MANF#/LCSC# per technology —
+    merging them let one technology's attributes silently overwrite the
+    other's on export.
 
-    attrs_el = ET.SubElement(comp, 'attributes')
-    ET.SubElement(attrs_el, 'attr').attrib.update({'name': 'value', 'value': ''})
-    for name, val in collect_attributes(ds_el).items():
-        ET.SubElement(attrs_el, 'attr').attrib.update({'name': name.lower(), 'value': val})
+    One IR <component> per distinct technology NAME across ALL of this
+    deviceset's devices (not per-device — Eagle only bothers naming a
+    technology when it's a REAL, meaningfully different variant, and the
+    same name means the same real thing across devices that share it,
+    confirmed on "R": every device with a "-1%"/"-5%" pair names them
+    identically). Naming: bare `name=""` -> the deviceset's own name
+    unchanged (e.g. "R") — the ordinary case for devices that only ever
+    have ONE anonymous technology (most Eagle libraries; "R"'s own SQP-5W/
+    -0201 devices fall in this bucket alongside every "normal" component
+    with no tolerance variants at all). A REAL non-empty technology name
+    suffixes the deviceset name directly (Eagle's own convention already
+    embeds any separator it wants in the name itself, e.g. "-1%" already
+    starts with "-": ds_name + tech_name, no separator inserted here) ->
+    "R-1%", "R-5%". A device that has NO technology matching a given name
+    at all (e.g. "-SQP-5W" only ever has "") simply isn't included in
+    that name's component — <component name="R-1%"> only carries the 7
+    devices that actually declare a "-1%" technology, not all 9.
 
+    Each returned <component>'s name is unique — the caller registers each
+    independently (same shape a single-technology deviceset already
+    produced, just N times instead of once).
+    """
+    tech_names = set()
+    for device in ds_el.find('devices').findall('device'):
+        for tech in device.findall('technologies/technology'):
+            tech_names.add(tech.get('name', ''))
+    if not tech_names:
+        tech_names = {''}
+
+    ds_name = ds_el.get('name')
     gates_el = ds_el.find('gates')
     gate_list = gates_el.findall('gate') if gates_el is not None else []
     multi = len(gate_list) > 1
 
-    if not multi and gate_list:
-        comp.set('symbol', gate_list[0].get('symbol', ''))
-    else:
-        for gate in gate_list:
-            g = ET.SubElement(comp, 'gate')
-            g.set('name', gate.get('name'))
-            g.set('symbol', gate.get('symbol', ''))
-            g.set('x', str(round(float(gate.get('x', '0')) * 1000)))
-            g.set('y', str(round(float(gate.get('y', '0')) * 1000)))
+    components = []
+    for tech_name in sorted(tech_names):
+        comp = ET.Element('component')
+        comp.set('name', ds_name + tech_name if tech_name else ds_name)
+        if ds_el.get('prefix'):
+            comp.set('prefix', ds_el.get('prefix'))
+        if ds_el.get('uservalue') == 'yes':
+            comp.set('uservalue', 'yes')
 
-    for device in ds_el.find('devices').findall('device'):
-        pkg_name = device.get('package')
-        if not pkg_name or pkg_name not in packages:
-            continue
+        attrs_el = ET.SubElement(comp, 'attributes')
+        ET.SubElement(attrs_el, 'attr').attrib.update({'name': 'value', 'value': ''})
+        # `description` is a plain attribute in IR, same as everywhere else
+        # (KiCad/Altium) — no dedicated <description> element. Eagle's own
+        # native deviceset <description> is special-cased back out of this
+        # attr only on export (see eagle_exporter.export_deviceset), not
+        # here — same text on every technology-split component (it's a
+        # deviceset-level fact, not per-technology).
+        desc_el = ds_el.find('description')
+        if desc_el is not None and desc_el.text:
+            ET.SubElement(attrs_el, 'attr').attrib.update(
+                {'name': 'description', 'value': desc_el.text})
 
-        fp = convert_package(packages[pkg_name], pkg_name)
-        dev_variant = device.get('name', '')
-        if dev_variant:
-            fp.set('variant', dev_variant)
+        if not multi and gate_list:
+            comp.set('symbol', gate_list[0].get('symbol', ''))
+        else:
+            for gate in gate_list:
+                g = ET.SubElement(comp, 'gate')
+                g.set('name', gate.get('name'))
+                g.set('symbol', gate.get('symbol', ''))
+                g.set('x', str(round(float(gate.get('x', '0')) * 1000)))
+                g.set('y', str(round(float(gate.get('y', '0')) * 1000)))
 
-        # Per-device attributes (from all technologies merged; first non-empty wins).
-        # NOTE: Eagle technologies (e.g. -1%, -5% tolerance variants) are NOT supported —
-        # multiple technologies per device collapse into one attribute set.
-        dev_attrs: dict[str, str] = {}
-        for tech in device.findall('technologies/technology'):
-            for attr in tech.findall('attribute'):
+        for device in ds_el.find('devices').findall('device'):
+            pkg_name = device.get('package')
+            if not pkg_name or pkg_name not in packages:
+                continue
+
+            tech_el = next((t for t in device.findall('technologies/technology')
+                             if t.get('name', '') == tech_name), None)
+            if tech_el is None:
+                continue   # this device has no variant under this technology name
+
+            fp = convert_package(packages[pkg_name], pkg_name)
+            dev_variant = device.get('name', '')
+            if dev_variant:
+                fp.set('variant', dev_variant)
+
+            # This technology's OWN attributes only — no merging across
+            # different technology names (that was the bug being fixed).
+            dev_attrs: dict[str, str] = {}
+            for attr in tech_el.findall('attribute'):
                 n = attr.get('name', '').lower()
                 v = attr.get('value', '')
-                if n and (n not in dev_attrs or (not dev_attrs[n] and v)):
+                if n and v:
                     dev_attrs[n] = v
-        if dev_attrs:
-            fa = ET.SubElement(fp, 'attributes')
-            for n, v in dev_attrs.items():
-                ET.SubElement(fa, 'attr').attrib.update({'name': n, 'value': v})
+            if dev_attrs:
+                fa = ET.SubElement(fp, 'attributes')
+                for n, v in dev_attrs.items():
+                    ET.SubElement(fa, 'attr').attrib.update({'name': n, 'value': v})
 
-        connects = device.find('connects')
-        if connects is not None:
-            pm = ET.SubElement(fp, 'pin-mapping')
-            for conn in connects.findall('connect'):
-                m = ET.SubElement(pm, 'map')
-                m.set('pad', conn.get('pad'))
-                if multi:
-                    m.set('pin', f"{conn.get('gate')}.{conn.get('pin')}")
-                else:
-                    m.set('pin', conn.get('pin'))
+            connects = device.find('connects')
+            if connects is not None:
+                pm = ET.SubElement(fp, 'pin-mapping')
+                for conn in connects.findall('connect'):
+                    m = ET.SubElement(pm, 'map')
+                    m.set('pad', conn.get('pad'))
+                    if multi:
+                        m.set('pin', f"{conn.get('gate')}.{conn.get('pin')}")
+                    else:
+                        m.set('pin', conn.get('pin'))
 
-        comp.append(fp)
+            comp.append(fp)
 
-    return comp
+        components.append(comp)
+
+    return components
 
 
 # ---------------------------------------------------------------------------
@@ -506,11 +612,12 @@ def convert(lbr_path, output_path=None):
     for sym_name, sym_el in eagle_syms.items():
         symbols_el.append(convert_symbol(sym_el, sym_name))
 
-    # Components from devicesets
+    # Components from devicesets — one deviceset -> N components, one per
+    # distinct Eagle <technology> name (see convert_deviceset).
     used_pkg_names = set()
     for ds in lib_el.find('devicesets').findall('deviceset'):
-        comp = convert_deviceset(ds, packages)
-        lib.append(comp)
+        for comp in convert_deviceset(ds, packages):
+            lib.append(comp)
         for device in ds.find('devices').findall('device'):
             pkg = device.get('package', '')
             if pkg:
@@ -539,28 +646,18 @@ def convert(lbr_path, output_path=None):
 
 
 def _copy_step_files(lib_el, lbr_path, out_path):
-    """Find STEP/WRL files in <lbr_stem>/ next to lbr, copy to <out_stem>/ next to IR.
-
-    Also sets file="<pkg>.step" attribute on each matching <model3d> element.
-    """
+    """Find STEP/WRL files in <lbr_stem>/ next to lbr, copy to <out_stem>/ next to IR."""
     step_src = lbr_path.parent / lbr_path.stem
     if not step_src.is_dir():
         return
     step_dst = out_path.parent / out_path.stem
 
     def _attach(fp_el):
-        m3d = fp_el.find('model3d')
-        if m3d is None:
-            return
-        pkg_name = fp_el.get('name', '')
-        for ext in ('.step', '.stp', '.wrl'):
-            src = step_src / f'{pkg_name}{ext}'
-            if src.exists():
-                m3d.set('file', src.name)
-                step_dst.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, step_dst / src.name)
-                print(f'  3D: {src.name}')
-                break
+        src = resolve_model3d_file(fp_el, step_src)
+        if src is not None:
+            step_dst.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, step_dst / src.name)
+            print(f'  3D: {src.name}')
 
     for comp in lib_el.findall('component'):
         for fp_el in comp.findall('footprint'):

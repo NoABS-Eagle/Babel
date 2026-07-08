@@ -9,7 +9,7 @@ from pathlib import Path
 from flask import Flask, render_template, request, redirect, url_for, abort, send_file
 
 from babel.svg_renderer import render_symbol, render_footprint
-from babel.ir_util import symbol_pool, component_gates
+from babel.ir_util import symbol_pool, component_gates, resolve_model3d_file
 from babel.eagle_parser import convert as eagle_parse
 from babel.altium_parser import convert as altium_parse
 from babel.eagle_exporter import export as eagle_export
@@ -258,11 +258,9 @@ def component_detail(comp_id):
         pm = fp.find('pin-mapping')
         pin_map = [{'pin': m.get('pin'), 'pad': m.get('pad')}
                    for m in (pm.findall('map') if pm is not None else [])]
-        m3d      = fp.find('model3d')
-        step_file = (m3d.get('file', '') if m3d is not None else '')
-        step_url  = (url_for('serve_step', filename=step_file)
-                     if step_file and (_SESSION_STEP_DIR / step_file).exists()
-                     else None)
+        step_path = resolve_model3d_file(fp, _SESSION_STEP_DIR)
+        step_url  = (url_for('serve_step', filename=step_path.name)
+                     if step_path is not None else None)
         footprints.append({
             'id':       fp.get('name'),
             'svg':      render_footprint(fp, fixed_size=260),
