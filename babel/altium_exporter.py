@@ -17,7 +17,7 @@ from altium_monkey.altium_pcb_enums import PadShape, PcbTextJustification
 from altium_monkey.altium_record_types import PcbLayer, LineWidth
 from altium_monkey.altium_sch_svg_renderer import LINE_WIDTH_MILS
 
-from babel.ir_util import component_gates, is_multi_gate, resolve_model3d_file
+from babel.ir_util import component_gates, is_multi_gate, parse_layer, resolve_model3d_file
 
 
 def _mils(v):
@@ -170,17 +170,35 @@ _DIR_TO_ELEC = {
 # special ERC-silencing behavior is lost, which Altium has no slot for
 # regardless of what we do here.
 
+# IR signed layer number (ir_schema.md "Плата (Board IR)") -> Altium PcbLayer.
 _IR_TO_PCB_LAYER = {
-    'top':          PcbLayer.TOP,
-    'bottom':       PcbLayer.BOTTOM,
-    'silk_top':     PcbLayer.TOP_OVERLAY,
-    'silk_bottom':  PcbLayer.BOTTOM_OVERLAY,
-    'labels':       PcbLayer.TOP_OVERLAY,   # >NAME / >VALUE text
-    'cream_top':    PcbLayer.TOP_PASTE,
-    'cream_bottom': PcbLayer.BOTTOM_PASTE,
-    'courtyard':    71,   # MECHANICAL_15
-    'fab':          57,   # MECHANICAL_1
+    1:    PcbLayer.TOP,
+    -1:   PcbLayer.BOTTOM,
+    121:  PcbLayer.TOP_OVERLAY,
+    -121: PcbLayer.BOTTOM_OVERLAY,
+    125:  PcbLayer.TOP_OVERLAY,     # Eagle tNames/tValues text -> overlay
+    -125: PcbLayer.BOTTOM_OVERLAY,
+    127:  PcbLayer.TOP_OVERLAY,
+    -127: PcbLayer.BOTTOM_OVERLAY,
+    131:  PcbLayer.TOP_PASTE,
+    -131: PcbLayer.BOTTOM_PASTE,
+    139:  71,   # courtyard -> MECHANICAL_15
+    -139: 71,
+    151:  57,   # fab -> MECHANICAL_1
+    -151: 57,
+    148:  57,   # side-less Document notes -> MECHANICAL_1 too
 }
+
+
+def _pcb_layer(ln):
+    """IR footprint layer attribute -> Altium PcbLayer, or None (drop)."""
+    try:
+        anti, n = parse_layer(ln)
+    except (TypeError, ValueError):
+        return None
+    if anti:
+        return None
+    return _IR_TO_PCB_LAYER.get(n)
 
 
 # ─── pin mapping helpers ─────────────────────────────────────────────────────
@@ -785,137 +803,139 @@ def _write_dblib(dblib_path, xlsx_name, all_cols):
 def _export_footprint(fp_el, pcblib, step_dir=None):
     fp = pcblib.add_footprint(fp_el.get('name', ''))
 
-    for layer_el in fp_el:
-        layer_tag = layer_el.tag
-        if layer_tag in ('model3d', 'pin-mapping', 'description'):
+    for child in fp_el:
+        tag = child.tag
+        if tag in ('model3d', 'pin-mapping', 'description'):
             continue
-        pcb_layer = _IR_TO_PCB_LAYER.get(layer_tag)
+        if tag in ('smd', 'pad', 'hole'):
+            pcb_layer = None            # pads pick their own layer below
+            smd_far = child.get('layer') == '-1'
+        else:
+            pcb_layer = _pcb_layer(child.get('layer'))
 
-        for child in layer_el:
-            tag = child.tag
 
-            if tag == 'smd':
-                roundness = int(child.get('roundness', 0))
-                if roundness == 100:
-                    shape = PadShape.CIRCLE
-                elif roundness > 0:
-                    shape = PadShape.ROUNDED_RECTANGLE
-                else:
-                    shape = PadShape.RECTANGLE
-                fp.add_pad(
-                    designator            = child.get('name', ''),
-                    position_mils         = [_mils(child.get('x', 0)),
-                                             _mils(child.get('y', 0))],
-                    width_mils            = _mils(child.get('width', 0)),
-                    height_mils           = _mils(child.get('height', 0)),
-                    layer                 = PcbLayer.TOP if layer_tag != 'bottom'
-                                            else PcbLayer.BOTTOM,
-                    shape                 = shape,
-                    rotation_degrees      = float(child.get('rot', 0)),
-                    corner_radius_percent = roundness if roundness > 0 else None,
+        if tag == 'smd':
+            roundness = int(child.get('roundness', 0))
+            if roundness == 100:
+                shape = PadShape.CIRCLE
+            elif roundness > 0:
+                shape = PadShape.ROUNDED_RECTANGLE
+            else:
+                shape = PadShape.RECTANGLE
+            fp.add_pad(
+                designator            = child.get('name', ''),
+                position_mils         = [_mils(child.get('x', 0)),
+                                         _mils(child.get('y', 0))],
+                width_mils            = _mils(child.get('width', 0)),
+                height_mils           = _mils(child.get('height', 0)),
+                layer                 = (PcbLayer.BOTTOM if smd_far
+                                         else PcbLayer.TOP),
+                shape                 = shape,
+                rotation_degrees      = float(child.get('rot', 0)),
+                corner_radius_percent = roundness if roundness > 0 else None,
+            )
+
+        elif tag == 'pad':
+            drill    = _mils(child.get('drill', 0))
+            shape    = (PadShape.RECTANGLE if child.get('shape', 'round') == 'square'
+                        else PadShape.CIRCLE)
+            pad_size = (_mils(child.get('diameter'))
+                        if child.get('diameter') else round(drill * 1.8))
+            fp.add_pad(
+                designator    = child.get('name', ''),
+                position_mils = [_mils(child.get('x', 0)),
+                                 _mils(child.get('y', 0))],
+                width_mils    = pad_size,
+                height_mils   = pad_size,
+                layer         = PcbLayer.MULTI_LAYER,
+                shape         = shape,
+                hole_size_mils= drill,
+            )
+
+        elif tag == 'line' and pcb_layer is not None:
+            fp.add_track(
+                [_mils(child.get('x1')), _mils(child.get('y1'))],
+                [_mils(child.get('x2')), _mils(child.get('y2'))],
+                width_mils=_mils(child.get('width', 100)),
+                layer=pcb_layer,
+            )
+
+        elif tag == 'text' and pcb_layer is not None:
+            content = child.text or ''
+            is_des  = (content == '>NAME')
+            is_com  = (content == '>VALUE')
+            if is_des or is_com or not content.startswith('>'):
+                fp.add_text(
+                    text               = ('.Designator' if is_des else
+                                          '.Comment'    if is_com else content),
+                    position_mils      = (_mils(child.get('x', '0')),
+                                          _mils(child.get('y', '0'))),
+                    height_mils        = max(_mils(child.get('size', '1000')), 20),
+                    layer              = pcb_layer,
+                    rotation_degrees   = float(child.get('rot', '0')),
+                    stroke_width_mils  = 5.0,
+                    is_designator      = is_des,
+                    is_comment         = is_com,
+                    text_justification = _pcb_justif(child.get('align', 'bottom-left')),
                 )
 
-            elif tag == 'pad':
-                drill    = _mils(child.get('drill', 0))
-                shape    = (PadShape.RECTANGLE if child.get('shape', 'round') == 'square'
-                            else PadShape.CIRCLE)
-                pad_size = (_mils(child.get('diameter'))
-                            if child.get('diameter') else round(drill * 1.8))
-                fp.add_pad(
-                    designator    = child.get('name', ''),
-                    position_mils = [_mils(child.get('x', 0)),
-                                     _mils(child.get('y', 0))],
-                    width_mils    = pad_size,
-                    height_mils   = pad_size,
-                    layer         = PcbLayer.MULTI_LAYER,
-                    shape         = shape,
-                    hole_size_mils= drill,
-                )
-
-            elif tag == 'line' and pcb_layer is not None:
-                fp.add_track(
-                    [_mils(child.get('x1')), _mils(child.get('y1'))],
-                    [_mils(child.get('x2')), _mils(child.get('y2'))],
-                    width_mils=_mils(child.get('width', 100)),
-                    layer=pcb_layer,
-                )
-
-            elif tag == 'text' and pcb_layer is not None:
-                content = child.text or ''
-                is_des  = (content == '>NAME')
-                is_com  = (content == '>VALUE')
-                if is_des or is_com or not content.startswith('>'):
-                    fp.add_text(
-                        text               = ('.Designator' if is_des else
-                                              '.Comment'    if is_com else content),
-                        position_mils      = (_mils(child.get('x', '0')),
-                                              _mils(child.get('y', '0'))),
-                        height_mils        = max(_mils(child.get('size', '1000')), 20),
-                        layer              = pcb_layer,
-                        rotation_degrees   = float(child.get('rot', '0')),
-                        stroke_width_mils  = 5.0,
-                        is_designator      = is_des,
-                        is_comment         = is_com,
-                        text_justification = _pcb_justif(child.get('align', 'bottom-left')),
+        elif tag == 'shape' and pcb_layer is not None:
+            rn         = int(child.get('roundness', 0))
+            cx         = _mils(child.get('x', 0))
+            cy         = _mils(child.get('y', 0))
+            outline_um = float(child.get('outline', '0'))
+            if rn == 100:
+                r_um = float(child.get('w', '0')) / 2
+                if outline_um == 0:
+                    fp.add_arc(
+                        center_mils         = [cx, cy],
+                        radius_mils         = round(r_um / 50.8),
+                        start_angle_degrees = 0,
+                        end_angle_degrees   = 360,
+                        width_mils          = round(r_um / 25.4),
+                        layer               = pcb_layer,
                     )
-
-            elif tag == 'shape' and pcb_layer is not None:
-                rn         = int(child.get('roundness', 0))
-                cx         = _mils(child.get('x', 0))
-                cy         = _mils(child.get('y', 0))
-                outline_um = float(child.get('outline', '0'))
-                if rn == 100:
-                    r_um = float(child.get('w', '0')) / 2
-                    if outline_um == 0:
-                        fp.add_arc(
-                            center_mils         = [cx, cy],
-                            radius_mils         = round(r_um / 50.8),
-                            start_angle_degrees = 0,
-                            end_angle_degrees   = 360,
-                            width_mils          = round(r_um / 25.4),
-                            layer               = pcb_layer,
-                        )
-                    else:
-                        fp.add_arc(
-                            center_mils         = [cx, cy],
-                            radius_mils         = round(r_um / 25.4),
-                            start_angle_degrees = 0,
-                            end_angle_degrees   = 360,
-                            width_mils          = _mils(child.get('outline', '0')),
-                            layer               = pcb_layer,
-                        )
                 else:
-                    hw = round(float(child.get('w', '0')) / 50.8)
-                    hh = round(float(child.get('h', '0')) / 50.8)
-                    if outline_um == 0:
-                        fp.add_fill(
-                            corner1_mils = (cx - hw, cy - hh),
-                            corner2_mils = (cx + hw, cy + hh),
-                            layer        = pcb_layer,
-                        )
-                    else:
-                        lw = _mils(str(outline_um)) or 4
-                        corners = [(cx-hw, cy-hh), (cx+hw, cy-hh),
-                                   (cx+hw, cy+hh), (cx-hw, cy+hh)]
-                        for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1]):
-                            fp.add_track([ax, ay], [bx, by],
-                                         width_mils=lw, layer=pcb_layer)
+                    fp.add_arc(
+                        center_mils         = [cx, cy],
+                        radius_mils         = round(r_um / 25.4),
+                        start_angle_degrees = 0,
+                        end_angle_degrees   = 360,
+                        width_mils          = _mils(child.get('outline', '0')),
+                        layer               = pcb_layer,
+                    )
+            else:
+                hw = round(float(child.get('w', '0')) / 50.8)
+                hh = round(float(child.get('h', '0')) / 50.8)
+                if outline_um == 0:
+                    fp.add_fill(
+                        corner1_mils = (cx - hw, cy - hh),
+                        corner2_mils = (cx + hw, cy + hh),
+                        layer        = pcb_layer,
+                    )
+                else:
+                    lw = _mils(str(outline_um)) or 4
+                    corners = [(cx-hw, cy-hh), (cx+hw, cy-hh),
+                               (cx+hw, cy+hh), (cx-hw, cy+hh)]
+                    for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1]):
+                        fp.add_track([ax, ay], [bx, by],
+                                     width_mils=lw, layer=pcb_layer)
 
-            elif tag == 'arc' and pcb_layer is not None:
-                start  = float(child.get('start', 0))
-                sweep  = float(child.get('sweep', 360))
-                cx_um  = float(child.get('cx', 0))
-                cy_um  = float(child.get('cy', 0))
-                r_um   = float(child.get('r',  0))
-                a1, a2 = _altium_arc_angles(start, sweep)
-                fp.add_arc(
-                    center_mils         = [_mils(cx_um), _mils(cy_um)],
-                    radius_mils         = _mils(r_um),
-                    start_angle_degrees = a1,
-                    end_angle_degrees   = a2,
-                    width_mils          = _mils(child.get('width', 100)),
-                    layer               = pcb_layer,
-                )
+        elif tag == 'arc' and pcb_layer is not None:
+            start  = float(child.get('start', 0))
+            sweep  = float(child.get('sweep', 360))
+            cx_um  = float(child.get('cx', 0))
+            cy_um  = float(child.get('cy', 0))
+            r_um   = float(child.get('r',  0))
+            a1, a2 = _altium_arc_angles(start, sweep)
+            fp.add_arc(
+                center_mils         = [_mils(cx_um), _mils(cy_um)],
+                radius_mils         = _mils(r_um),
+                start_angle_degrees = a1,
+                end_angle_degrees   = a2,
+                width_mils          = _mils(child.get('width', 100)),
+                layer               = pcb_layer,
+            )
 
     # 3D model — embed STEP file if available
     m3d = fp_el.find('model3d')

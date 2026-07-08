@@ -36,27 +36,42 @@ _E = {
 
 _BG = '#141414'   # Eagle dark editor background
 
-# IR layer → Eagle display color (from eagle_layers.xml color attributes)
+# IR signed layer number (ir_schema.md "Плата (Board IR)") → Eagle display
+# color (from eagle_layers.xml color attributes). Footprint geometry carries
+# layer="N" directly; <smd>/<pad>/<hole> have no layer (copper by
+# construction — far-side smd marked layer="-1").
 _LAYER_COLORS = {
-    'top':           _E[4],   # layer 1  color=4  red
-    'bottom':        _E[1],   # layer 16 color=1  blue
-    'cream_top':     _E[7],   # layer 31 color=7  yellow
-    'cream_bottom':  _E[7],   # layer 32 color=7  yellow
-    'silk_top':      _E[7],   # layer 21 color=7  yellow
-    'silk_bottom':   _E[1],   # layer 22 color=1  blue
-    'labels':        _E[7],   # layer 25 color=7  yellow
-    'fab':           _E[7],   # layer 51 color=7  yellow (dimmed below)
-    'courtyard':     _E[4],   # layer 39 color=4  red, dashed
+    1:    _E[4],   # copper mount side (Eagle 1  color=4  red)
+    -1:   _E[1],   # copper far side   (Eagle 16 color=1  blue)
+    121:  _E[7],   # silk    (Eagle 21 color=7 yellow)
+    -121: _E[1],   # b silk  (Eagle 22 color=1 blue)
+    125:  _E[7],   # names   (Eagle 25)
+    -125: _E[1],
+    127:  _E[7],   # values  (Eagle 27)
+    -127: _E[1],
+    129:  _E[7],   # mask
+    -129: _E[1],
+    131:  _E[7],   # paste   (Eagle 31)
+    -131: _E[7],
+    139:  _E[4],   # courtyard (Eagle 39 color=4 red, dashed)
+    -139: _E[4],
+    120:  _E[15],  # Dimension — white
+    146:  _E[15],  # Milling
+    148:  _E[7],   # Document notes (dimmed like fab)
+    151:  _E[7],   # fab (Eagle 51, dimmed below)
+    -151: _E[1],
 }
 
 # Layers rendered with dashed stroke (Eagle fill patterns 10/11 = hatch)
-_LAYER_DASH = {'courtyard': '3,2'}
+_LAYER_DASH = {139: '3,2', -139: '3,2'}
 
-# Fab is same color as silkscreen but dimmer so it doesn't compete
+# Fab/Document are same color as silkscreen but dimmer so they don't compete
+_DIM_LAYERS = {148, 151, -151}
 _FAB_OPACITY = '0.45'
 
-_LAYER_Z = ['courtyard', 'fab', 'silk_bottom', 'bottom', 'top', 'silk_top',
-            'labels', 'cream_top', 'cream_bottom']
+# Paint order, bottom-most first; pads (layer None) are painted with copper.
+_LAYER_Z = [139, -139, 151, -151, 148, 146, 120, -121, -129, -1, None, 1,
+            121, 125, -125, 127, -127, 129, 131, -131]
 
 # Symbol layers
 _SYM_BODY  = _E[4]   # layer 94 Symbols color=4 red
@@ -791,10 +806,21 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
     fixed_size: if set, all SVGs are exactly fixed_size×fixed_size px,
                 content is scaled to fit and centered.
     """
-    all_els = []
-    for layer_el in fp_el:
-        if layer_el.tag in _LAYER_COLORS:
-            all_els.extend(list(layer_el))
+    def _el_layer(el):
+        """Element -> signed layer number for styling; None for pads
+        (copper-by-construction; the far-side smd is tinted separately
+        below). No/unparseable layer and anti (!) objects -> 'drop'
+        (subtractive geometry is not rendered yet)."""
+        if el.tag in ('smd', 'pad', 'hole'):
+            return None
+        try:
+            return int((el.get('layer') or '').strip())
+        except ValueError:
+            return 'drop'
+
+    all_els = [el for el in fp_el
+               if el.tag not in ('description', 'model3d', 'pin-mapping')
+               and _el_layer(el) != 'drop']
 
     x_min, x_max, y_min, y_max = _bounds(all_els)
     w_mm = max(x_max - x_min, 1.0)
@@ -818,17 +844,21 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
            f'<rect width="{W}" height="{H}" fill="{_BG}"/>',
            f'<g transform="translate({ox:.1f},{oy:.1f})">']
 
-    for layer_name in _LAYER_Z:
-        layer_el = fp_el.find(layer_name)
-        if layer_el is None:
+    by_layer = {}
+    for el in all_els:
+        by_layer.setdefault(_el_layer(el), []).append(el)
+
+    for layer_n in _LAYER_Z:
+        group = by_layer.get(layer_n, [])
+        if not group:
             continue
-        color = _LAYER_COLORS[layer_name]
-        dash  = _LAYER_DASH.get(layer_name, '')
-        opacity = _FAB_OPACITY if layer_name == 'fab' else ''
+        color = _LAYER_COLORS.get(layer_n, _E[7]) if layer_n is not None else _E[4]
+        dash  = _LAYER_DASH.get(layer_n, '')
+        opacity = _FAB_OPACITY if layer_n in _DIM_LAYERS else ''
         if opacity:
             out.append(f'<g opacity="{opacity}">')
 
-        for el in layer_el:
+        for el in group:
             t = el.tag
             if t == 'line':
                 lw = max(_v(el.get('width', '152')) * scale, 0.5)
@@ -857,8 +887,9 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
             elif t == 'smd':
                 x, y = _v(el.get('x')), _v(el.get('y'))
                 rot = float(el.get('rot', 0))
+                pad_color = _E[1] if el.get('layer') == '-1' else color
                 out.append(_smd(x, y, _v(el.get('width')), _v(el.get('height')),
-                                el.get('roundness', '0'), rot, color, **kw))
+                                el.get('roundness', '0'), rot, pad_color, **kw))
                 out.append(_pad_label(x, y, el.get('name', ''), **kw))
 
             elif t == 'pad':

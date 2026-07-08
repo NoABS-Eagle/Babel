@@ -51,6 +51,50 @@ def rotate_port_side(side, coord_um, rot_deg, mirror):
     return _ANGLE_SIDE[new_theta], sign * coord_um
 
 
+# ---------------------------------------------------------------------------
+# Board/footprint layer numbers (ir_schema.md "Плата (Board IR)")
+#
+# A layer is a SIGNED int. |n| < 100 = copper (top=1, bottom=-1, inner 2..
+# always standalone); |n| >= 100 = non-copper. Sign = side for PAIRED layers;
+# a layer with no opposite-sign counterpart is standalone (side-less). In
+# FOOTPRINT space the sign is side-RELATIVE (+ = mount side, - = far side);
+# on the board it becomes absolute through <element side=...>: flipping to
+# bottom negates paired layers, leaves standalone ones alone, and mirrors
+# geometry. The numeric values follow "Eagle + 100" for recognizability
+# (121 ~ tPlace 21) but are defined by the IR, not by Eagle.
+#
+# Footprint geometry carries layer="N" directly on each element — there are
+# no per-layer container tags. <smd>/<pad>/<hole> carry no layer at all
+# (copper-by-construction / side-less drill).
+# ---------------------------------------------------------------------------
+
+LAYER_COPPER_TOP = 1      # mount side copper (footprint) / board top
+LAYER_COPPER_BOTTOM = -1
+LAYER_DIMENSION = 120     # board outline (Eagle Dimension 20); standalone
+LAYER_SILK = 121          # tPlace 21 / F.SilkS
+LAYER_NAMES = 125         # tNames 25 (>NAME placeholder home in Eagle)
+LAYER_VALUES = 127        # tValues 27
+LAYER_MASK = 129          # tStop 29 / F.Mask
+LAYER_PASTE = 131         # tCream 31 / F.Paste
+LAYER_COURTYARD = 139     # tKeepout 39 / F.CrtYd
+LAYER_DRILLS = 144        # standalone
+LAYER_HOLES = 145         # standalone
+LAYER_MILLING = 146       # standalone
+LAYER_DOCUMENT = 148      # standalone, side-less notes (Dwgs.User/Cmts.User)
+LAYER_FAB = 151           # tDocu 51 / F.Fab — assembly drawing
+
+
+def is_copper(layer_n):
+    return abs(int(layer_n)) < 100
+
+
+def parse_layer(s):
+    """IR `layer` attribute string -> (anti: bool, n: int). Format: [!][-]N."""
+    s = (s or '').strip()
+    anti = s.startswith('!')
+    return anti, int(s[1:] if anti else s)
+
+
 def sanitize_filename(name):
     """Replace characters illegal in filenames (Windows-illegal set, the
     strictest of the formats we touch) with '_'.

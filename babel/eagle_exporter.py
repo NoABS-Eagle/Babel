@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from pathlib import Path
 from babel.eagle_parser import fmt
-from babel.ir_util import symbol_pool, component_gates
+from babel.ir_util import parse_layer, symbol_pool, component_gates
 from babel import import_log
 
 
@@ -36,12 +36,30 @@ _LAYERS_FILE = Path(__file__).parent / 'data' / 'eagle_layers.xml'
 
 _WIRE_W = '0.1524'  # default wire width (6 mil), lost during import
 
-_IR_LAYER_TO_EAGLE = {
-    'top': 1, 'bottom': 16, 'silk_top': 21, 'silk_bottom': 22,
-    'labels': 25, 'fab': 51, 'courtyard': 39,
-    'mask_top': 29, 'mask_bottom': 30,
-    'paste_top': 31, 'paste_bottom': 32,
-}
+def _pkg_eagle_layer(ln):
+    """IR footprint/board layer attribute ('121', '-121', '!1', ...) ->
+    Eagle layer number, or None (inexpressible -> drop). Inverse of
+    eagle_parser._pkg_layer: pair bottoms are Eagle top-number + 1
+    (-121 -> 22), standalone layers keep |n|-100, copper 1/-1 -> 1/16,
+    inner copper keeps its number, anti-copper -> tRestrict(41)/
+    bRestrict(42) (Eagle's native keepout mechanism for that side),
+    other anti layers have no Eagle equivalent."""
+    try:
+        anti, n = parse_layer(ln)
+    except (TypeError, ValueError):
+        return None
+    if anti:
+        if abs(n) < 100:
+            return 41 if n > 0 else 42
+        return None
+    if abs(n) < 100:
+        if n == 1:
+            return 1
+        if n == -1:
+            return 16
+        return abs(n)          # inner copper: number preserved
+    base = abs(n) - 100
+    return base if n > 0 else base + 1
 
 _PIN_LEN = {0: 'point', 2.54: 'short', 5.08: 'middle', 7.62: 'long'}
 
@@ -357,127 +375,134 @@ def export_package(fp_el, pkg_name):
         d = ET.SubElement(pkg, 'description')
         d.text = desc_text
 
-    for ir_layer, eagle_num in _IR_LAYER_TO_EAGLE.items():
-        layer_el = fp_el.find(ir_layer)
-        if layer_el is None:
+    for el in fp_el:
+        t = el.tag
+        if t in ('description', 'model3d', 'pin-mapping'):
             continue
 
-        for el in layer_el:
-            t = el.tag
+        if t in ('smd', 'pad', 'hole'):
+            # pads carry no layer attr (mount-side copper by construction);
+            # an smd's rare far-side marker layer="-1" selects Bottom(16).
+            eagle_num = 16 if el.get('layer') == '-1' else 1
+        else:
+            eagle_num = _pkg_eagle_layer(el.get('layer'))
+            if eagle_num is None:
+                continue
 
-            if t == 'smd':
-                s = ET.SubElement(pkg, 'smd')
-                s.set('name', _eagle_designator(el.get('name')))
-                s.set('x', _tomm(el.get('x'))); s.set('y', _tomm(el.get('y')))
-                s.set('dx', _tomm(el.get('width'))); s.set('dy', _tomm(el.get('height')))
-                rn = int(float(el.get('roundness', 0)))
-                if rn: s.set('roundness', str(rn))
-                rot = float(el.get('rot', 0))
-                if rot:
-                    r_str = f'R{int(rot)}' if rot == int(rot) else f'R{rot}'
-                    s.set('rot', r_str)
-                s.set('layer', str(eagle_num))
-                # IR thermals/stopmask/paste default "1" == Eagle thermals/
-                # stop/cream default "yes" — only emit on the (rare)
-                # explicit-off case (ir_schema.md "KiCad: технические слои
-                # smd-пада"), same omit-the-default convention as roundness/rot.
-                if el.get('thermals') == '0': s.set('thermals', 'no')
-                if el.get('stopmask') == '0': s.set('stop', 'no')
-                if el.get('paste') == '0': s.set('cream', 'no')
 
-            elif t == 'pad':
-                p = ET.SubElement(pkg, 'pad')
-                p.set('name', _eagle_designator(el.get('name')))
-                p.set('x', _tomm(el.get('x'))); p.set('y', _tomm(el.get('y')))
-                p.set('drill', _tomm(el.get('drill')))
-                if el.get('diameter'):
-                    p.set('diameter', _tomm(el.get('diameter')))
-                shape = el.get('shape', 'round')
-                if shape != 'round': p.set('shape', shape)
-                if el.get('thermals') == '0': p.set('thermals', 'no')
-                if el.get('stopmask') == '0': p.set('stop', 'no')
+        if t == 'smd':
+            s = ET.SubElement(pkg, 'smd')
+            s.set('name', _eagle_designator(el.get('name')))
+            s.set('x', _tomm(el.get('x'))); s.set('y', _tomm(el.get('y')))
+            s.set('dx', _tomm(el.get('width'))); s.set('dy', _tomm(el.get('height')))
+            rn = int(float(el.get('roundness', 0)))
+            if rn: s.set('roundness', str(rn))
+            rot = float(el.get('rot', 0))
+            if rot:
+                r_str = f'R{int(rot)}' if rot == int(rot) else f'R{rot}'
+                s.set('rot', r_str)
+            s.set('layer', str(eagle_num))
+            # IR thermals/stopmask/paste default "1" == Eagle thermals/
+            # stop/cream default "yes" — only emit on the (rare)
+            # explicit-off case (ir_schema.md "KiCad: технические слои
+            # smd-пада"), same omit-the-default convention as roundness/rot.
+            if el.get('thermals') == '0': s.set('thermals', 'no')
+            if el.get('stopmask') == '0': s.set('stop', 'no')
+            if el.get('paste') == '0': s.set('cream', 'no')
 
-            elif t == 'hole':
-                h = ET.SubElement(pkg, 'hole')
-                h.set('x', _tomm(el.get('x'))); h.set('y', _tomm(el.get('y')))
-                h.set('drill', _tomm(el.get('drill')))
+        elif t == 'pad':
+            p = ET.SubElement(pkg, 'pad')
+            p.set('name', _eagle_designator(el.get('name')))
+            p.set('x', _tomm(el.get('x'))); p.set('y', _tomm(el.get('y')))
+            p.set('drill', _tomm(el.get('drill')))
+            if el.get('diameter'):
+                p.set('diameter', _tomm(el.get('diameter')))
+            shape = el.get('shape', 'round')
+            if shape != 'round': p.set('shape', shape)
+            if el.get('thermals') == '0': p.set('thermals', 'no')
+            if el.get('stopmask') == '0': p.set('stop', 'no')
 
-            elif t == 'line':
-                w = ET.SubElement(pkg, 'wire')
-                w.set('x1', _tomm(el.get('x1'))); w.set('y1', _tomm(el.get('y1')))
-                w.set('x2', _tomm(el.get('x2'))); w.set('y2', _tomm(el.get('y2')))
-                w.set('width', _tomm(el.get('width', '152'))); w.set('layer', str(eagle_num))
+        elif t == 'hole':
+            h = ET.SubElement(pkg, 'hole')
+            h.set('x', _tomm(el.get('x'))); h.set('y', _tomm(el.get('y')))
+            h.set('drill', _tomm(el.get('drill')))
 
-            elif t == 'arc':
-                _emit_arc(pkg, el, str(eagle_num))
+        elif t == 'line':
+            w = ET.SubElement(pkg, 'wire')
+            w.set('x1', _tomm(el.get('x1'))); w.set('y1', _tomm(el.get('y1')))
+            w.set('x2', _tomm(el.get('x2'))); w.set('y2', _tomm(el.get('y2')))
+            w.set('width', _tomm(el.get('width', '152'))); w.set('layer', str(eagle_num))
 
-            elif t == 'shape':
-                rn = int(el.get('roundness', 0))
-                x, y = float(el.get('x')) / 1000, float(el.get('y')) / 1000
-                w2 = float(el.get('w', '0')) / 2000
-                h2 = float(el.get('h', '0')) / 2000
-                outline_mm = _tomm(el.get('outline', '0'))
+        elif t == 'arc':
+            _emit_arc(pkg, el, str(eagle_num))
+
+        elif t == 'shape':
+            rn = int(el.get('roundness', 0))
+            x, y = float(el.get('x')) / 1000, float(el.get('y')) / 1000
+            w2 = float(el.get('w', '0')) / 2000
+            h2 = float(el.get('h', '0')) / 2000
+            outline_mm = _tomm(el.get('outline', '0'))
+            lyr = str(eagle_num)
+            if rn == 100:
+                c = ET.SubElement(pkg, 'circle')
+                c.set('x', fmt(x)); c.set('y', fmt(y))
+                c.set('radius', fmt(w2))
+                c.set('width', outline_mm); c.set('layer', lyr)
+            elif float(el.get('outline', '0')) == 0:
+                r_el = ET.SubElement(pkg, 'rectangle')
+                r_el.set('x1', fmt(x - w2)); r_el.set('y1', fmt(y - h2))
+                r_el.set('x2', fmt(x + w2)); r_el.set('y2', fmt(y + h2))
+                r_el.set('layer', lyr)
+            else:
+                corners = [(x-w2, y-h2), (x+w2, y-h2), (x+w2, y+h2), (x-w2, y+h2)]
+                for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1]):
+                    w_el = ET.SubElement(pkg, 'wire')
+                    w_el.set('x1', fmt(ax)); w_el.set('y1', fmt(ay))
+                    w_el.set('x2', fmt(bx)); w_el.set('y2', fmt(by))
+                    w_el.set('width', outline_mm); w_el.set('layer', lyr)
+
+        elif t == 'polygon':
+            # Same fill<=0 fallback as the symbol-side branch above —
+            # Eagle <polygon> has no percent-fill concept, so an unfilled
+            # IR contour becomes a closed wire outline instead.
+            verts = [(v.get('x', '0'), v.get('y', '0')) for v in el.findall('vertex')]
+            if float(el.get('fill', '100')) <= 0 and len(verts) >= 2:
+                w = _tomm(el.get('width', '0'))
                 lyr = str(eagle_num)
-                if rn == 100:
-                    c = ET.SubElement(pkg, 'circle')
-                    c.set('x', fmt(x)); c.set('y', fmt(y))
-                    c.set('radius', fmt(w2))
-                    c.set('width', outline_mm); c.set('layer', lyr)
-                elif float(el.get('outline', '0')) == 0:
-                    r_el = ET.SubElement(pkg, 'rectangle')
-                    r_el.set('x1', fmt(x - w2)); r_el.set('y1', fmt(y - h2))
-                    r_el.set('x2', fmt(x + w2)); r_el.set('y2', fmt(y + h2))
-                    r_el.set('layer', lyr)
-                else:
-                    corners = [(x-w2, y-h2), (x+w2, y-h2), (x+w2, y+h2), (x-w2, y+h2)]
-                    for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1]):
-                        w_el = ET.SubElement(pkg, 'wire')
-                        w_el.set('x1', fmt(ax)); w_el.set('y1', fmt(ay))
-                        w_el.set('x2', fmt(bx)); w_el.set('y2', fmt(by))
-                        w_el.set('width', outline_mm); w_el.set('layer', lyr)
+                for (ax, ay), (bx, by) in zip(verts, verts[1:] + verts[:1]):
+                    w_el = ET.SubElement(pkg, 'wire')
+                    w_el.set('x1', _tomm(ax)); w_el.set('y1', _tomm(ay))
+                    w_el.set('x2', _tomm(bx)); w_el.set('y2', _tomm(by))
+                    w_el.set('width', w); w_el.set('layer', lyr)
+            else:
+                pg = ET.SubElement(pkg, 'polygon')
+                pg.set('width', _tomm(el.get('width', '0')))
+                pg.set('layer', str(eagle_num))
+                for x, y in verts:
+                    ve = ET.SubElement(pg, 'vertex')
+                    ve.set('x', _tomm(x))
+                    ve.set('y', _tomm(y))
 
-            elif t == 'polygon':
-                # Same fill<=0 fallback as the symbol-side branch above —
-                # Eagle <polygon> has no percent-fill concept, so an unfilled
-                # IR contour becomes a closed wire outline instead.
-                verts = [(v.get('x', '0'), v.get('y', '0')) for v in el.findall('vertex')]
-                if float(el.get('fill', '100')) <= 0 and len(verts) >= 2:
-                    w = _tomm(el.get('width', '0'))
-                    lyr = str(eagle_num)
-                    for (ax, ay), (bx, by) in zip(verts, verts[1:] + verts[:1]):
-                        w_el = ET.SubElement(pkg, 'wire')
-                        w_el.set('x1', _tomm(ax)); w_el.set('y1', _tomm(ay))
-                        w_el.set('x2', _tomm(bx)); w_el.set('y2', _tomm(by))
-                        w_el.set('width', w); w_el.set('layer', lyr)
-                else:
-                    pg = ET.SubElement(pkg, 'polygon')
-                    pg.set('width', _tomm(el.get('width', '0')))
-                    pg.set('layer', str(eagle_num))
-                    for x, y in verts:
-                        ve = ET.SubElement(pg, 'vertex')
-                        ve.set('x', _tomm(x))
-                        ve.set('y', _tomm(y))
-
-            elif t == 'text':
-                te = ET.SubElement(pkg, 'text')
-                te.set('x', _tomm(el.get('x'))); te.set('y', _tomm(el.get('y')))
-                te.set('size', _tomm(el.get('size')))
-                rot = _rot_attr(float(el.get('rot', 0)))
-                if rot: te.set('rot', rot)
-                align = el.get('align', 'bottom-left')
-                if align != 'bottom-left': te.set('align', align)
-                # `>VALUE` always -> tValues (27), regardless of which IR
-                # layer bucket it's actually sitting in (confirmed real:
-                # always `fab` — a single, side-less documentation layer;
-                # the pool footprint has no top/bottom of its own at all,
-                # that only exists once an instance is placed+mirrored on a
-                # board, same reason the SYMBOL-side `>VALUE` is always 96
-                # unconditionally, never bValue-style). Per the user — only
-                # `>VALUE`, NOT `>NAME` (stays on whatever layer it's on).
-                eagle_layer = '27' if (el.text or '').strip() == '>VALUE' else str(eagle_num)
-                te.set('layer', eagle_layer)
-                te.set('font', 'vector')  # always — see export_symbol's text branch
-                te.text = el.text or ''
+        elif t == 'text':
+            te = ET.SubElement(pkg, 'text')
+            te.set('x', _tomm(el.get('x'))); te.set('y', _tomm(el.get('y')))
+            te.set('size', _tomm(el.get('size')))
+            rot = _rot_attr(float(el.get('rot', 0)))
+            if rot: te.set('rot', rot)
+            align = el.get('align', 'bottom-left')
+            if align != 'bottom-left': te.set('align', align)
+            # `>VALUE` always -> tValues (27), regardless of which IR
+            # layer bucket it's actually sitting in (confirmed real:
+            # always `fab` — a single, side-less documentation layer;
+            # the pool footprint has no top/bottom of its own at all,
+            # that only exists once an instance is placed+mirrored on a
+            # board, same reason the SYMBOL-side `>VALUE` is always 96
+            # unconditionally, never bValue-style). Per the user — only
+            # `>VALUE`, NOT `>NAME` (stays on whatever layer it's on).
+            eagle_layer = '27' if (el.text or '').strip() == '>VALUE' else str(eagle_num)
+            te.set('layer', eagle_layer)
+            te.set('font', 'vector')  # always — see export_symbol's text branch
+            te.text = el.text or ''
 
     return pkg
 

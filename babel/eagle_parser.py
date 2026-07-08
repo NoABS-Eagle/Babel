@@ -7,24 +7,51 @@ from xml.dom import minidom
 from pathlib import Path
 from babel.ir_util import resolve_model3d_file
 
-# Eagle layer number → IR layer name (None = ignore)
+# Eagle SCHEMATIC/SYMBOL layer number → IR layer name (visual grouping,
+# ir_schema.md "Слои — единая номенклатура").
 LAYER_MAP = {
-    1:  'top',
-    16: 'bottom',
-    21: 'silk_top',
-    22: 'silk_bottom',
-    25: 'labels',
-    27: 'labels',
-    31: 'cream_top',
-    32: 'cream_bottom',
-    39: 'courtyard',
-    51: 'fab',
     91: 'NETS',
     94: 'SYMBOLS',
     95: 'NAMES',
     96: 'VALUES',
     97: 'INFO',
 }
+
+# Eagle PACKAGE/BOARD layer number → IR signed layer number as a string
+# (ir_schema.md "Плата (Board IR)", canonical constants in ir_util.py).
+# Formula of recognizability: ours = Eagle + 100 for the top layer of a
+# pair, the bottom counterpart is the NEGATIVE of that same number (bPlace
+# 22 -> -121, not 122). tRestrict/bRestrict are not layers of their own —
+# they dissolve into ANTI-copper of their side ('!1'/'!-1'). Unmapped
+# system layers (tGlue/bGlue, tTest/bTest, tFinish/bFinish, Origins,
+# Pads/Vias/Unrouted, vRestrict) are deliberate drops (junk/derived);
+# user layers 100-255 (all unpaired in Eagle) go to +(n+100) standalone
+# via _pkg_layer().
+PKG_LAYER_MAP = {
+    1:  '1',    16: '-1',
+    20: '120',                 # Dimension (standalone)
+    21: '121',  22: '-121',    # tPlace / bPlace
+    25: '125',  26: '-125',    # tNames / bNames
+    27: '127',  28: '-127',    # tValues / bValues
+    29: '129',  30: '-129',    # tStop / bStop
+    31: '131',  32: '-131',    # tCream / bCream
+    39: '139',  40: '-139',    # tKeepout / bKeepout
+    41: '!1',   42: '!-1',     # tRestrict / bRestrict -> anti-copper
+    44: '144',  45: '145',     # Drills / Holes (standalone)
+    46: '146',                 # Milling (standalone)
+    48: '148',                 # Document (standalone)
+    51: '151',  52: '-151',    # tDocu / bDocu
+}
+
+
+def _pkg_layer(eagle_n):
+    """Eagle package/board layer number -> IR layer string, or None (drop)."""
+    ir = PKG_LAYER_MAP.get(eagle_n)
+    if ir is not None:
+        return ir
+    if 100 <= eagle_n <= 255:      # user layers: all unpaired -> + standalone
+        return str(eagle_n + 100)
+    return None
 
 DIR_MAP = {
     'in':  'in',
@@ -293,29 +320,21 @@ def convert_package(pkg_el, pkg_name):
         d = ET.SubElement(fp, 'description')
         d.text = clean_desc
 
-    layers = {
-        'top':          ET.Element('top'),
-        'bottom':       ET.Element('bottom'),
-        'cream_top':    ET.Element('cream_top'),
-        'cream_bottom': ET.Element('cream_bottom'),
-        'silk_top':     ET.Element('silk_top'),
-        'silk_bottom':  ET.Element('silk_bottom'),
-        'fab':          ET.Element('fab'),
-        'courtyard':    ET.Element('courtyard'),
-        'labels':       ET.Element('labels'),
-    }
-
     for child in pkg_el:
         tag = child.tag
         layer = int(child.get('layer', 0))
-        ir_layer = LAYER_MAP.get(layer)
+        ir_layer = _pkg_layer(layer)
 
         if tag == 'smd':
-            bucket = layers.get(ir_layer)
-            if bucket is None:
+            # <smd> carries no layer attr for the normal mount-side pad
+            # (copper by construction); a Bottom(16) pad in a library
+            # package keeps its far-sidedness via explicit layer="-1".
+            if ir_layer not in ('1', '-1'):
                 continue
             rot, _ = parse_rot(child.get('rot'))
-            el = ET.SubElement(bucket, 'smd')
+            el = ET.SubElement(fp, 'smd')
+            if ir_layer == '-1':
+                el.set('layer', '-1')
             el.set('name', child.get('name'))
             el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
             el.set('width', str(round(float(child.get('dx')) * 1000)))
@@ -325,10 +344,9 @@ def convert_package(pkg_el, pkg_name):
                 el.set('rot', fmt(rot))
 
         elif tag == 'pad':
-            bucket = layers['top']
             shape = child.get('shape', 'round')
             ir_shape = 'square' if shape == 'square' else 'round'
-            el = ET.SubElement(bucket, 'pad')
+            el = ET.SubElement(fp, 'pad')
             el.set('name', child.get('name'))
             el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
             el.set('drill', _um(child.get('drill')))
@@ -337,14 +355,12 @@ def convert_package(pkg_el, pkg_name):
             el.set('shape', ir_shape)
 
         elif tag == 'hole':
-            bucket = layers['top']
-            el = ET.SubElement(bucket, 'hole')
+            el = ET.SubElement(fp, 'hole')
             el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
             el.set('drill', _um(child.get('drill')))
 
         elif tag == 'wire':
-            bucket = layers.get(ir_layer)
-            if bucket is None:
+            if ir_layer is None:
                 continue
             curve = float(child.get('curve', 0))
             x1, y1 = float(child.get('x1')), float(child.get('y1'))
@@ -354,32 +370,33 @@ def convert_package(pkg_el, pkg_name):
                 arc = eagle_arc(x1, y1, x2, y2, curve)
                 if arc:
                     cx, cy, r, start, sweep = arc
-                    el = ET.SubElement(bucket, 'arc')
+                    el = ET.SubElement(fp, 'arc')
                     el.set('cx', str(round(cx * 1000))); el.set('cy', str(round(cy * 1000)))
                     el.set('r', str(round(r * 1000)))
                     el.set('start', fmt(start)); el.set('sweep', fmt(sweep))
                     el.set('width', _um(width))
+                    el.set('layer', ir_layer)
             else:
-                el = ET.SubElement(bucket, 'line')
+                el = ET.SubElement(fp, 'line')
                 el.set('x1', str(round(x1 * 1000))); el.set('y1', str(round(y1 * 1000)))
                 el.set('x2', str(round(x2 * 1000))); el.set('y2', str(round(y2 * 1000)))
                 el.set('width', _um(width))
+                el.set('layer', ir_layer)
 
         elif tag == 'circle':
-            bucket = layers.get(ir_layer)
-            if bucket is None:
+            if ir_layer is None:
                 continue
             r_um = round(float(child.get('radius')) * 1000)
-            el = ET.SubElement(bucket, 'shape')
+            el = ET.SubElement(fp, 'shape')
             el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
             el.set('w', str(r_um * 2)); el.set('h', str(r_um * 2))
             el.set('roundness', '100')
             el.set('rot', '0')
             el.set('outline', _um(child.get('width', '0')))
+            el.set('layer', ir_layer)
 
         elif tag == 'rectangle':
-            bucket = layers.get(ir_layer)
-            if bucket is None:
+            if ir_layer is None:
                 continue
             x1, y1 = float(child.get('x1')), float(child.get('y1'))
             x2, y2 = float(child.get('x2')), float(child.get('y2'))
@@ -389,33 +406,34 @@ def convert_package(pkg_el, pkg_name):
             if round(rot) % 180 == 90:
                 w, h = h, w
                 rot = rot - 90
-            el = ET.SubElement(bucket, 'shape')
+            el = ET.SubElement(fp, 'shape')
             el.set('x', str(round(cx * 1000))); el.set('y', str(round(cy * 1000)))
             el.set('w', str(round(w * 1000))); el.set('h', str(round(h * 1000)))
             el.set('roundness', '0')
             el.set('rot', str(round(rot)))
             el.set('outline', _um(child.get('width', '0')))
+            el.set('layer', ir_layer)
 
         elif tag == 'polygon':
-            bucket = layers.get(ir_layer)
-            if bucket is None:
+            if ir_layer is None:
                 continue
             width_um = round(float(child.get('width', '0')) * 1000)
             if 0 < width_um < 50:
                 width_um = 50
-            pg = ET.SubElement(bucket, 'polygon')
+            pg = ET.SubElement(fp, 'polygon')
             pg.set('width', str(width_um))
+            pg.set('layer', ir_layer)
             for v in child.findall('vertex'):
                 ve = ET.SubElement(pg, 'vertex')
                 ve.set('x', str(round(float(v.get('x', '0')) * 1000)))
                 ve.set('y', str(round(float(v.get('y', '0')) * 1000)))
 
         elif tag == 'text':
-            bucket = layers.get(ir_layer)
-            if bucket is None:
+            if ir_layer is None:
                 continue
             rot, _ = parse_rot(child.get('rot'))
-            el = ET.SubElement(bucket, 'text')
+            el = ET.SubElement(fp, 'text')
+            el.set('layer', ir_layer)
             el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
             el.set('size', _um(child.get('size')))
             el.set('rot', fmt(rot))
@@ -423,10 +441,6 @@ def convert_package(pkg_el, pkg_name):
             if child.get('font') == 'vector':
                 el.set('font', 'vector')
             el.text = child.text or ''
-
-    for name, bucket in layers.items():
-        if len(bucket) > 0:
-            fp.append(bucket)
 
     d3 = parse_3d(desc_text)
     if d3:

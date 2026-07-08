@@ -3,7 +3,7 @@ import math
 import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from babel.ir_util import symbol_pool, component_gates, resolve_model3d_file, sanitize_filename
+from babel.ir_util import parse_layer, symbol_pool, component_gates, resolve_model3d_file, sanitize_filename
 
 _SYM_VERSION = 20251024   # KiCad 10
 _FP_VERSION  = 20251024
@@ -18,17 +18,37 @@ _PIN_DIR = {
     'sup': 'power_in',
 }
 
+# IR signed layer number (ir_schema.md "Плата (Board IR)") -> KiCad layer
+# name. 125/127 (Eagle tNames/tValues) have no KiCad home -> F.Fab, same
+# place the old 'labels' bucket went. 146 Milling -> Edge.Cuts is the
+# standard KiCad convention for milled slots.
 _FP_LAYER = {
-    'silk_top':     'F.SilkS',
-    'silk_bottom':  'B.SilkS',
-    'fab':          'F.Fab',
-    'courtyard':    'F.CrtYd',
-    'top':          'F.Cu',
-    'bottom':       'B.Cu',
-    'labels':       'F.Fab',
-    'cream_top':    'F.Paste',
-    'cream_bottom': 'B.Paste',
+    1:    'F.Cu',      -1:   'B.Cu',
+    121:  'F.SilkS',   -121: 'B.SilkS',
+    125:  'F.Fab',     -125: 'B.Fab',
+    127:  'F.Fab',     -127: 'B.Fab',
+    129:  'F.Mask',    -129: 'B.Mask',
+    131:  'F.Paste',   -131: 'B.Paste',
+    139:  'F.CrtYd',   -139: 'B.CrtYd',
+    151:  'F.Fab',     -151: 'B.Fab',
+    120:  'Edge.Cuts',
+    144:  'Dwgs.User',
+    145:  'Dwgs.User',
+    146:  'Edge.Cuts',
+    148:  'Dwgs.User',
 }
+
+
+def _fp_kicad_layer(ln):
+    """IR footprint layer attribute -> KiCad layer name, or None (drop).
+    Anti layers ('!...') have no KiCad footprint equivalent."""
+    try:
+        anti, n = parse_layer(ln)
+    except (TypeError, ValueError):
+        return None
+    if anti:
+        return None
+    return _FP_LAYER.get(n)
 
 
 def _f(v):
@@ -414,24 +434,23 @@ def export_footprint(fp_el, model_path=None):
 
     # Collect >NAME / >VALUE positions from any layer
     def _fp_text_style(placeholder, default_y):
-        for layer_el in fp_el:
-            for el in layer_el:
-                if el.tag == 'text' and (el.text or '').strip() == placeholder:
-                    ratio_ = int(el.get('ratio', '8') or '8')
-                    sz_    = _mm(el.get('size', '1000') or '1000')
-                    return True, {
-                        'x':     _f(_mm(el.get('x', '0'))),
-                        'y':     _f(_ky(el.get('y', '0'))),
-                        # No negation: IR and KiCad footprint angles share
-                        # the same CCW sense despite the Y-flip — proven by
-                        # visual ground truth (testData/rtfp, decisions.md
-                        # "KiCad: _rot_fp"); inverse of kicad_parser._rot_fp.
-                        'rot':   _f(float(el.get('rot', '0') or '0') % 360),
-                        'size':  _f(sz_),
-                        'thick': _f(sz_ * ratio_ / 100),
-                        'bold':  '(bold yes)' if ratio_ >= 15 else '(bold no)',
-                        'just':  _justify(el.get('align', 'bottom-left'), flip_v=True),
-                    }
+        for el in fp_el:
+            if el.tag == 'text' and (el.text or '').strip() == placeholder:
+                ratio_ = int(el.get('ratio', '8') or '8')
+                sz_    = _mm(el.get('size', '1000') or '1000')
+                return True, {
+                    'x':     _f(_mm(el.get('x', '0'))),
+                    'y':     _f(_ky(el.get('y', '0'))),
+                    # No negation: IR and KiCad footprint angles share
+                    # the same CCW sense despite the Y-flip — proven by
+                    # visual ground truth (testData/rtfp, decisions.md
+                    # "KiCad: _rot_fp"); inverse of kicad_parser._rot_fp.
+                    'rot':   _f(float(el.get('rot', '0') or '0') % 360),
+                    'size':  _f(sz_),
+                    'thick': _f(sz_ * ratio_ / 100),
+                    'bold':  '(bold yes)' if ratio_ >= 15 else '(bold no)',
+                    'just':  _justify(el.get('align', 'bottom-left'), flip_v=True),
+                }
         sz_ = 1.0
         return False, {'x': '0', 'y': _f(default_y), 'rot': '0',
                        'size': '1', 'thick': _f(sz_ * 8 / 100), 'bold': '(bold no)',
@@ -463,117 +482,126 @@ def export_footprint(fp_el, model_path=None):
         f'  )',
     ]
 
-    for ir_layer, kicad_layer in _FP_LAYER.items():
-        layer_el = fp_el.find(ir_layer)
-        if layer_el is None:
+    for el in fp_el:
+        t = el.tag
+        if t in ('description', 'model3d', 'pin-mapping'):
             continue
-        kl = _q(kicad_layer)
 
-        for el in layer_el:
-            t = el.tag
+        if t in ('smd', 'pad', 'hole'):
+            # no layer attr on pads (mount-side copper by construction);
+            # an smd's far-side marker layer="-1" flips its layer set.
+            far = el.get('layer') == '-1'
+            kl = _q('B.Cu' if far else 'F.Cu')
+        else:
+            kicad_layer = _fp_kicad_layer(el.get('layer'))
+            if kicad_layer is None:
+                continue
+            kl = _q(kicad_layer)
 
-            if t == 'line':
-                x1 = _f(_mm(el.get('x1'))); y1 = _f(_ky(el.get('y1')))
-                x2 = _f(_mm(el.get('x2'))); y2 = _f(_ky(el.get('y2')))
-                w  = _f(_mm(el.get('width', '120')))
-                lines.append(f'  (fp_line (start {x1} {y1}) (end {x2} {y2}) (layer {kl}) (width {w}))')
 
-            elif t == 'arc':
-                cx, cy = _mm(el.get('cx')), _mm(el.get('cy'))
-                r      = _mm(el.get('r'))
-                start  = float(el.get('start'))
-                sweep  = float(el.get('sweep'))
-                w      = _f(_mm(el.get('width', '120')))
-                if sweep >= 360:
-                    # Full circle — see the symbol-side arc branch above for why
-                    # a start==end 3-point arc can't represent this.
-                    lines.append(f'  (fp_circle (center {_f(cx)} {_f(-cy)}) (end {_f(cx+r)} {_f(-cy)}) (layer {kl}) (width {w}) (fill none))')
-                else:
-                    sr = math.radians(start)
-                    mr = math.radians(start + sweep / 2)
-                    er = math.radians(start + sweep)
-                    sx = _f(cx + r * math.cos(sr));  sy = _f(-(cy + r * math.sin(sr)))
-                    mx = _f(cx + r * math.cos(mr));  my = _f(-(cy + r * math.sin(mr)))
-                    ex = _f(cx + r * math.cos(er));  ey = _f(-(cy + r * math.sin(er)))
-                    lines.append(f'  (fp_arc (start {sx} {sy}) (mid {mx} {my}) (end {ex} {ey}) (layer {kl}) (width {w}))')
+        if t == 'line':
+            x1 = _f(_mm(el.get('x1'))); y1 = _f(_ky(el.get('y1')))
+            x2 = _f(_mm(el.get('x2'))); y2 = _f(_ky(el.get('y2')))
+            w  = _f(_mm(el.get('width', '120')))
+            lines.append(f'  (fp_line (start {x1} {y1}) (end {x2} {y2}) (layer {kl}) (width {w}))')
 
-            elif t == 'shape':
-                x, y = _mm(el.get('x')), _mm(el.get('y'))
-                w, h = _mm(el.get('w', '0')), _mm(el.get('h', '0'))
-                rnd  = int(el.get('roundness', 0))
-                outline = _mm(el.get('outline', '0'))
-                lw   = _f(outline)
-                fill = 'none' if outline else 'solid'
-                if rnd == 100:
-                    r = w / 2
-                    lines.append(f'  (fp_circle (center {_f(x)} {_f(-y)}) (end {_f(x+r)} {_f(-y)}) (layer {kl}) (width {lw}) (fill {fill}))')
-                else:
-                    x1k = _f(x - w/2); y1k = _f(-(y - h/2))
-                    x2k = _f(x + w/2); y2k = _f(-(y + h/2))
-                    lines.append(f'  (fp_rect (start {x1k} {y1k}) (end {x2k} {y2k}) (layer {kl}) (width {lw}) (fill {fill}))')
+        elif t == 'arc':
+            cx, cy = _mm(el.get('cx')), _mm(el.get('cy'))
+            r      = _mm(el.get('r'))
+            start  = float(el.get('start'))
+            sweep  = float(el.get('sweep'))
+            w      = _f(_mm(el.get('width', '120')))
+            if sweep >= 360:
+                # Full circle — see the symbol-side arc branch above for why
+                # a start==end 3-point arc can't represent this.
+                lines.append(f'  (fp_circle (center {_f(cx)} {_f(-cy)}) (end {_f(cx+r)} {_f(-cy)}) (layer {kl}) (width {w}) (fill none))')
+            else:
+                sr = math.radians(start)
+                mr = math.radians(start + sweep / 2)
+                er = math.radians(start + sweep)
+                sx = _f(cx + r * math.cos(sr));  sy = _f(-(cy + r * math.sin(sr)))
+                mx = _f(cx + r * math.cos(mr));  my = _f(-(cy + r * math.sin(mr)))
+                ex = _f(cx + r * math.cos(er));  ey = _f(-(cy + r * math.sin(er)))
+                lines.append(f'  (fp_arc (start {sx} {sy}) (mid {mx} {my}) (end {ex} {ey}) (layer {kl}) (width {w}))')
 
-            elif t == 'polygon':
-                lw = _f(_mm(el.get('width', '0')))
-                pts = ' '.join(f'(xy {_f(_mm(v.get("x","0")))} {_f(-_mm(v.get("y","0")))})'
-                               for v in el.findall('vertex'))
-                lines.append(f'  (fp_poly (pts {pts}) (layer {kl}) (width {lw}) (fill solid))')
+        elif t == 'shape':
+            x, y = _mm(el.get('x')), _mm(el.get('y'))
+            w, h = _mm(el.get('w', '0')), _mm(el.get('h', '0'))
+            rnd  = int(el.get('roundness', 0))
+            outline = _mm(el.get('outline', '0'))
+            lw   = _f(outline)
+            fill = 'none' if outline else 'solid'
+            if rnd == 100:
+                r = w / 2
+                lines.append(f'  (fp_circle (center {_f(x)} {_f(-y)}) (end {_f(x+r)} {_f(-y)}) (layer {kl}) (width {lw}) (fill {fill}))')
+            else:
+                x1k = _f(x - w/2); y1k = _f(-(y - h/2))
+                x2k = _f(x + w/2); y2k = _f(-(y + h/2))
+                lines.append(f'  (fp_rect (start {x1k} {y1k}) (end {x2k} {y2k}) (layer {kl}) (width {lw}) (fill {fill}))')
 
-            elif t == 'text':
-                text = el.text or ''
-                if text.startswith('>'):
-                    continue
-                kx  = _f(_mm(el.get('x')));  ky_ = _f(_ky(el.get('y')))
-                sz_f   = _mm(el.get('size', '1000'))
-                sz     = _f(sz_f)
-                rot = float(el.get('rot', 0))
-                kr  = _f(rot % 360)   # no negation — see _fp_text_style
-                ratio_ = int(el.get('ratio', '8'))
-                t      = _f(sz_f * ratio_ / 100)
-                b      = ' (bold yes)' if ratio_ >= 15 else ' (bold no)'
-                j      = _justify(el.get('align', 'bottom-left'), flip_v=True)
-                lines += [f'  (fp_text user {_q(text)} (at {kx} {ky_} {kr}) (layer {kl})',
-                          f'    (effects (font (size {sz} {sz}) (thickness {t}){b}){j})',
+        elif t == 'polygon':
+            lw = _f(_mm(el.get('width', '0')))
+            pts = ' '.join(f'(xy {_f(_mm(v.get("x","0")))} {_f(-_mm(v.get("y","0")))})'
+                           for v in el.findall('vertex'))
+            lines.append(f'  (fp_poly (pts {pts}) (layer {kl}) (width {lw}) (fill solid))')
+
+        elif t == 'text':
+            text = el.text or ''
+            if text.startswith('>'):
+                continue
+            kx  = _f(_mm(el.get('x')));  ky_ = _f(_ky(el.get('y')))
+            sz_f   = _mm(el.get('size', '1000'))
+            sz     = _f(sz_f)
+            rot = float(el.get('rot', 0))
+            kr  = _f(rot % 360)   # no negation — see _fp_text_style
+            ratio_ = int(el.get('ratio', '8'))
+            t      = _f(sz_f * ratio_ / 100)
+            b      = ' (bold yes)' if ratio_ >= 15 else ' (bold no)'
+            j      = _justify(el.get('align', 'bottom-left'), flip_v=True)
+            lines += [f'  (fp_text user {_q(text)} (at {kx} {ky_} {kr}) (layer {kl})',
+                      f'    (effects (font (size {sz} {sz}) (thickness {t}){b}){j})',
+                      f'  )']
+
+        elif t == 'smd':
+            x, y = _mm(el.get('x')), _mm(el.get('y'))
+            w, h = _mm(el.get('width')), _mm(el.get('height'))
+            name = el.get('name', '')
+            # IR roundness 0-100 means radius = (roundness/100) * min_dim/2
+            # (see svg_renderer._smd); KiCad roundrect_rratio = radius / min_dim.
+            rnd  = float(el.get('roundness', 0)) / 200
+            rot  = float(el.get('rot', 0))
+            kx = _f(x); ky_ = _f(-y); kw = _f(w); kh = _f(h)
+            at = f'{kx} {ky_} {_f(rot % 360)}' if rot else f'{kx} {ky_}'   # no negation — see _fp_text_style
+            smd_layers = '"B.Cu" "B.Paste" "B.Mask"' if far else '"F.Cu" "F.Paste" "F.Mask"'
+            if rnd > 0:
+                lines += [f'  (pad {_q(name)} smd roundrect (at {at}) (size {kw} {kh})',
+                          f'    (layers {smd_layers})',
+                          f'    (roundrect_rratio {_f(rnd)})',
+                          f'  )']
+            else:
+                lines += [f'  (pad {_q(name)} smd rect (at {at}) (size {kw} {kh})',
+                          f'    (layers {smd_layers})',
                           f'  )']
 
-            elif t == 'smd':
-                x, y = _mm(el.get('x')), _mm(el.get('y'))
-                w, h = _mm(el.get('width')), _mm(el.get('height'))
-                name = el.get('name', '')
-                # IR roundness 0-100 means radius = (roundness/100) * min_dim/2
-                # (see svg_renderer._smd); KiCad roundrect_rratio = radius / min_dim.
-                rnd  = float(el.get('roundness', 0)) / 200
-                rot  = float(el.get('rot', 0))
-                kx = _f(x); ky_ = _f(-y); kw = _f(w); kh = _f(h)
-                at = f'{kx} {ky_} {_f(rot % 360)}' if rot else f'{kx} {ky_}'   # no negation — see _fp_text_style
-                if rnd > 0:
-                    lines += [f'  (pad {_q(name)} smd roundrect (at {at}) (size {kw} {kh})',
-                              f'    (layers "F.Cu" "F.Paste" "F.Mask")',
-                              f'    (roundrect_rratio {_f(rnd)})',
-                              f'  )']
-                else:
-                    lines += [f'  (pad {_q(name)} smd rect (at {at}) (size {kw} {kh})',
-                              f'    (layers "F.Cu" "F.Paste" "F.Mask")',
-                              f'  )']
+        elif t == 'pad':
+            x, y   = _mm(el.get('x')), _mm(el.get('y'))
+            drill  = _mm(el.get('drill', '1000'))
+            shape  = el.get('shape', 'round')
+            name   = el.get('name', '')
+            od     = _mm(el.get('diameter')) if el.get('diameter') else drill * 1.8
+            kshape = 'rect' if shape == 'square' else 'circle'
+            lines += [f'  (pad {_q(name)} thru_hole {kshape} (at {_f(x)} {_f(-y)}) (size {_f(od)} {_f(od)})',
+                      f'    (drill {_f(drill)})',
+                      f'    (layers "*.Cu" "*.Mask")',
+                      f'  )']
 
-            elif t == 'pad':
-                x, y   = _mm(el.get('x')), _mm(el.get('y'))
-                drill  = _mm(el.get('drill', '1000'))
-                shape  = el.get('shape', 'round')
-                name   = el.get('name', '')
-                od     = _mm(el.get('diameter')) if el.get('diameter') else drill * 1.8
-                kshape = 'rect' if shape == 'square' else 'circle'
-                lines += [f'  (pad {_q(name)} thru_hole {kshape} (at {_f(x)} {_f(-y)}) (size {_f(od)} {_f(od)})',
-                          f'    (drill {_f(drill)})',
-                          f'    (layers "*.Cu" "*.Mask")',
-                          f'  )']
-
-            elif t == 'hole':
-                x, y = _mm(el.get('x')), _mm(el.get('y'))
-                d    = _mm(el.get('drill'))
-                lines += [f'  (pad "" np_thru_hole circle (at {_f(x)} {_f(-y)}) (size {_f(d)} {_f(d)})',
-                          f'    (drill {_f(d)})',
-                          f'    (layers "*.Cu" "*.Mask")',
-                          f'  )']
+        elif t == 'hole':
+            x, y = _mm(el.get('x')), _mm(el.get('y'))
+            d    = _mm(el.get('drill'))
+            lines += [f'  (pad "" np_thru_hole circle (at {_f(x)} {_f(-y)}) (size {_f(d)} {_f(d)})',
+                      f'    (drill {_f(d)})',
+                      f'    (layers "*.Cu" "*.Mask")',
+                      f'  )']
 
     m3 = fp_el.find('model3d')
     if m3 is not None and model_path:

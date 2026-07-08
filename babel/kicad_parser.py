@@ -65,19 +65,25 @@ _PAD_SHAPE_FALLBACK = {
     'trapezoid': 'square', 'rect': 'square', 'custom': 'square',
 }
 
+# KiCad footprint layer name -> IR signed layer NUMBER (ir_schema.md "Плата
+# (Board IR)"; ir_util.py has the canonical constants). Sign is side-relative
+# in footprint space: + = mount side, - = far side.
 _FP_LAYER_TO_IR = {
-    'F.SilkS': 'silk_top', 'B.SilkS': 'silk_bottom',
-    'F.Fab':   'fab',      'F.CrtYd': 'courtyard',
-    'F.Cu':    'top',      'B.Cu':    'bottom',
-    'F.Paste': 'cream_top', 'B.Paste': 'cream_bottom',
-    # KiCad's generic (not top/bottom-specific) designer-notes layers — no
-    # IR layer of their own, closest semantic match is `fab` (assembly
-    # drawing/documentation, already wired to Eagle's tDocu). Confirmed real
-    # content silently dropped without this (testData/kicad9-ti-mspm0-
-    # tutorial: Tag-Connect footprint's "KEEPOUT" on Cmts.User, USB-C
-    # receptacle's "PCB Edge" on Dwgs.User — found via Footprint Editor
-    # showing more text than reached Eagle).
-    'Dwgs.User': 'fab', 'Cmts.User': 'fab',
+    'F.Cu':    1,    'B.Cu':    -1,
+    'F.SilkS': 121,  'B.SilkS': -121,
+    'F.Mask':  129,  'B.Mask':  -129,
+    'F.Paste': 131,  'B.Paste': -131,
+    'F.CrtYd': 139,  'B.CrtYd': -139,
+    'F.Fab':   151,  'B.Fab':   -151,
+    'Edge.Cuts': 120,
+    # KiCad's generic (not top/bottom-specific) designer-notes layers — the
+    # side-less Document layer (148) is the exact semantic match (they have
+    # no side in KiCad either). Confirmed real content silently dropped
+    # before this mapping existed (testData/kicad9-ti-mspm0-tutorial:
+    # Tag-Connect footprint's "KEEPOUT" on Cmts.User, USB-C receptacle's
+    # "PCB Edge" on Dwgs.User — found via Footprint Editor showing more
+    # text than reached Eagle).
+    'Dwgs.User': 148, 'Cmts.User': 148,
 }
 
 
@@ -1062,15 +1068,13 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
         d = ET.SubElement(fp_el, 'description')
         d.text = fp.description
 
-    layer_groups = {}
-
-    def _bucket(kicad_layer):
-        ir_layer = _FP_LAYER_TO_IR.get(kicad_layer)
-        if ir_layer is None:
-            return None
-        if ir_layer not in layer_groups:
-            layer_groups[ir_layer] = ET.SubElement(fp_el, ir_layer)
-        return layer_groups[ir_layer]
+    def _layer_n(kicad_layer):
+        """KiCad layer name -> IR layer attribute value (str) or None (drop).
+        Geometry is a DIRECT child of <footprint> carrying layer="N" — no
+        per-layer container tags (unified with the board layer model,
+        ir_schema.md "Плата (Board IR)")."""
+        n = _FP_LAYER_TO_IR.get(kicad_layer)
+        return None if n is None else str(n)
 
     for item in fp.graphicItems:
         tag = type(item).__name__
@@ -1078,20 +1082,22 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
         if tag == 'FpText':
             if item.hide:
                 continue
-            bkt = _bucket(item.layer)
-            if bkt is None:
+            ln = _layer_n(item.layer)
+            if ln is None:
                 continue
             if item.type == 'reference':
-                t = ET.SubElement(bkt, 'text', x=_um(item.position.X), y=_um(-item.position.Y),
+                t = ET.SubElement(fp_el, 'text', x=_um(item.position.X), y=_um(-item.position.Y),
                                    size=_text_size_um(item.effects),
                                    rot=_rot_fp((item.position.angle or 0) - placement_angle),
-                                   align=_align(item.effects.justify if item.effects else None))
+                                   align=_align(item.effects.justify if item.effects else None),
+                                   layer=ln)
                 t.text = '>NAME'
             elif item.type == 'value':
-                t = ET.SubElement(bkt, 'text', x=_um(item.position.X), y=_um(-item.position.Y),
+                t = ET.SubElement(fp_el, 'text', x=_um(item.position.X), y=_um(-item.position.Y),
                                    size=_text_size_um(item.effects),
                                    rot=_rot_fp((item.position.angle or 0) - placement_angle),
-                                   align=_align(item.effects.justify if item.effects else None))
+                                   align=_align(item.effects.justify if item.effects else None),
+                                   layer=ln)
                 t.text = '>VALUE'
             elif item.type == 'user' and (item.text or '').strip().upper() in ('${REFERENCE}', '${VALUE}'):
                 # KiCad text variable on a plain decorative `fp_text user`
@@ -1109,40 +1115,43 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
                 # placeholder or not). Only the literal text changes
                 # (-> IR placeholder, not the raw `${...}` string), nothing
                 # about position/rotation handling.
-                t = ET.SubElement(bkt, 'text', x=_um(item.position.X), y=_um(-item.position.Y),
+                t = ET.SubElement(fp_el, 'text', x=_um(item.position.X), y=_um(-item.position.Y),
                                    size=_text_size_um(item.effects),
                                    rot=_rot_fp((item.position.angle or 0) - placement_angle),
-                                   align=_align(item.effects.justify if item.effects else None))
+                                   align=_align(item.effects.justify if item.effects else None),
+                                   layer=ln)
                 t.text = '>NAME' if '${REFERENCE}' in item.text.upper() else '>VALUE'
             else:
-                t = ET.SubElement(bkt, 'text', x=_um(item.position.X), y=_um(-item.position.Y),
+                t = ET.SubElement(fp_el, 'text', x=_um(item.position.X), y=_um(-item.position.Y),
                                    size=_text_size_um(item.effects),
                                    rot=_rot_fp((item.position.angle or 0) - placement_angle),
-                                   align=_align(item.effects.justify if item.effects else None))
+                                   align=_align(item.effects.justify if item.effects else None),
+                                   layer=ln)
                 t.text = _kicad_overbar_to_eagle(_kicad_multiline_to_eagle(item.text))
             continue
 
-        bkt = _bucket(item.layer)
-        if bkt is None:
+        ln = _layer_n(item.layer)
+        if ln is None:
             continue
 
         if tag == 'FpLine':
-            ET.SubElement(bkt, 'line',
+            ET.SubElement(fp_el, 'line',
                           x1=_um(item.start.X), y1=_um(-item.start.Y),
                           x2=_um(item.end.X), y2=_um(-item.end.Y),
-                          width=_stroke_width_um(item))
+                          width=_stroke_width_um(item), layer=ln)
 
         elif tag == 'FpRect':
             x1, y1, x2, y2 = item.start.X, -item.start.Y, item.end.X, -item.end.Y
             w = _stroke_width_um(item)
             for ax1, ay1, ax2, ay2 in [(x1, y1, x2, y1), (x2, y1, x2, y2),
                                         (x2, y2, x1, y2), (x1, y2, x1, y1)]:
-                ET.SubElement(bkt, 'line', x1=_um(ax1), y1=_um(ay1), x2=_um(ax2), y2=_um(ay2), width=w)
+                ET.SubElement(fp_el, 'line', x1=_um(ax1), y1=_um(ay1), x2=_um(ax2), y2=_um(ay2),
+                              width=w, layer=ln)
 
         elif tag == 'FpCircle':
             r = math.hypot(item.end.X - item.center.X, item.end.Y - item.center.Y)
-            ET.SubElement(bkt, 'arc', cx=_um(item.center.X), cy=_um(-item.center.Y), r=_um(r),
-                          start='0', sweep='360', width=_stroke_width_um(item))
+            ET.SubElement(fp_el, 'arc', cx=_um(item.center.X), cy=_um(-item.center.Y), r=_um(r),
+                          start='0', sweep='360', width=_stroke_width_um(item), layer=ln)
 
         elif tag == 'FpArc':
             params = _arc_params((item.start.X, -item.start.Y),
@@ -1157,8 +1166,8 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
             # the footprint/PCB-arc side. Not exercised by any current test
             # fixture (no footprint here has a real partial arc), found by
             # inspection while chasing the Eagle-export arc-orientation bug.
-            ET.SubElement(bkt, 'arc', cx=_um(cx), cy=_um(cy), r=_um(r),
-                          start=_f(start), sweep=_f(sweep), width=_stroke_width_um(item))
+            ET.SubElement(fp_el, 'arc', cx=_um(cx), cy=_um(cy), r=_um(r),
+                          start=_f(start), sweep=_f(sweep), width=_stroke_width_um(item), layer=ln)
 
         elif tag == 'FpPoly':
             # item.fill is None when the token is absent entirely — kiutils'
@@ -1168,8 +1177,8 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
             # for readers of a hand-written IR file missing the attribute,
             # not for a source that explicitly has no fill token at all.
             fill_pct = _FP_FILL_PERCENT.get(item.fill, 0)
-            poly = ET.SubElement(bkt, 'polygon', width=_stroke_width_um(item),
-                                  fill=str(fill_pct))
+            poly = ET.SubElement(fp_el, 'polygon', width=_stroke_width_um(item),
+                                  fill=str(fill_pct), layer=ln)
             for pt in item.coordinates:
                 ET.SubElement(poly, 'vertex', x=_um(pt.X), y=_um(-pt.Y))
 
@@ -1189,13 +1198,14 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
         position, effects, layer, hide = entry
         if hide:
             continue
-        bkt = _bucket(layer)
-        if bkt is None:
+        ln = _layer_n(layer)
+        if ln is None:
             continue
-        t = ET.SubElement(bkt, 'text', x=_um(position.X), y=_um(-position.Y),
+        t = ET.SubElement(fp_el, 'text', x=_um(position.X), y=_um(-position.Y),
                            size=_text_size_um(effects),
                            rot=_rot_fp((position.angle or 0) - placement_angle),
-                           align=_align(effects.justify if effects else None))
+                           align=_align(effects.justify if effects else None),
+                           layer=ln)
         t.text = f'>{placeholder}'
 
     # KiCad allows several physical pads to share one pad NUMBER (e.g. several
@@ -1238,18 +1248,18 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
         # `F.Mask` pad carrying `pad_prop_heatsink`, plus several small
         # blank-number `F.Paste`-only fragments inside its bounds, so the
         # stencil doesn't print one solid blob). Imported as plain `<shape>`
-        # geometry on whichever of `paste_top`/`paste_bottom`/`mask_top`/
-        # `mask_bottom` its layer set actually selects — one shape per
+        # geometry on whichever paste/mask layer number (±131/±129) its
+        # layer set actually selects — one shape per
         # selected layer, not a `<smd>`/`<pad>` (no pin-mapping entry, no
         # name needed). No technical layer at all selected -> nothing to
         # draw, dropped with a log line (ir_schema.md "KiCad: технические
         # слои smd-пада").
         if not any(l.endswith('.Cu') for l in pad.layers):
             aperture_layers = [ir for kicad_l, ir in
-                                (('F.Paste', 'paste_top'), ('B.Paste', 'paste_bottom'),
-                                 ('*.Paste', 'paste_top'),
-                                 ('F.Mask', 'mask_top'), ('B.Mask', 'mask_bottom'),
-                                 ('*.Mask', 'mask_top'))
+                                (('F.Paste', '131'), ('B.Paste', '-131'),
+                                 ('*.Paste', '131'),
+                                 ('F.Mask', '129'), ('B.Mask', '-129'),
+                                 ('*.Mask', '129'))
                                 if kicad_l in pad.layers]
             if not aperture_layers:
                 import_log.log(fp_name, pad.number or '(blank)',
@@ -1260,12 +1270,10 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
                 import_log.log(fp_name, pad.number or '(blank)', f'PAD_SHAPE {pad.shape} ->', 'rectangular')
             roundness = 0 if not shape_exact else _smd_roundness(pad)
             for ir_layer in aperture_layers:
-                bkt = layer_groups.get(ir_layer)
-                if bkt is None:
-                    bkt = layer_groups[ir_layer] = ET.SubElement(fp_el, ir_layer)
-                ET.SubElement(bkt, 'shape', x=x, y=y,
+                ET.SubElement(fp_el, 'shape', x=x, y=y,
                               w=_um(pad.size.X), h=_um(pad.size.Y),
-                              roundness=str(roundness), outline='0', rot=rot)
+                              roundness=str(roundness), outline='0', rot=rot,
+                              layer=ir_layer)
             continue
 
         tag = _PAD_TAG.get(pad.type, 'smd')
@@ -1279,9 +1287,10 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
             name = f'_NC{_blank_pad_n}'
 
         if tag == 'smd':
-            bkt = _bucket('F.Cu' if 'F.Cu' in pad.layers else (pad.layers[0] if pad.layers else 'F.Cu'))
-            if bkt is None:
-                continue
+            # <smd> carries no layer (mount-side copper by construction);
+            # the rare far-side pad (B.Cu-only in a library footprint) keeps
+            # its sidedness via an explicit layer="-1".
+            far_side = 'B.Cu' in pad.layers and 'F.Cu' not in pad.layers
             shape_exact = _smd_shape_exact(pad)
             if not shape_exact:
                 import_log.log(fp_name, name, f'PAD_SHAPE {pad.shape} ->', 'rectangular')
@@ -1292,35 +1301,31 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
             # layer presence, not a separate yes/no property.
             has_paste = any(l in pad.layers for l in ('F.Paste', 'B.Paste', '*.Paste'))
             has_mask = any(l in pad.layers for l in ('F.Mask', 'B.Mask', '*.Mask'))
-            smd_el = ET.SubElement(bkt, 'smd', name=name, x=x, y=y,
+            smd_el = ET.SubElement(fp_el, 'smd', name=name, x=x, y=y,
                           width=_um(pad.size.X), height=_um(pad.size.Y),
                           roundness=str(_smd_roundness(pad) if shape_exact else 0), rot=rot)
+            if far_side:
+                smd_el.set('layer', '-1')
             if not has_paste:
                 smd_el.set('paste', '0')
             if not has_mask:
                 smd_el.set('stopmask', '0')
 
         elif tag == 'pad':
-            bkt = layer_groups.get('top')
-            if bkt is None:
-                bkt = layer_groups['top'] = ET.SubElement(fp_el, 'top')
             drill = pad.drill
             if drill and drill.oval:
                 import_log.log(fp_name, name, 'DRILL_SHAPE oval ->', f'round(diameter={drill.diameter}mm)')
             diameter = drill.diameter if drill else pad.size.X
             has_mask = any(l in pad.layers for l in ('F.Mask', 'B.Mask', '*.Mask'))
-            pad_el = ET.SubElement(bkt, 'pad', name=name, x=x, y=y,
+            pad_el = ET.SubElement(fp_el, 'pad', name=name, x=x, y=y,
                           drill=_um(diameter), shape=_pad_shape(pad))
             if not has_mask:
                 pad_el.set('stopmask', '0')
 
         elif tag == 'hole':
-            bkt = layer_groups.get('top')
-            if bkt is None:
-                bkt = layer_groups['top'] = ET.SubElement(fp_el, 'top')
             drill = pad.drill
             diameter = drill.diameter if drill else pad.size.X
-            ET.SubElement(bkt, 'hole', x=x, y=y, drill=_um(diameter))
+            ET.SubElement(fp_el, 'hole', x=x, y=y, drill=_um(diameter))
 
     if fp.models:
         model = fp.models[0]

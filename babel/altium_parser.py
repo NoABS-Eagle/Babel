@@ -75,24 +75,25 @@ _FLIP_VERT = {
     'top-right':     'bottom-right',
 }
 
-# Altium PcbLayer ID → IR layer name
-# (same numbering used by altium-monkey's PcbLayer enum)
+# Altium PcbLayer ID → IR signed layer number as a string (ir_schema.md
+# "Плата (Board IR)", canonical constants in ir_util.py).
+# (numbering used by altium-monkey's PcbLayer enum)
 # 1=Top, 32=Bottom, 33=TopOverlay, 34=BottomOverlay, 35=TopPaste, 36=BottomPaste,
 # 57-72=Mechanical1-16, 74=Multi-Layer
 _LAYER_MAP = {
-    1:  'top',
-    32: 'bottom',
-    33: 'silk_top',
-    34: 'silk_bottom',
-    35: 'cream_top',
-    36: 'cream_bottom',
-    74: 'top',           # Multi-Layer (TH pads through all layers)
+    1:  '1',
+    32: '-1',
+    33: '121',
+    34: '-121',
+    35: '131',
+    36: '-131',
+    74: '1',             # Multi-Layer (TH pads through all layers)
 }
 for _i in range(57, 73):
-    _LAYER_MAP[_i] = 'fab' if (_i % 2 == 1) else 'courtyard'
-_LAYER_MAP[67] = 'courtyard'   # Mech 11 — IPC courtyard convention
-_LAYER_MAP[69] = 'courtyard'   # Mech 13
-_LAYER_MAP[71] = 'courtyard'   # Mech 15
+    _LAYER_MAP[_i] = '151' if (_i % 2 == 1) else '139'   # fab / courtyard
+_LAYER_MAP[67] = '139'   # Mech 11 — IPC courtyard convention
+_LAYER_MAP[69] = '139'   # Mech 13
+_LAYER_MAP[71] = '139'   # Mech 15
 
 
 def _um(mils):
@@ -330,16 +331,15 @@ _INTERNAL_TO_UM   = 25.4 / 10000.0   # internal units → µm (0.00254 µm/unit)
 
 
 def _convert_footprint(fp, fp_el):
-    """Append footprint geometry to fp_el from altium-monkey AltiumPcbFootprint."""
-    layers = {}
+    """Append footprint geometry to fp_el from altium-monkey AltiumPcbFootprint.
 
-    def _bucket(lyr_id):
-        name = _LAYER_MAP.get(int(lyr_id))
-        if name is None:
-            return None
-        if name not in layers:
-            layers[name] = ET.Element(name)
-        return layers[name]
+    Geometry goes in as DIRECT children of <footprint> with a layer="N"
+    attribute (unified board/footprint layer model, ir_schema.md "Плата
+    (Board IR)"); <smd>/<pad> carry no layer (copper by construction,
+    far-side smd gets an explicit layer="-1").
+    """
+    def _layer_n(lyr_id):
+        return _LAYER_MAP.get(int(lyr_id))
 
     # Non-electrical pads (fiducials, mounting holes) carry an empty Altium
     # designator. Eagle requires a non-empty smd/pad name, so number them,
@@ -348,8 +348,8 @@ def _convert_footprint(fp, fp_el):
     anon_n = 0
 
     for pad in fp.pads:
-        bkt = _bucket(pad.layer)
-        if bkt is None:
+        ln = _layer_n(pad.layer)
+        if ln not in ('1', '-1'):
             continue
         x    = _um(pad.x_mils)
         y    = _um(pad.y_mils)
@@ -365,7 +365,7 @@ def _convert_footprint(fp, fp_el):
         shape_id = int(pad.effective_top_shape)
 
         if not pad.is_smt:
-            el = ET.SubElement(bkt, 'pad')
+            el = ET.SubElement(fp_el, 'pad')
             el.set('name', name)
             el.set('x', x); el.set('y', y)
             el.set('drill', _um(pad.hole_size_mils))
@@ -382,7 +382,9 @@ def _convert_footprint(fp, fp_el):
                 roundness = '50'
             else:                # RECTANGLE, CUSTOM, unknown
                 roundness = '0'
-            el = ET.SubElement(bkt, 'smd')
+            el = ET.SubElement(fp_el, 'smd')
+            if ln == '-1':
+                el.set('layer', '-1')
             el.set('name', name)
             el.set('x', x); el.set('y', y)
             el.set('width', w); el.set('height', h)
@@ -392,30 +394,32 @@ def _convert_footprint(fp, fp_el):
                 el.set('rot', _f(rot % 360))
 
     for track in fp.tracks:
-        bkt = _bucket(track.layer)
-        if bkt is None:
+        ln = _layer_n(track.layer)
+        if ln is None:
             continue
-        el = ET.SubElement(bkt, 'line')
+        el = ET.SubElement(fp_el, 'line')
         el.set('x1', _um(track.start_x_mils)); el.set('y1', _um(track.start_y_mils))
         el.set('x2', _um(track.end_x_mils));   el.set('y2', _um(track.end_y_mils))
         el.set('width', _um(track.width_mils))
+        el.set('layer', ln)
 
     for arc in fp.arcs:
-        bkt = _bucket(arc.layer)
-        if bkt is None:
+        ln = _layer_n(arc.layer)
+        if ln is None:
             continue
         start = float(arc.start_angle)
         end   = float(arc.end_angle)
         sweep = (end - start) % 360 or 360
-        el = ET.SubElement(bkt, 'arc')
+        el = ET.SubElement(fp_el, 'arc')
+        el.set('layer', ln)
         el.set('cx', _um(arc.center_x_mils)); el.set('cy', _um(arc.center_y_mils))
         el.set('r',  _um(arc.radius_mils))
         el.set('start', _f(start)); el.set('sweep', _f(sweep))
         el.set('width', _um(arc.width_mils))
 
     for txt in fp.texts:
-        bkt = _bucket(txt.layer)
-        if bkt is None:
+        ln = _layer_n(txt.layer)
+        if ln is None:
             continue
         content = txt.text_content or ''
         if content == '.Designator':
@@ -425,16 +429,14 @@ def _convert_footprint(fp, fp_el):
         j     = txt.effective_justification
         jval  = j.value if hasattr(j, 'value') else int(j)
         align = _PCB_JUST.get(jval, 'bottom-left')
-        el = ET.SubElement(bkt, 'text')
+        el = ET.SubElement(fp_el, 'text')
+        el.set('layer', ln)
         el.set('x', _um(txt.x_mils)); el.set('y', _um(txt.y_mils))
         el.set('size', _um(txt.height_mils) if txt.height_mils else '1000')
         el.set('rot', _f(float(txt.rotation or 0) % 360))
         el.set('align', align)
         el.text = content
 
-    for bkt in layers.values():
-        if len(bkt):
-            fp_el.append(bkt)
 
 
 def _do_model_extraction(orig_to_compel, intlib, pcblib_cache, models_dir):

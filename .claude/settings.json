@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash",
-      "PowerShell"
+      "PowerShell",
+      "Bash(python -c ' *)"
     ]
   }
 }
