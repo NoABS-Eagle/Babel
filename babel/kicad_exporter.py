@@ -3,7 +3,8 @@ import math
 import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from babel.ir_util import parse_layer, symbol_pool, component_gates, resolve_model3d_file, sanitize_filename
+from babel.ir_util import (parse_layer, symbol_pool, component_gates,
+                           resolve_model3d_file, sanitize_filename, arc_mid)
 
 _SYM_VERSION = 20251024   # KiCad 10
 _FP_VERSION  = 20251024
@@ -163,30 +164,16 @@ def _sym_geom(sym_el, pin_to_pad):
                    f'      )')
 
         elif t == 'arc':
-            cx, cy = _mm(el.get('cx')), _mm(el.get('cy'))
-            r      = _mm(el.get('r'))
-            start  = float(el.get('start'))
-            sweep  = float(el.get('sweep'))
+            # endpoint canon: start/end are the stored endpoints VERBATIM,
+            # only the mid point is derived (ir_util.arc_mid)
+            x1, y1 = _mm(el.get('x1')), _mm(el.get('y1'))
+            x2, y2 = _mm(el.get('x2')), _mm(el.get('y2'))
+            mx, my = arc_mid(x1, y1, x2, y2, float(el.get('curve')))
             w      = _f(_mm(el.get('width', '0')))
-            if sweep >= 360:
-                # Full-circle arc (start point == end point) — a 3-point
-                # start/mid/end arc can't represent that degenerate chord;
-                # use the native circle item instead.
-                yield (f'      (circle (center {_f(cx)} {_f(cy)}) (radius {_f(r)})\n'
-                       f'        (stroke (width {w}) (type default))\n'
-                       f'        (fill (type none))\n'
-                       f'      )')
-            else:
-                sr = math.radians(start)
-                mr = math.radians(start + sweep / 2)
-                er = math.radians(start + sweep)
-                sx = _f(cx + r * math.cos(sr));  sy = _f(cy + r * math.sin(sr))
-                mx = _f(cx + r * math.cos(mr));  my = _f(cy + r * math.sin(mr))
-                ex = _f(cx + r * math.cos(er));  ey = _f(cy + r * math.sin(er))
-                yield (f'      (arc (start {sx} {sy}) (mid {mx} {my}) (end {ex} {ey})\n'
-                       f'        (stroke (width {w}) (type default))\n'
-                       f'        (fill (type none))\n'
-                       f'      )')
+            yield (f'      (arc (start {_f(x1)} {_f(y1)}) (mid {_f(mx)} {_f(my)}) (end {_f(x2)} {_f(y2)})\n'
+                   f'        (stroke (width {w}) (type default))\n'
+                   f'        (fill (type none))\n'
+                   f'      )')
 
         elif t == 'shape':
             x, y = _mm(el.get('x')), _mm(el.get('y'))
@@ -505,23 +492,14 @@ def export_footprint(fp_el, model_path=None):
             lines.append(f'  (fp_line (start {x1} {y1}) (end {x2} {y2}) (layer {kl}) (width {w}))')
 
         elif t == 'arc':
-            cx, cy = _mm(el.get('cx')), _mm(el.get('cy'))
-            r      = _mm(el.get('r'))
-            start  = float(el.get('start'))
-            sweep  = float(el.get('sweep'))
+            # endpoint canon: endpoints verbatim (Y-flipped into KiCad
+            # space), only the mid point is derived
+            x1, y1 = _mm(el.get('x1')), _mm(el.get('y1'))
+            x2, y2 = _mm(el.get('x2')), _mm(el.get('y2'))
+            mx, my = arc_mid(x1, y1, x2, y2, float(el.get('curve')))
             w      = _f(_mm(el.get('width', '120')))
-            if sweep >= 360:
-                # Full circle — see the symbol-side arc branch above for why
-                # a start==end 3-point arc can't represent this.
-                lines.append(f'  (fp_circle (center {_f(cx)} {_f(-cy)}) (end {_f(cx+r)} {_f(-cy)}) (layer {kl}) (width {w}) (fill none))')
-            else:
-                sr = math.radians(start)
-                mr = math.radians(start + sweep / 2)
-                er = math.radians(start + sweep)
-                sx = _f(cx + r * math.cos(sr));  sy = _f(-(cy + r * math.sin(sr)))
-                mx = _f(cx + r * math.cos(mr));  my = _f(-(cy + r * math.sin(mr)))
-                ex = _f(cx + r * math.cos(er));  ey = _f(-(cy + r * math.sin(er)))
-                lines.append(f'  (fp_arc (start {sx} {sy}) (mid {mx} {my}) (end {ex} {ey}) (layer {kl}) (width {w}))')
+            lines.append(f'  (fp_arc (start {_f(x1)} {_f(-y1)}) (mid {_f(mx)} {_f(-my)}) '
+                         f'(end {_f(x2)} {_f(-y2)}) (layer {kl}) (width {w}))')
 
         elif t == 'shape':
             x, y = _mm(el.get('x')), _mm(el.get('y'))

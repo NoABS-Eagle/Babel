@@ -88,46 +88,19 @@ def _pin_length_str(mm):
     return _PIN_LEN[closest]
 
 
-def _arc_to_wire(cx, cy, r, start_deg, sweep_deg):
-    """IR arc → Eagle wire (x1, y1, x2, y2, curve).
-
-    `curve` = `sweep_deg`, unchanged — NOT negated. Eagle's own `curve` sign
-    is the SAME convention IR uses (positive = CCW from x1,y1 to x2,y2),
-    confirmed by eagle_parser.eagle_arc (built from reading real Eagle
-    files): it hands back `sweep_deg = curve_deg` directly, no sign flip.
-    A `-sweep_deg` here was a bug — round-trip-verified wrong: exporting an
-    arc and reading it back via eagle_arc gave back a different center/
-    start/sweep entirely (found when arcs looked "inside out" after the
-    cx/cy/r unit fix made real partial arcs visible for the first time).
-    """
-    sr = math.radians(start_deg)
-    er = sr + math.radians(sweep_deg)
-    return (cx + r * math.cos(sr), cy + r * math.sin(sr),
-            cx + r * math.cos(er), cy + r * math.sin(er),
-            sweep_deg)
-
-
 def _emit_arc(parent, el, layer):
-    """IR <arc> → Eagle geometry. A full-circle arc (sweep=360, IR's "circle"
-    convention) has start point == end point — Eagle's wire/curve can't
-    represent that degenerate chord, so it must become a native <circle>
-    instead of a <wire curve="360">.
-    """
-    cx, cy, r = float(el.get('cx')) / 1000, float(el.get('cy')) / 1000, float(el.get('r')) / 1000
-    sweep = float(el.get('sweep'))
-    width_mm = _tomm(el.get('width', '152'))
-    if sweep >= 360:
-        c = ET.SubElement(parent, 'circle')
-        c.set('x', fmt(cx)); c.set('y', fmt(cy))
-        c.set('radius', fmt(r))
-        c.set('width', width_mm); c.set('layer', layer)
-    else:
-        x1, y1, x2, y2, curve = _arc_to_wire(cx, cy, r, float(el.get('start')), sweep)
-        w = ET.SubElement(parent, 'wire')
-        w.set('x1', fmt(x1)); w.set('y1', fmt(y1))
-        w.set('x2', fmt(x2)); w.set('y2', fmt(y2))
-        w.set('width', width_mm); w.set('layer', layer)
-        w.set('curve', fmt(curve))
+    """IR <arc> → Eagle <wire curve=...>. The IR arc canon IS Eagle's
+    endpoint form (x1 y1 x2 y2 curve, same sign convention: positive = CCW
+    from p1 to p2) — a pure attribute copy, µm→mm. No center math, no
+    endpoint reconstruction: joints stay lattice-exact (the center-form
+    canon produced ~1 µm endpoint wobble and Eagle drew ratsnest stubs at
+    every arc↔wire joint — luminoso ground truth). Full circles are not
+    arcs in IR (degenerate chord) — they are <shape roundness="100">."""
+    w = ET.SubElement(parent, 'wire')
+    w.set('x1', _tomm(el.get('x1'))); w.set('y1', _tomm(el.get('y1')))
+    w.set('x2', _tomm(el.get('x2'))); w.set('y2', _tomm(el.get('y2')))
+    w.set('width', _tomm(el.get('width', '152'))); w.set('layer', layer)
+    w.set('curve', fmt(el.get('curve')))
 
 
 def _rot_attr(deg):
@@ -1221,9 +1194,6 @@ def _emit_deco(plain_el, el):
                       width=(width_mm if float(width_mm) else _WIRE_W),
                       layer=_eagle_layer(el, fallback=_LYR_GRAPHIC))
     elif t == 'arc':
-        # _emit_arc expects cx/cy/r in raw IR µm (it does its own /1000
-        # internally, same as export_symbol's callers) — coordinates go
-        # straight through unshifted, same as everywhere else here.
         _emit_arc(plain_el, el, _eagle_layer(el, fallback=_LYR_GRAPHIC))
     elif t == 'shape':
         rn = int(el.get('roundness', 0))
@@ -1632,7 +1602,8 @@ def export_schematic(ir_path, output_path=None):
             x2, y2 = float(el.get('x2')), float(el.get('y2'))
             sheet_idx = _graphic_sheet((x1 + x2) / 2, (y1 + y2) / 2, f'line ({x1},{y1})-({x2},{y2})')
         elif t == 'arc':
-            cx, cy = float(el.get('cx')), float(el.get('cy'))
+            cx = (float(el.get('x1')) + float(el.get('x2'))) / 2
+            cy = (float(el.get('y1')) + float(el.get('y2'))) / 2
             sheet_idx = _graphic_sheet(cx, cy, f'arc ({cx},{cy})')
         elif t == 'shape':
             x, y = float(el.get('x')), float(el.get('y'))

@@ -52,6 +52,65 @@ def rotate_port_side(side, coord_um, rot_deg, mirror):
 
 
 # ---------------------------------------------------------------------------
+# Arc math (ir_schema.md "<arc>"): the CANONICAL arc form is ENDPOINTS +
+# curve angle (x1 y1 x2 y2 curve, degrees CCW+, positive = center to the
+# LEFT of the chord) — Eagle's own form, chosen deliberately: copper
+# connectivity is a contract of ENDPOINTS, and in endpoint form every
+# segment lives on the same integer-µm lattice, so joints are exact BY
+# CONSTRUCTION under any quantization. The center form (cx/cy/r/start/
+# sweep) stores the construction process, not the result: re-deriving
+# endpoints from a µm-rounded center gave ~1 µm wobble and Eagle drew
+# ratsnest stubs at every arc<->wire joint (luminoso ground truth).
+# Center math lives HERE, for the consumers that need it (Altium's native
+# form, SVG bounds) — derived, never stored.
+# ---------------------------------------------------------------------------
+
+def arc_center(x1, y1, x2, y2, curve_deg):
+    """(cx, cy, r) of the arc, or None for a degenerate chord."""
+    dx, dy = x2 - x1, y2 - y1
+    chord = math.hypot(dx, dy)
+    if chord < 1e-10 or not curve_deg:
+        return None
+    a = math.radians(abs(curve_deg))
+    r = chord / (2 * math.sin(a / 2))
+    d = r * math.cos(a / 2)
+    mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+    sign = 1 if curve_deg > 0 else -1
+    return mx + sign * d * (-dy / chord), my + sign * d * (dx / chord), r
+
+
+def arc_params(x1, y1, x2, y2, curve_deg):
+    """Endpoint form -> (cx, cy, r, start_deg, sweep_deg) center form for
+    consumers that need it; None for a degenerate arc."""
+    c = arc_center(x1, y1, x2, y2, curve_deg)
+    if c is None:
+        return None
+    cx, cy, r = c
+    start = math.degrees(math.atan2(y1 - cy, x1 - cx))
+    return cx, cy, r, start, curve_deg
+
+
+def arc_mid(x1, y1, x2, y2, curve_deg):
+    """The arc's midpoint (KiCad's 3-point form wants one). Degenerate
+    chord -> the chord middle."""
+    p = arc_params(x1, y1, x2, y2, curve_deg)
+    if p is None:
+        return (x1 + x2) / 2, (y1 + y2) / 2
+    cx, cy, r, start, sweep = p
+    m = math.radians(start + sweep / 2)
+    return cx + r * math.cos(m), cy + r * math.sin(m)
+
+
+def arc_endpoints(cx, cy, r, start_deg, sweep_deg):
+    """Center form -> (x1, y1, x2, y2, curve) endpoint form — for center-
+    form SOURCES (Altium). Full circles (|sweep| >= 360) are NOT arcs in
+    IR — represent them as a circle <shape>; callers must special-case."""
+    sr, er = math.radians(start_deg), math.radians(start_deg + sweep_deg)
+    return (cx + r * math.cos(sr), cy + r * math.sin(sr),
+            cx + r * math.cos(er), cy + r * math.sin(er), sweep_deg)
+
+
+# ---------------------------------------------------------------------------
 # Board/footprint layer numbers (ir_schema.md "Плата (Board IR)")
 #
 # A layer is a SIGNED int. |n| < 100 = copper (top=1, bottom=-1, inner 2..
@@ -159,13 +218,11 @@ def place_ir_element(el, ex_um, ey_um, rot_deg, bottom):
     if t == 'line':
         set_pt(c, 'x1', 'y1'); set_pt(c, 'x2', 'y2')
     elif t == 'arc':
-        set_pt(c, 'cx', 'cy')
-        start = float(c.get('start', 0)); sweep = float(c.get('sweep', 0))
+        # endpoint form: endpoints move like line ends, mirror flips the
+        # bulge side (curve sign) — no angle bookkeeping at all
+        set_pt(c, 'x1', 'y1'); set_pt(c, 'x2', 'y2')
         if bottom:
-            c.set('start', f'{(180 - start + rot_deg) % 360:g}')
-            c.set('sweep', f'{-sweep:g}')
-        else:
-            c.set('start', f'{(start + rot_deg) % 360:g}')
+            c.set('curve', f'{-float(c.get("curve", 0)):g}')
     elif t == 'polygon':
         for v in c.findall('vertex'):
             set_pt(v, 'x', 'y')

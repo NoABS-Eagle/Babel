@@ -125,10 +125,12 @@ def _angle_deg(cx, cy, x, y):
 def _arc_params(p1, p2, p3):
     """3 points (start, mid, end) -> (cx, cy, r, start_deg, sweep_deg), or None.
 
-    Inverse of kicad_exporter._sym_geom's arc branch: that emits start/mid/end
-    points from (cx, cy, r, start, sweep) via standard math-angle parametrics
-    (CCW from +X). sweep here is signed: positive = CCW, negative = CW —
-    whichever direction actually passes through the mid point.
+    Center form is DERIVED, only the signed sweep out of it becomes IR data:
+    the IR arc canon is endpoints + curve (ir_util's arc-math block), and
+    KiCad's own start/end points ARE those endpoints — they pass through
+    exactly, the circle fit only decides the bulge angle. sweep is signed:
+    positive = CCW, negative = CW — whichever direction actually passes
+    through the mid point.
     """
     fit = _circle_from_3pts(p1, p2, p3)
     if fit is None:
@@ -685,10 +687,14 @@ def _add_unit_geometry(sym_el, unit, named_pins, names_hidden, numbers_hidden, *
                               w=_um(item.radius * 2), h=_um(item.radius * 2),
                               roundness='100', outline='0', rot='0', layer='SYMBOLS')
             else:
-                ET.SubElement(sym_el, 'arc',
-                              cx=_um(item.center.X), cy=_um(item.center.Y), r=_um(item.radius),
-                              start='0', sweep='360',
-                              width=_stroke_width_um(item, _SYM_DEFAULT_STROKE_UM), layer='SYMBOLS')
+                # unfilled circle = outlined <shape roundness=100>, not a
+                # 360° arc — the endpoint arc canon has no degenerate chord
+                ET.SubElement(sym_el, 'shape',
+                              x=_um(item.center.X), y=_um(item.center.Y),
+                              w=_um(item.radius * 2), h=_um(item.radius * 2),
+                              roundness='100', rot='0',
+                              outline=_stroke_width_um(item, _SYM_DEFAULT_STROKE_UM),
+                              layer='SYMBOLS')
 
         elif tag == 'SyArc':
             params = _arc_params((item.start.X, item.start.Y),
@@ -714,14 +720,12 @@ def _add_unit_geometry(sym_el, unit, named_pins, names_hidden, numbers_hidden, *
                               w=_um(r * 2), h=_um(r * 2),
                               roundness='100', outline='0', rot='0', layer='SYMBOLS')
             else:
-                # cx/cy/r come from _arc_params in mm (raw kiutils units) —
-                # _um() here, not _f(): ir_schema.md's <arc> wants µm like
-                # everywhere else. Previously these went through _f() bare,
-                # storing mm values mislabeled as µm (1000x too small) for
-                # every non-full-circle KiCad arc — found while touching
-                # this exact line, unrelated to the fill fix above.
-                ET.SubElement(sym_el, 'arc', cx=_um(cx), cy=_um(cy), r=_um(r),
-                              start=_f(start), sweep=_f(sweep),
+                # endpoints pass through exactly (KiCad's own start/end);
+                # the circle fit only supplies the signed bulge angle
+                ET.SubElement(sym_el, 'arc',
+                              x1=_um(item.start.X), y1=_um(item.start.Y),
+                              x2=_um(item.end.X), y2=_um(item.end.Y),
+                              curve=_f(sweep),
                               width=_stroke_width_um(item, _SYM_DEFAULT_STROKE_UM), layer='SYMBOLS')
 
         elif tag == 'SyText':
@@ -1149,9 +1153,13 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
                               width=w, layer=ln)
 
         elif tag == 'FpCircle':
+            # full circle = <shape roundness=100> with an outline stroke —
+            # NOT an arc (the endpoint arc canon can't express a degenerate
+            # 360° chord, and a circle is a shape anyway)
             r = math.hypot(item.end.X - item.center.X, item.end.Y - item.center.Y)
-            ET.SubElement(fp_el, 'arc', cx=_um(item.center.X), cy=_um(-item.center.Y), r=_um(r),
-                          start='0', sweep='360', width=_stroke_width_um(item), layer=ln)
+            ET.SubElement(fp_el, 'shape', x=_um(item.center.X), y=_um(-item.center.Y),
+                          w=_um(r * 2), h=_um(r * 2), roundness='100', rot='0',
+                          outline=_stroke_width_um(item), layer=ln)
 
         elif tag == 'FpArc':
             params = _arc_params((item.start.X, -item.start.Y),
@@ -1159,15 +1167,12 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
                                   (item.end.X, -item.end.Y))
             if params is None:
                 continue
-            cx, cy, r, start, sweep = params
-            # _um(), not _f(): cx/cy/r are mm from _arc_params — same
-            # mislabeled-as-µm bug as the symbol-side SyArc branch (see
-            # decisions.md "KiCad-специфика: filled дуга → круг"), just on
-            # the footprint/PCB-arc side. Not exercised by any current test
-            # fixture (no footprint here has a real partial arc), found by
-            # inspection while chasing the Eagle-export arc-orientation bug.
-            ET.SubElement(fp_el, 'arc', cx=_um(cx), cy=_um(cy), r=_um(r),
-                          start=_f(start), sweep=_f(sweep), width=_stroke_width_um(item), layer=ln)
+            # endpoints pass through EXACTLY (KiCad stores them natively);
+            # only the signed sweep comes from the circle fit
+            ET.SubElement(fp_el, 'arc',
+                          x1=_um(item.start.X), y1=_um(-item.start.Y),
+                          x2=_um(item.end.X), y2=_um(-item.end.Y),
+                          curve=_f(params[4]), width=_stroke_width_um(item), layer=ln)
 
         elif tag == 'FpPoly':
             # item.fill is None when the token is absent entirely — kiutils'

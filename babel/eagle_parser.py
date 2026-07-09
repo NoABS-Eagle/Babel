@@ -108,21 +108,9 @@ def parse_rot(rot_str):
     return angle, mirrored
 
 
-def eagle_arc(x1, y1, x2, y2, curve_deg):
-    """Convert Eagle wire-with-curve to (cx, cy, r, start_deg, sweep_deg)."""
-    dx, dy = x2 - x1, y2 - y1
-    chord = math.hypot(dx, dy)
-    if chord < 1e-10:
-        return None
-    a = math.radians(abs(curve_deg))
-    r = chord / (2 * math.sin(a / 2))
-    d = r * math.cos(a / 2)
-    mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-    sign = 1 if curve_deg > 0 else -1   # positive curve → center to the left of chord
-    cx = mx + sign * d * (-dy / chord)
-    cy = my + sign * d * (dx / chord)
-    start = math.degrees(math.atan2(y1 - cy, x1 - cx))
-    return cx, cy, r, start, curve_deg
+# (eagle_arc is gone: the IR arc canon IS Eagle's endpoint form — see
+# ir_util's arc-math block; center math lives there as arc_center/arc_params
+# for the consumers that still need it.)
 
 
 def _eagle_to_mcad_rot(rx_e, ry_e, rz_e):
@@ -199,26 +187,17 @@ def convert_symbol(sym_el, sym_name):
         ir_layer = LAYER_MAP.get(layer, str(layer))
 
         if tag == 'wire':
+            # IR arc canon = Eagle's own endpoint form (x1 y1 x2 y2 curve,
+            # ir_util arc-math comment) — a curved wire converts with NO
+            # geometry math at all, endpoints stay lattice-exact
             curve = float(child.get('curve', 0))
-            x1, y1 = float(child.get('x1')), float(child.get('y1'))
-            x2, y2 = float(child.get('x2')), float(child.get('y2'))
-            width = child.get('width', '0.1524')
-            if curve != 0:
-                arc = eagle_arc(x1, y1, x2, y2, curve)
-                if arc:
-                    cx, cy, r, start, sweep = arc
-                    el = ET.SubElement(sym, 'arc')
-                    el.set('cx', str(round(cx * 1000))); el.set('cy', str(round(cy * 1000)))
-                    el.set('r', str(round(r * 1000)))
-                    el.set('start', fmt(start)); el.set('sweep', fmt(sweep))
-                    el.set('width', _um(width))
-                    el.set('layer', ir_layer)
-            else:
-                el = ET.SubElement(sym, 'line')
-                el.set('x1', str(round(x1 * 1000))); el.set('y1', str(round(y1 * 1000)))
-                el.set('x2', str(round(x2 * 1000))); el.set('y2', str(round(y2 * 1000)))
-                el.set('width', _um(width))
-                el.set('layer', ir_layer)
+            el = ET.SubElement(sym, 'arc' if curve else 'line')
+            el.set('x1', _um(child.get('x1'))); el.set('y1', _um(child.get('y1')))
+            el.set('x2', _um(child.get('x2'))); el.set('y2', _um(child.get('y2')))
+            if curve:
+                el.set('curve', fmt(curve))
+            el.set('width', _um(child.get('width', '0.1524')))
+            el.set('layer', ir_layer)
 
         elif tag == 'rectangle':
             x1, y1 = float(child.get('x1')), float(child.get('y1'))
@@ -361,26 +340,16 @@ def convert_geometry(child, parent, ir_layer):
     if tag == 'wire':
         if ir_layer is None:
             return True
+        # arc canon = Eagle's endpoint form: no geometry math, endpoints
+        # stay lattice-exact (ir_util arc-math comment)
         curve = float(child.get('curve', 0))
-        x1, y1 = float(child.get('x1')), float(child.get('y1'))
-        x2, y2 = float(child.get('x2')), float(child.get('y2'))
-        width = child.get('width', '0.1524')
-        if curve != 0:
-            arc = eagle_arc(x1, y1, x2, y2, curve)
-            if arc:
-                cx, cy, r, start, sweep = arc
-                el = ET.SubElement(parent, 'arc')
-                el.set('cx', str(round(cx * 1000))); el.set('cy', str(round(cy * 1000)))
-                el.set('r', str(round(r * 1000)))
-                el.set('start', fmt(start)); el.set('sweep', fmt(sweep))
-                el.set('width', _um(width))
-                el.set('layer', ir_layer)
-        else:
-            el = ET.SubElement(parent, 'line')
-            el.set('x1', str(round(x1 * 1000))); el.set('y1', str(round(y1 * 1000)))
-            el.set('x2', str(round(x2 * 1000))); el.set('y2', str(round(y2 * 1000)))
-            el.set('width', _um(width))
-            el.set('layer', ir_layer)
+        el = ET.SubElement(parent, 'arc' if curve else 'line')
+        el.set('x1', _um(child.get('x1'))); el.set('y1', _um(child.get('y1')))
+        el.set('x2', _um(child.get('x2'))); el.set('y2', _um(child.get('y2')))
+        if curve:
+            el.set('curve', fmt(curve))
+        el.set('width', _um(child.get('width', '0.1524')))
+        el.set('layer', ir_layer)
         return True
 
     if tag == 'circle':

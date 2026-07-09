@@ -9,7 +9,7 @@ from xml.dom import minidom
 from pathlib import Path
 
 from altium_monkey import AltiumIntLib, AltiumSchLib, AltiumPcbLib
-from babel.ir_util import sanitize_filename, clean_attr_name
+from babel.ir_util import sanitize_filename, clean_attr_name, arc_endpoints
 from babel.altium_exporter import _um_lw
 
 _MILS_TO_UM = 25.4   # 1 mil = 25.4 µm
@@ -199,23 +199,34 @@ def _convert_symbol(sym, sym_name, part_id=None):
             radius_mils = min(radius_mils, secondary_mils)
         # Same '% 360 or 360' fallback as the PCB arc loop below: a full
         # circle drawn as start=0/end=360 must not collapse to a 0° sweep.
+        # Altium's native arc form is the CENTER one — the endpoint-canon
+        # conversion (ir_util's arc-math block) happens here, at the Altium
+        # boundary; full circles are <shape roundness=100>, not arcs.
         sweep = (arc.end_angle - arc.start_angle) % 360 or 360
-        ET.SubElement(sym_el, 'arc',
-                      cx=_um(loc.x_mils), cy=_um(loc.y_mils),
-                      r=_um(radius_mils),
-                      start=_f(arc.start_angle),
-                      sweep=_f(sweep),
-                      width=str(_um_lw(arc.line_width)))
+        if sweep >= 360:
+            ET.SubElement(sym_el, 'shape',
+                          x=_um(loc.x_mils), y=_um(loc.y_mils),
+                          w=_um(radius_mils * 2), h=_um(radius_mils * 2),
+                          roundness='100', rot='0',
+                          outline=str(_um_lw(arc.line_width)))
+        else:
+            x1, y1, x2, y2, curve = arc_endpoints(
+                float(loc.x_mils), float(loc.y_mils), float(radius_mils),
+                float(arc.start_angle), sweep)
+            ET.SubElement(sym_el, 'arc',
+                          x1=_um(x1), y1=_um(y1), x2=_um(x2), y2=_um(y2),
+                          curve=_f(curve),
+                          width=str(_um_lw(arc.line_width)))
 
     for ell in filter(_keep, sym.ellipses):
-        # Same min-radius collapse as elliptical arcs, swept to a full circle.
+        # Same min-radius collapse as elliptical arcs, as a full circle.
         loc = ell.location_mils
         radius_mils = min(ell.radius_mils, ell.secondary_radius_mils)
-        ET.SubElement(sym_el, 'arc',
-                      cx=_um(loc.x_mils), cy=_um(loc.y_mils),
-                      r=_um(radius_mils),
-                      start='0', sweep='360',
-                      width=str(_um_lw(ell.line_width)))
+        ET.SubElement(sym_el, 'shape',
+                      x=_um(loc.x_mils), y=_um(loc.y_mils),
+                      w=_um(radius_mils * 2), h=_um(radius_mils * 2),
+                      roundness='100', rot='0',
+                      outline=str(_um_lw(ell.line_width)))
 
     for pol in filter(_keep, sym.polygons):
         pts = list(pol.points_mils)
@@ -410,12 +421,24 @@ def _convert_footprint(fp, fp_el):
         start = float(arc.start_angle)
         end   = float(arc.end_angle)
         sweep = (end - start) % 360 or 360
-        el = ET.SubElement(fp_el, 'arc')
-        el.set('layer', ln)
-        el.set('cx', _um(arc.center_x_mils)); el.set('cy', _um(arc.center_y_mils))
-        el.set('r',  _um(arc.radius_mils))
-        el.set('start', _f(start)); el.set('sweep', _f(sweep))
-        el.set('width', _um(arc.width_mils))
+        if sweep >= 360:
+            el = ET.SubElement(fp_el, 'shape')
+            el.set('layer', ln)
+            el.set('x', _um(arc.center_x_mils)); el.set('y', _um(arc.center_y_mils))
+            el.set('w', _um(float(arc.radius_mils) * 2))
+            el.set('h', _um(float(arc.radius_mils) * 2))
+            el.set('roundness', '100'); el.set('rot', '0')
+            el.set('outline', _um(arc.width_mils))
+        else:
+            x1, y1, x2, y2, curve = arc_endpoints(
+                float(arc.center_x_mils), float(arc.center_y_mils),
+                float(arc.radius_mils), start, sweep)
+            el = ET.SubElement(fp_el, 'arc')
+            el.set('layer', ln)
+            el.set('x1', _um(x1)); el.set('y1', _um(y1))
+            el.set('x2', _um(x2)); el.set('y2', _um(y2))
+            el.set('curve', _f(curve))
+            el.set('width', _um(arc.width_mils))
 
     for txt in fp.texts:
         ln = _layer_n(txt.layer)

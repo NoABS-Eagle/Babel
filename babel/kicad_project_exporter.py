@@ -40,7 +40,7 @@ from pathlib import Path
 
 from babel import import_log
 from babel.ir_util import (symbol_pool, component_gates, sanitize_filename,
-                            rotate_port_side)
+                            rotate_port_side, arc_mid)
 from babel.kicad_schematic import _collinear_between
 from babel.kicad_exporter import (
     export as export_library, export_symbol,
@@ -651,19 +651,15 @@ def _emit_deco(page, el, ns):
                 f'\t\t(uuid "{_quuid(ns, "deco-r", cx, cy)}")\n'
                 f'\t)')
     elif t == 'arc':
-        # IR arc params live in Y-up space — generate start/mid/end THERE,
-        # then map each point through the page transform (the Y flip then
+        # endpoint canon: endpoints verbatim, mid derived in Y-up IR space,
+        # each point then mapped through the page transform (the Y flip
         # implicitly reverses the sweep direction, matching how the importer
-        # derived these params via _arc_params on negated-Y points).
-        cx, cy = float(el.get('cx')), float(el.get('cy'))
-        r = float(el.get('r'))
-        start = float(el.get('start'))
-        sweep = float(el.get('sweep'))
-        pts = []
-        for a in (start, start + sweep / 2, start + sweep):
-            ar = math.radians(a)
-            pts.append(page.pt(cx + r * math.cos(ar), cy + r * math.sin(ar)))
-        (sx, sy), (mx, my), (ex, ey) = pts
+        # derived the curve via _arc_params on negated-Y points).
+        x1, y1 = float(el.get('x1')), float(el.get('y1'))
+        x2, y2 = float(el.get('x2')), float(el.get('y2'))
+        mxy = arc_mid(x1, y1, x2, y2, float(el.get('curve')))
+        (sx, sy), (mx, my), (ex, ey) = (page.pt(x1, y1), page.pt(*mxy),
+                                        page.pt(x2, y2))
         w = _f(_mm(el.get('width', '0')))
         page.body.append(
             f'\t(arc\n'
@@ -881,10 +877,8 @@ def _emit_canvas(pages, canvas_el, part_insts, comp_by_name, pool, lib_name,
 
     for el in canvas_el:
         if el.tag in ('line', 'arc', 'shape', 'text', 'note'):
-            if el.tag == 'line':
+            if el.tag in ('line', 'arc'):
                 px, py = el.get('x1'), el.get('y1')
-            elif el.tag == 'arc':
-                px, py = el.get('cx'), el.get('cy')
             else:
                 px, py = el.get('x'), el.get('y')
             _emit_deco(_page_for_point(pages, px, py, f'deco {el.tag}'), el, ns)

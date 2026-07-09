@@ -1290,26 +1290,22 @@ def _collect_canvas(sch, sch_path, dx, cv, ctx, stray_check):
             cv.deco_shapes.append(('circle', cx, cy, r_um * 2, r_um * 2,
                                  100, 0 if filled else width_um))
         elif tag == 'Arc':
-            # _arc_params expects points already in IR's Y-up space and
-            # returns cx/cy/start/sweep already correct for THAT space
-            # (same convention kicad_parser.py's FpArc branch uses for
-            # footprint arcs) — unlike deco_lines/deco_shapes above,
-            # deco_arcs therefore stores final IR-space (Y-up) values
-            # directly, not raw KiCad Y-down — start/sweep have no
-            # meaningful "un-flip" back to Y-down, converting cx/cy back
-            # would desync them from the angles. dx is added to X going
-            # IN (before _arc_params), same as every other shape above —
-            # a pure X-translation doesn't affect start/sweep at all.
+            # IR arc canon = endpoints + curve (ir_util's arc-math block):
+            # KiCad's own start/end ARE the endpoints, they pass through
+            # exactly; the 3-point fit only supplies the signed bulge angle.
+            # Points go in already in IR's Y-up space, dx pre-added — a pure
+            # X-translation doesn't affect the sweep.
             params = _arc_params((s.start.X + dx, -s.start.Y), (s.mid.X + dx, -s.mid.Y),
                                   (s.end.X + dx, -s.end.Y))
             if params is None:
                 continue
-            cx, cy_ir, ar, astart, asweep = params
-            cx_um, cy_um = round(cx * 1000), round(cy_ir * 1000)
-            r_um = round(ar * 1000)
+            cx, cy_ir, ar = params[0], params[1], params[2]
+            x1_um, y1_um = round((s.start.X + dx) * 1000), round(-s.start.Y * 1000)
+            x2_um, y2_um = round((s.end.X + dx) * 1000), round(-s.end.Y * 1000)
             stray_check(f'arc {getattr(s, "uuid", "")}',
-                         cx_um - r_um, cx_um + r_um, -cy_um - r_um, -cy_um + r_um)
-            cv.deco_arcs.append((cx_um, cy_um, r_um, astart, asweep, width_um))
+                         round((cx - ar) * 1000), round((cx + ar) * 1000),
+                         round((-cy_ir - ar) * 1000), round((-cy_ir + ar) * 1000))
+            cv.deco_arcs.append((x1_um, y1_um, x2_um, y2_um, params[4], width_um))
 
     for t in sch.texts:
         # Free-standing `(text)` canvas notes — purely decorative, GRAPHIC
@@ -1514,9 +1510,10 @@ def _write_canvas(parent_el, cv, nets, wire_default_um=152, wire_um_by_class=Non
     for kind, cx, cy, w, h, roundness, outline_um in cv.deco_shapes:
         ET.SubElement(parent_el, 'shape', x=str(cx), y=str(-cy), w=str(w), h=str(h),
                       roundness=str(roundness), outline=str(outline_um), rot='0', layer='GRAPHIC')
-    for cx_um, cy_um, r_um, start, sweep, width_um in cv.deco_arcs:
-        ET.SubElement(parent_el, 'arc', cx=str(cx_um), cy=str(cy_um), r=str(r_um),
-                      start=_f(start), sweep=_f(sweep), width=str(width_um), layer='GRAPHIC')
+    for x1_um, y1_um, x2_um, y2_um, curve, width_um in cv.deco_arcs:
+        ET.SubElement(parent_el, 'arc', x1=str(x1_um), y1=str(y1_um),
+                      x2=str(x2_um), y2=str(y2_um),
+                      curve=_f(curve), width=str(width_um), layer='GRAPHIC')
     for tx, ty, text, size_um, rot, align in cv.deco_texts:
         t_el = ET.SubElement(parent_el, 'text', x=str(tx), y=str(-ty),
                              size=size_um, rot=_f(rot), align=align, layer='GRAPHIC')

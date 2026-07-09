@@ -17,7 +17,8 @@ from altium_monkey.altium_pcb_enums import PadShape, PcbTextJustification
 from altium_monkey.altium_record_types import PcbLayer, LineWidth
 from altium_monkey.altium_sch_svg_renderer import LINE_WIDTH_MILS
 
-from babel.ir_util import component_gates, is_multi_gate, parse_layer, resolve_model3d_file
+from babel.ir_util import (component_gates, is_multi_gate, parse_layer,
+                           resolve_model3d_file, arc_params)
 
 
 def _mils(v):
@@ -340,13 +341,19 @@ def _add_gate_to_symbol(sym, sym_el, des_map, schlib, owner_part_id=None):
                                       is_solid=False, line_width=lw,
                                       owner_part_id=pid)
         elif el.tag == 'arc':
-            start = float(el.get('start', 0))
-            sweep = float(el.get('sweep', 360))
+            # endpoint canon -> Altium's native center form (derived here,
+            # at the Altium boundary — ir_util.arc_params)
+            p = arc_params(float(el.get('x1')), float(el.get('y1')),
+                           float(el.get('x2')), float(el.get('y2')),
+                           float(el.get('curve')))
+            if p is None:
+                continue
+            cx_um, cy_um, r_um, start, sweep = p
             a1, a2 = _altium_arc_angles(start, sweep)
             _sym_add_arc(
                 sym,
-                _mils(el.get('cx')), _mils(el.get('cy')),
-                _mils(el.get('r')),
+                _mils(cx_um), _mils(cy_um),
+                _mils(r_um),
                 start_angle=a1,
                 end_angle=a2,
                 line_width=_lw(el.get('width', '0')),
@@ -922,11 +929,12 @@ def _export_footprint(fp_el, pcblib, step_dir=None):
                                      width_mils=lw, layer=pcb_layer)
 
         elif tag == 'arc' and pcb_layer is not None:
-            start  = float(child.get('start', 0))
-            sweep  = float(child.get('sweep', 360))
-            cx_um  = float(child.get('cx', 0))
-            cy_um  = float(child.get('cy', 0))
-            r_um   = float(child.get('r',  0))
+            p = arc_params(float(child.get('x1', 0)), float(child.get('y1', 0)),
+                           float(child.get('x2', 0)), float(child.get('y2', 0)),
+                           float(child.get('curve', 0)))
+            if p is None:
+                continue
+            cx_um, cy_um, r_um, start, sweep = p
             a1, a2 = _altium_arc_angles(start, sweep)
             fp.add_arc(
                 center_mils         = [_mils(cx_um), _mils(cy_um)],

@@ -2,7 +2,7 @@
 import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from babel.ir_util import symbol_pool, component_gates
+from babel.ir_util import symbol_pool, component_gates, arc_center
 
 _MARGIN  = 3.0   # mm padding around content (renderer works in mm internally)
 _MAX_DIM = 500   # max SVG dimension in pixels
@@ -109,8 +109,14 @@ def _bounds(elems_iter):
             pts += [(_v(el.get('x1')), _v(el.get('y1'))),
                     (_v(el.get('x2')), _v(el.get('y2')))]
         elif t == 'arc':
-            cx, cy, r = _v(el.get('cx')), _v(el.get('cy')), _v(el.get('r'))
-            pts += [(cx - r, cy - r), (cx + r, cy + r)]
+            x1, y1 = _v(el.get('x1')), _v(el.get('y1'))
+            x2, y2 = _v(el.get('x2')), _v(el.get('y2'))
+            c = arc_center(x1, y1, x2, y2, float(el.get('curve', 0) or 0))
+            if c is None:
+                pts += [(x1, y1), (x2, y2)]
+            else:
+                cx, cy, r = c
+                pts += [(cx - r, cy - r), (cx + r, cy + r)]
         elif t == 'shape':
             x, y = _v(el.get('x')), _v(el.get('y'))
             w2, h2 = _v(el.get('w')) / 2, _v(el.get('h')) / 2
@@ -159,21 +165,23 @@ def _line(x1s, y1s, x2s, y2s, color, lw, dash=''):
             f'stroke="{color}" stroke-width="{lw:.1f}" stroke-linecap="round"{dash_attr}/>')
 
 
-def _arc(cx_ir, cy_ir, r_ir, start_deg, sweep_deg, color, lw, x_min, y_max, scale, dash=''):
-    sr = math.radians(start_deg)
-    er = sr + math.radians(sweep_deg)
-    x1s, y1s = _tr(cx_ir + r_ir * math.cos(sr), cy_ir + r_ir * math.sin(sr),
-                   x_min, y_max, scale)
-    x2s, y2s = _tr(cx_ir + r_ir * math.cos(er), cy_ir + r_ir * math.sin(er),
-                   x_min, y_max, scale)
-    rp = r_ir * scale
-    large = 1 if abs(sweep_deg) > 180 else 0
-    # IR positive sweep = CCW (Y-up). After the Y flip the point moves in
+def _arc(x1_ir, y1_ir, x2_ir, y2_ir, curve_deg, color, lw, x_min, y_max, scale, dash=''):
+    """IR endpoint-form arc (ir_util's arc-math block) — SVG arcs are
+    endpoint-parameterized too, so the endpoints transform like any point
+    and only the radius is derived."""
+    c = arc_center(x1_ir, y1_ir, x2_ir, y2_ir, curve_deg)
+    x1s, y1s = _tr(x1_ir, y1_ir, x_min, y_max, scale)
+    x2s, y2s = _tr(x2_ir, y2_ir, x_min, y_max, scale)
+    if c is None:
+        return _line(x1s, y1s, x2s, y2s, color, lw, dash)
+    rp = c[2] * scale
+    large = 1 if abs(curve_deg) > 180 else 0
+    # IR positive curve = CCW (Y-up). After the Y flip the point moves in
     # the direction of DECREASING screen angle, and SVG sweep-flag=1 means
-    # INCREASING screen angle (its Y is down) — so positive sweep maps to
+    # INCREASING screen angle (its Y is down) — so positive curve maps to
     # flag 0. (Was inverted; caught by eye on modtest.brd dxf art —
     # every arc bulged to the mirrored side.)
-    cw = 0 if sweep_deg > 0 else 1
+    cw = 0 if curve_deg > 0 else 1
     dash_attr = f' stroke-dasharray="{dash}"' if dash else ''
     return (f'<path d="M{x1s:.1f},{y1s:.1f} A{rp:.1f},{rp:.1f} 0 {large} {cw} {x2s:.1f},{y2s:.1f}" '
             f'stroke="{color}" stroke-width="{lw:.1f}" fill="none" stroke-linecap="round"{dash_attr}/>')
@@ -394,8 +402,9 @@ def render_symbol(comp_el, root, scale=10):
 
         elif t == 'arc':
             lw = max(_v(el.get('width', '152')) * scale, 0.5)
-            out.append(_arc(_v(el.get('cx')), _v(el.get('cy')), _v(el.get('r')),
-                            float(el.get('start')), float(el.get('sweep')),
+            out.append(_arc(_v(el.get('x1')), _v(el.get('y1')),
+                            _v(el.get('x2')), _v(el.get('y2')),
+                            float(el.get('curve', 0)),
                             _SYM_BODY, lw, **kw))
 
         elif t == 'shape':
@@ -574,12 +583,15 @@ def render_schematic(root, scale=8, canvas_el=None):
                 _track(x1, y1); _track(x2, y2)
                 prims.append(('line', x1, y1, x2, y2, _v(el.get('width', '152')), _SYM_BODY))
             elif t == 'arc':
-                cx, cy = _inst_point(_v(el.get('cx')), _v(el.get('cy')), inst)
-                r = _v(el.get('r'))
-                start = _inst_dir_angle(float(el.get('start')), inst)
-                sweep = -float(el.get('sweep')) if inst['mirror'] else float(el.get('sweep'))
-                _track(cx - r, cy - r); _track(cx + r, cy + r)
-                prims.append(('arc', cx, cy, r, start, sweep, _v(el.get('width', '152'))))
+                # endpoint canon: endpoints transform like any point, mirror
+                # only flips the bulge side (curve sign)
+                ax1, ay1 = _inst_point(_v(el.get('x1')), _v(el.get('y1')), inst)
+                ax2, ay2 = _inst_point(_v(el.get('x2')), _v(el.get('y2')), inst)
+                curve = float(el.get('curve', 0))
+                if inst['mirror']:
+                    curve = -curve
+                _track(ax1, ay1); _track(ax2, ay2)
+                prims.append(('arc', ax1, ay1, ax2, ay2, curve, _v(el.get('width', '152'))))
             elif t == 'shape':
                 x, y = _inst_point(_v(el.get('x')), _v(el.get('y')), inst)
                 w, h = _v(el.get('w')), _v(el.get('h'))
@@ -700,11 +712,11 @@ def render_schematic(root, scale=8, canvas_el=None):
             _track(x1, y1); _track(x2, y2)
             prims.append(('line', x1, y1, x2, y2, _v(el.get('width', '152')), _SYM_INFO))
         elif t == 'arc':
-            cx, cy = _v(el.get('cx')), _v(el.get('cy'))
-            r = _v(el.get('r'))
-            _track(cx - r, cy - r); _track(cx + r, cy + r)
-            prims.append(('arc', cx, cy, r, float(el.get('start', 0)),
-                          float(el.get('sweep', 360)), _v(el.get('width', '152'))))
+            ax1, ay1 = _v(el.get('x1')), _v(el.get('y1'))
+            ax2, ay2 = _v(el.get('x2')), _v(el.get('y2'))
+            _track(ax1, ay1); _track(ax2, ay2)
+            prims.append(('arc', ax1, ay1, ax2, ay2,
+                          float(el.get('curve', 0)), _v(el.get('width', '152'))))
         elif t == 'shape':
             x, y = _v(el.get('x')), _v(el.get('y'))
             w, h = _v(el.get('w')), _v(el.get('h'))
@@ -755,8 +767,8 @@ def render_schematic(root, scale=8, canvas_el=None):
             x2s, y2s = _tr(x2, y2, **kw)
             out.append(_line(x1s, y1s, x2s, y2s, color, max(w * scale, 0.5)))
         elif kind == 'arc':
-            _, cx, cy, r, start, sweep, w = p
-            out.append(_arc(cx, cy, r, start, sweep, _SYM_BODY, max(w * scale, 0.5), **kw))
+            _, ax1, ay1, ax2, ay2, curve, w = p
+            out.append(_arc(ax1, ay1, ax2, ay2, curve, _SYM_BODY, max(w * scale, 0.5), **kw))
         elif kind == 'shape':
             _, x, y, w, h, roundness, outline, rot = p
             xs2, ys2 = _tr(x, y, **kw)
@@ -922,8 +934,9 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
 
             elif t == 'arc':
                 lw = max(_v(el.get('width', '152')) * scale, 0.5)
-                out.append(_arc(_v(el.get('cx')), _v(el.get('cy')), _v(el.get('r')),
-                                float(el.get('start')), float(el.get('sweep')),
+                out.append(_arc(_v(el.get('x1')), _v(el.get('y1')),
+                                _v(el.get('x2')), _v(el.get('y2')),
+                                float(el.get('curve', 0)),
                                 color, lw, **kw, dash=dash))
 
             elif t == 'shape':
