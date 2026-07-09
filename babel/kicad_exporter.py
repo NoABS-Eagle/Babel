@@ -32,8 +32,6 @@ _FP_LAYER = {
     139:  'F.CrtYd',   -139: 'B.CrtYd',
     151:  'F.Fab',     -151: 'B.Fab',
     120:  'Edge.Cuts',
-    144:  'Dwgs.User',
-    145:  'Dwgs.User',
     146:  'Edge.Cuts',
     148:  'Dwgs.User',
 }

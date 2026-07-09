@@ -77,8 +77,6 @@ LAYER_VALUES = 127        # tValues 27
 LAYER_MASK = 129          # tStop 29 / F.Mask
 LAYER_PASTE = 131         # tCream 31 / F.Paste
 LAYER_COURTYARD = 139     # tKeepout 39 / F.CrtYd
-LAYER_DRILLS = 144        # standalone
-LAYER_HOLES = 145         # standalone
 LAYER_MILLING = 146       # standalone
 LAYER_DOCUMENT = 148      # standalone, side-less notes (Dwgs.User/Cmts.User)
 LAYER_FAB = 151           # tDocu 51 / F.Fab — assembly drawing
@@ -93,7 +91,12 @@ CHANNEL_VIAS = 901        # rings/barrels of all <via>
 CHANNEL_PADS = 902        # TH pad copper (<pad>)
 CHANNEL_ORIGINS = 903     # <element> grab points; paired: -903 = bottom side
 CHANNEL_AIRWIRES = 904    # ratsnest (contactref minus routed copper)
-# 905+ reserved (DRC/ERC markers etc. — when they exist)
+CHANNEL_DRILLS = 905      # ALL drill renderings (pad/via/hole `drill` attrs).
+                          # ONE channel, not Eagle's 44/45 pair: the real
+                          # PTH/NPTH boundary lives in the object TYPE
+                          # (pad/via = plated, hole = not) and resurfaces at
+                          # CAM export; a view channel carries no semantics.
+# 906+ reserved (DRC/ERC markers etc. — when they exist)
 
 
 def is_copper(layer_n):

@@ -37,11 +37,24 @@ PKG_LAYER_MAP = {
     31: '131',  32: '-131',    # tCream / bCream
     39: '139',  40: '-139',    # tKeepout / bKeepout
     41: '!1',   42: '!-1',     # tRestrict / bRestrict -> anti-copper
-    44: '144',  45: '145',     # Drills / Holes (standalone)
+    # 44 Drills / 45 Holes: display channels in Eagle too (drill renderings,
+    # no stored objects) — no map entry; the impossible stray object would
+    # fall through to +100 as a plain user layer. IR side: CHANNEL_DRILLS.
     46: '146',                 # Milling (standalone)
     48: '148',                 # Document (standalone)
     51: '151',  52: '-151',    # tDocu / bDocu
 }
+
+
+# Deliberate drops (eda_ir_design.md "Импорт ВЫБОРОЧНЫЙ"): derived layers
+# (Pads/Vias are pad/via renderings, Unrouted is the ratsnest — connectivity
+# lives in contactref) and junk (Origins, Finish, Glue, Test, orphan
+# vRestrict). Everything NOT here and not in PKG_LAYER_MAP is carried as a
+# standalone layer by the +100 formula — the rule is "objects survive unless
+# the layer is known junk", not "only whitelisted layers survive" (real
+# boards keep art on odd system-range layers: modtest.brd has 150 wires on
+# a user-created layer 50 "dxf").
+_PKG_LAYER_JUNK = {17, 18, 19, 23, 24, 33, 34, 35, 36, 37, 38, 43}
 
 
 def _pkg_layer(eagle_n):
@@ -49,9 +62,9 @@ def _pkg_layer(eagle_n):
     ir = PKG_LAYER_MAP.get(eagle_n)
     if ir is not None:
         return ir
-    if 100 <= eagle_n <= 255:      # user layers: all unpaired -> + standalone
-        return str(eagle_n + 100)
-    return None
+    if eagle_n in _PKG_LAYER_JUNK or not 1 <= eagle_n <= 255:
+        return None
+    return str(eagle_n + 100)      # unpaired -> + standalone (user layers etc.)
 
 DIR_MAP = {
     'in':  'in',
@@ -309,6 +322,113 @@ def convert_symbol(sym_el, sym_name):
 # Footprint (package) conversion
 # ---------------------------------------------------------------------------
 
+def convert_geometry(child, parent, ir_layer):
+    """One Eagle drawing primitive (wire/circle/rectangle/polygon/text/hole)
+    -> IR element appended to `parent` with layer=ir_layer. The SINGLE home
+    for this conversion — used by convert_package (package geometry) and by
+    eagle_board_parser (board <plain> free geometry): same Eagle tags, same
+    IR primitives, one implementation. Returns True if the tag was handled
+    (regardless of whether ir_layer was None and it got dropped)."""
+    tag = child.tag
+
+    if tag == 'wire':
+        if ir_layer is None:
+            return True
+        curve = float(child.get('curve', 0))
+        x1, y1 = float(child.get('x1')), float(child.get('y1'))
+        x2, y2 = float(child.get('x2')), float(child.get('y2'))
+        width = child.get('width', '0.1524')
+        if curve != 0:
+            arc = eagle_arc(x1, y1, x2, y2, curve)
+            if arc:
+                cx, cy, r, start, sweep = arc
+                el = ET.SubElement(parent, 'arc')
+                el.set('cx', str(round(cx * 1000))); el.set('cy', str(round(cy * 1000)))
+                el.set('r', str(round(r * 1000)))
+                el.set('start', fmt(start)); el.set('sweep', fmt(sweep))
+                el.set('width', _um(width))
+                el.set('layer', ir_layer)
+        else:
+            el = ET.SubElement(parent, 'line')
+            el.set('x1', str(round(x1 * 1000))); el.set('y1', str(round(y1 * 1000)))
+            el.set('x2', str(round(x2 * 1000))); el.set('y2', str(round(y2 * 1000)))
+            el.set('width', _um(width))
+            el.set('layer', ir_layer)
+        return True
+
+    if tag == 'circle':
+        if ir_layer is None:
+            return True
+        r_um = round(float(child.get('radius')) * 1000)
+        el = ET.SubElement(parent, 'shape')
+        el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
+        el.set('w', str(r_um * 2)); el.set('h', str(r_um * 2))
+        el.set('roundness', '100')
+        el.set('rot', '0')
+        el.set('outline', _um(child.get('width', '0')))
+        el.set('layer', ir_layer)
+        return True
+
+    if tag == 'rectangle':
+        if ir_layer is None:
+            return True
+        x1, y1 = float(child.get('x1')), float(child.get('y1'))
+        x2, y2 = float(child.get('x2')), float(child.get('y2'))
+        rot, _ = parse_rot(child.get('rot'))
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        w, h = abs(x2 - x1), abs(y2 - y1)
+        if round(rot) % 180 == 90:
+            w, h = h, w
+            rot = rot - 90
+        el = ET.SubElement(parent, 'shape')
+        el.set('x', str(round(cx * 1000))); el.set('y', str(round(cy * 1000)))
+        el.set('w', str(round(w * 1000))); el.set('h', str(round(h * 1000)))
+        el.set('roundness', '0')
+        el.set('rot', str(round(rot)))
+        el.set('outline', _um(child.get('width', '0')))
+        el.set('layer', ir_layer)
+        return True
+
+    if tag == 'polygon':
+        if ir_layer is None:
+            return True
+        width_um = round(float(child.get('width', '0')) * 1000)
+        if 0 < width_um < 50:
+            width_um = 50
+        pg = ET.SubElement(parent, 'polygon')
+        pg.set('width', str(width_um))
+        pg.set('layer', ir_layer)
+        for v in child.findall('vertex'):
+            ve = ET.SubElement(pg, 'vertex')
+            ve.set('x', str(round(float(v.get('x', '0')) * 1000)))
+            ve.set('y', str(round(float(v.get('y', '0')) * 1000)))
+        return True
+
+    if tag == 'text':
+        if ir_layer is None:
+            return True
+        rot, _ = parse_rot(child.get('rot'))
+        el = ET.SubElement(parent, 'text')
+        el.set('layer', ir_layer)
+        el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
+        el.set('size', _um(child.get('size')))
+        el.set('rot', fmt(rot))
+        el.set('align', child.get('align', 'bottom-left'))
+        if child.get('font') == 'vector':
+            el.set('font', 'vector')
+        el.text = child.text or ''
+        return True
+
+    if tag == 'hole':
+        # layer-less by nature (through the whole stack)
+        el = ET.SubElement(parent, 'hole')
+        el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
+        el.set('drill', _um(child.get('drill')))
+        return True
+
+    return False
+
+
 def convert_package(pkg_el, pkg_name):
     fp = ET.Element('footprint')
     fp.set('name', pkg_name)
@@ -354,93 +474,8 @@ def convert_package(pkg_el, pkg_name):
                 el.set('diameter', _um(child.get('diameter')))
             el.set('shape', ir_shape)
 
-        elif tag == 'hole':
-            el = ET.SubElement(fp, 'hole')
-            el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
-            el.set('drill', _um(child.get('drill')))
-
-        elif tag == 'wire':
-            if ir_layer is None:
-                continue
-            curve = float(child.get('curve', 0))
-            x1, y1 = float(child.get('x1')), float(child.get('y1'))
-            x2, y2 = float(child.get('x2')), float(child.get('y2'))
-            width = child.get('width', '0.1524')
-            if curve != 0:
-                arc = eagle_arc(x1, y1, x2, y2, curve)
-                if arc:
-                    cx, cy, r, start, sweep = arc
-                    el = ET.SubElement(fp, 'arc')
-                    el.set('cx', str(round(cx * 1000))); el.set('cy', str(round(cy * 1000)))
-                    el.set('r', str(round(r * 1000)))
-                    el.set('start', fmt(start)); el.set('sweep', fmt(sweep))
-                    el.set('width', _um(width))
-                    el.set('layer', ir_layer)
-            else:
-                el = ET.SubElement(fp, 'line')
-                el.set('x1', str(round(x1 * 1000))); el.set('y1', str(round(y1 * 1000)))
-                el.set('x2', str(round(x2 * 1000))); el.set('y2', str(round(y2 * 1000)))
-                el.set('width', _um(width))
-                el.set('layer', ir_layer)
-
-        elif tag == 'circle':
-            if ir_layer is None:
-                continue
-            r_um = round(float(child.get('radius')) * 1000)
-            el = ET.SubElement(fp, 'shape')
-            el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
-            el.set('w', str(r_um * 2)); el.set('h', str(r_um * 2))
-            el.set('roundness', '100')
-            el.set('rot', '0')
-            el.set('outline', _um(child.get('width', '0')))
-            el.set('layer', ir_layer)
-
-        elif tag == 'rectangle':
-            if ir_layer is None:
-                continue
-            x1, y1 = float(child.get('x1')), float(child.get('y1'))
-            x2, y2 = float(child.get('x2')), float(child.get('y2'))
-            rot, _ = parse_rot(child.get('rot'))
-            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-            w, h = abs(x2 - x1), abs(y2 - y1)
-            if round(rot) % 180 == 90:
-                w, h = h, w
-                rot = rot - 90
-            el = ET.SubElement(fp, 'shape')
-            el.set('x', str(round(cx * 1000))); el.set('y', str(round(cy * 1000)))
-            el.set('w', str(round(w * 1000))); el.set('h', str(round(h * 1000)))
-            el.set('roundness', '0')
-            el.set('rot', str(round(rot)))
-            el.set('outline', _um(child.get('width', '0')))
-            el.set('layer', ir_layer)
-
-        elif tag == 'polygon':
-            if ir_layer is None:
-                continue
-            width_um = round(float(child.get('width', '0')) * 1000)
-            if 0 < width_um < 50:
-                width_um = 50
-            pg = ET.SubElement(fp, 'polygon')
-            pg.set('width', str(width_um))
-            pg.set('layer', ir_layer)
-            for v in child.findall('vertex'):
-                ve = ET.SubElement(pg, 'vertex')
-                ve.set('x', str(round(float(v.get('x', '0')) * 1000)))
-                ve.set('y', str(round(float(v.get('y', '0')) * 1000)))
-
-        elif tag == 'text':
-            if ir_layer is None:
-                continue
-            rot, _ = parse_rot(child.get('rot'))
-            el = ET.SubElement(fp, 'text')
-            el.set('layer', ir_layer)
-            el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
-            el.set('size', _um(child.get('size')))
-            el.set('rot', fmt(rot))
-            el.set('align', child.get('align', 'bottom-left'))
-            if child.get('font') == 'vector':
-                el.set('font', 'vector')
-            el.text = child.text or ''
+        elif tag in ('hole', 'wire', 'circle', 'rectangle', 'polygon', 'text'):
+            convert_geometry(child, fp, ir_layer)
 
     d3 = parse_3d(desc_text)
     if d3:
