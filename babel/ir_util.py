@@ -109,6 +109,91 @@ CHANNEL_DRILLS = 905      # ALL drill renderings (pad/via/hole `drill` attrs).
 # 906+ reserved (DRC/ERC markers etc. — when they exist)
 
 
+# |n| values that form canonical top/bottom PAIRS (ir_schema.md "Слои
+# футпринта <-> слои платы": bottom placement negates paired layers, leaves
+# standalone ones alone). The real rule consults the layout's OWN layer
+# table (a pair = both signs declared); this set covers the canonical
+# numbers until layouts grow explicit <layer> declarations.
+_CANON_PAIRED = {1, 121, 125, 127, 129, 131, 139, 151}
+
+
+def place_layer(ln, bottom):
+    """Footprint-space layer attr (side-relative sign) -> board-space layer
+    attr for an element on the given side. Sign arithmetic per ir_schema.md:
+    top passes through; bottom negates paired layers, standalone unchanged."""
+    if not bottom or not ln:
+        return ln
+    anti, n = parse_layer(ln)
+    if abs(n) in _CANON_PAIRED:
+        n = -n
+    return ('!' if anti else '') + str(n)
+
+
+def place_ir_element(el, ex_um, ey_um, rot_deg, bottom):
+    """One footprint-space IR element -> a transformed deep copy in board
+    space for a placement at (ex_um, ey_um µm), rot_deg CCW (top view),
+    side bottom = mirror about the Y axis THEN rotate (ir_schema.md
+    <element>). The single home of placement math — renderer today, board
+    exporters that must bake placements tomorrow."""
+    import copy
+    c = copy.deepcopy(el)
+    a = math.radians(rot_deg)
+    cos_a, sin_a = math.cos(a), math.sin(a)
+
+    def pt(x, y):
+        if bottom:
+            x = -x
+        return (ex_um + x * cos_a - y * sin_a, ey_um + x * sin_a + y * cos_a)
+
+    def set_pt(el_, kx, ky):
+        if el_.get(kx) is None:
+            return
+        x, y = pt(float(el_.get(kx)), float(el_.get(ky)))
+        el_.set(kx, str(round(x))); el_.set(ky, str(round(y)))
+
+    def obj_rot(theta):
+        # M . R(theta) = R(-theta) . M  =>  net object angle rot -/+ theta
+        return (rot_deg - theta) % 360 if bottom else (rot_deg + theta) % 360
+
+    t = c.tag
+    if t == 'line':
+        set_pt(c, 'x1', 'y1'); set_pt(c, 'x2', 'y2')
+    elif t == 'arc':
+        set_pt(c, 'cx', 'cy')
+        start = float(c.get('start', 0)); sweep = float(c.get('sweep', 0))
+        if bottom:
+            c.set('start', f'{(180 - start + rot_deg) % 360:g}')
+            c.set('sweep', f'{-sweep:g}')
+        else:
+            c.set('start', f'{(start + rot_deg) % 360:g}')
+    elif t == 'polygon':
+        for v in c.findall('vertex'):
+            set_pt(v, 'x', 'y')
+    else:   # shape / text / smd / pad / hole — point + own rotation
+        set_pt(c, 'x', 'y')
+        if c.get('rot') is not None or t in ('shape', 'text', 'smd'):
+            c.set('rot', f'{obj_rot(float(c.get("rot", 0))):g}')
+    if c.get('layer') is not None:
+        c.set('layer', place_layer(c.get('layer'), bottom))
+    elif t == 'smd':
+        c.set('layer', place_layer('1', bottom))
+    return c
+
+
+def place_footprint(fp_el, ex_um, ey_um, rot_deg, bottom, skip_texts=()):
+    """All drawable children of a footprint, placed. skip_texts: placeholder
+    strings ('>NAME', ...) overridden or hidden by the element's own <text>
+    children — the footprint's copy is not emitted."""
+    out = []
+    for el in fp_el:
+        if el.tag in ('description', 'model3d', 'pin-mapping'):
+            continue
+        if el.tag == 'text' and (el.text or '').strip() in skip_texts:
+            continue
+        out.append(place_ir_element(el, ex_um, ey_um, rot_deg, bottom))
+    return out
+
+
 def is_copper(layer_n):
     return abs(int(layer_n)) < 100
 

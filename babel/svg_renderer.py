@@ -915,6 +915,8 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
                                   _v(el.get('drill')), **kw))
 
             elif t == 'text':
+                if el.get('hidden') == 'yes':
+                    continue    # suppression override (ir_schema.md <element>)
                 out.append(_text(_v(el.get('x')), _v(el.get('y')),
                                   el.text or '', _v(el.get('size', '1270')),
                                   float(el.get('rot', 0)), el.get('align', 'bottom-left'),
