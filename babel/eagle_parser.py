@@ -269,6 +269,8 @@ def convert_symbol(sym_el, sym_name):
             el.set('layer', ir_layer)
             if child.get('font') == 'vector':
                 el.set('font', 'vector')
+            if child.get('ratio'):
+                el.set('ratio', child.get('ratio'))
             el.text = child.text or ''
 
         elif tag == 'frame':
@@ -441,6 +443,8 @@ def convert_geometry(child, parent, ir_layer):
         el.set('align', child.get('align', 'bottom-left'))
         if child.get('font') == 'vector':
             el.set('font', 'vector')
+        if child.get('ratio'):
+            el.set('ratio', child.get('ratio'))
         el.text = child.text or ''
         return True
 

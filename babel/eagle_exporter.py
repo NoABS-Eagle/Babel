@@ -242,6 +242,7 @@ def export_symbol(sym_el, sym_name, coerce_sup=False):
             if rot: te.set('rot', rot)
             align = el.get('align', 'bottom-left')
             if align != 'bottom-left': te.set('align', align)
+            if el.get('ratio'): te.set('ratio', el.get('ratio'))
             # Stored IR layer takes priority; fall back to content-based guess
             te.set('layer', _eagle_layer(el, fallback=_text_layer(txt)))
             # Always vector, regardless of source font — per the user, this
@@ -523,6 +524,7 @@ def export_package(fp_el, pkg_name):
             if rot: te.set('rot', rot)
             align = el.get('align', 'bottom-left')
             if align != 'bottom-left': te.set('align', align)
+            if el.get('ratio'): te.set('ratio', el.get('ratio'))
             # `>VALUE` always -> tValues (27), regardless of which IR
             # layer bucket it's actually sitting in (confirmed real:
             # always `fab` — a single, side-less documentation layer;
@@ -1183,6 +1185,7 @@ def _emit_deco(plain_el, el):
         if rot: te.set('rot', rot)
         align = el.get('align', 'bottom-left')
         if align != 'bottom-left': te.set('align', align)
+        if el.get('ratio'): te.set('ratio', el.get('ratio'))
         te.set('layer', _eagle_layer(el, fallback=_LYR_GRAPHIC))
         te.set('font', 'vector')
         te.text = el.text or ''

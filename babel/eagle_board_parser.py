@@ -74,6 +74,8 @@ def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset()):
         t.set('align', a.get('align', 'bottom-left'))
         if a.get('font') == 'vector':
             t.set('font', 'vector')
+        if a.get('ratio'):
+            t.set('ratio', a.get('ratio'))
         ir_layer = _pkg_layer(int(a.get('layer')))
         if ir_layer:
             t.set('layer', ir_layer)
