@@ -66,13 +66,15 @@ _LAYER_COLORS = {
 # Layers rendered with dashed stroke (Eagle fill patterns 10/11 = hatch)
 _LAYER_DASH = {139: '3,2', -139: '3,2'}
 
-# Fab/Document are same color as silkscreen but dimmer so they don't compete
-_DIM_LAYERS = {148, 151, -151}
+# Fab/Document are same color as silkscreen but dimmer so they don't compete;
+# mask/paste are APERTURES, not ink — dimmed and painted UNDER copper, or a
+# pad's mask rectangle floods the pad silk-yellow (caught on luminoso D1)
+_DIM_LAYERS = {148, 151, -151, 129, -129, 131, -131}
 _FAB_OPACITY = '0.45'
 
 # Paint order, bottom-most first; pads (layer None) are painted with copper.
-_LAYER_Z = [139, -139, 151, -151, 148, 120, 147, -121, -129, -1, None, 1,
-            121, 125, -125, 127, -127, 129, 131, -131]
+_LAYER_Z = [139, -139, 151, -151, 148, 120, 147, 129, -129, 131, -131,
+            -121, -1, None, 1, 121, 125, -125, 127, -127]
 
 # Symbol layers
 _SYM_BODY  = _E[4]   # layer 94 Symbols color=4 red
@@ -173,18 +175,21 @@ def _arc(cx_ir, cy_ir, r_ir, start_deg, sweep_deg, color, lw, x_min, y_max, scal
             f'stroke="{color}" stroke-width="{lw:.1f}" fill="none" stroke-linecap="round"{dash_attr}/>')
 
 
-def _shape(x_ir, y_ir, w_ir, h_ir, roundness, outline_ir, color, x_min, y_max, scale):
+def _shape(x_ir, y_ir, w_ir, h_ir, roundness, outline_ir, color, x_min, y_max, scale,
+           rot_deg=0):
     xs, ys = _tr(x_ir, y_ir, x_min, y_max, scale)
     wp, hp = w_ir * scale, h_ir * scale
     filled = (outline_ir == 0)
     fc = color if filled else 'none'
     sw = max(outline_ir * scale, 0.5) if not filled else 0
+    # IR CCW+ -> SVG rotate is CW-positive on screen (Y down)
+    rot_attr = f' transform="rotate({-rot_deg:.3g},{xs:.1f},{ys:.1f})"' if rot_deg % 360 else ''
     if roundness == 100:
         return (f'<circle cx="{xs:.1f}" cy="{ys:.1f}" r="{wp/2:.1f}" '
                 f'stroke="{color}" stroke-width="{sw:.1f}" fill="{fc}"/>')
     rx = (roundness / 100) * min(wp, hp) / 2
     return (f'<rect x="{xs-wp/2:.1f}" y="{ys-hp/2:.1f}" width="{wp:.1f}" height="{hp:.1f}" '
-            f'rx="{rx:.1f}" stroke="{color}" stroke-width="{sw:.1f}" fill="{fc}"/>')
+            f'rx="{rx:.1f}" stroke="{color}" stroke-width="{sw:.1f}" fill="{fc}"{rot_attr}/>')
 
 
 def _align_to_svg(align):
@@ -360,7 +365,7 @@ def render_symbol(comp_el, root, scale=10):
             out.append(_shape(_v(el.get('x')), _v(el.get('y')),
                                _v(el.get('w')), _v(el.get('h')),
                                int(el.get('roundness', 0)), _v(el.get('outline', '0')),
-                               _SYM_BODY, **kw))
+                               _SYM_BODY, **kw, rot_deg=float(el.get('rot', 0))))
 
         elif t == 'polygon':
             coords = [_tr(_v(v.get('x')), _v(v.get('y')), **kw)
@@ -888,7 +893,7 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
                 out.append(_shape(_v(el.get('x')), _v(el.get('y')),
                                    _v(el.get('w')), _v(el.get('h')),
                                    int(el.get('roundness', 0)), _v(el.get('outline', '0')),
-                                   color, **kw))
+                                   color, **kw, rot_deg=float(el.get('rot', 0))))
 
             elif t == 'polygon':
                 coords = [_tr(_v(v.get('x')), _v(v.get('y')), **kw)
