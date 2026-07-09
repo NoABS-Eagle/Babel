@@ -83,6 +83,18 @@ LAYER_MILLING = 146       # standalone
 LAYER_DOCUMENT = 148      # standalone, side-less notes (Dwgs.User/Cmts.User)
 LAYER_FAB = 151           # tDocu 51 / F.Fab — assembly drawing
 
+# Derived DISPLAY CHANNELS (ir_schema.md "Производные каналы отображения",
+# decisions.md 2026-07-09): renderer/editor-only layer numbers whose
+# membership is decided by object TYPE, never by a stored attribute — these
+# numbers are ILLEGAL in .swprj files (|n| >= 900 reserved). <via>/<pad>
+# span the whole stack, airwires aren't stored at all; the channel exists so
+# the editor's layer machinery (visibility/color) can still address them.
+CHANNEL_VIAS = 901        # rings/barrels of all <via>
+CHANNEL_PADS = 902        # TH pad copper (<pad>)
+CHANNEL_ORIGINS = 903     # <element> grab points; paired: -903 = bottom side
+CHANNEL_AIRWIRES = 904    # ratsnest (contactref minus routed copper)
+# 905+ reserved (DRC/ERC markers etc. — when they exist)
+
 
 def is_copper(layer_n):
     return abs(int(layer_n)) < 100
