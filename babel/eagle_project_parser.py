@@ -30,6 +30,7 @@ kicad_project_parser._detect_pages/convert_project_full uses for KiCad's
 flat multi-page projects.
 """
 import math
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -791,6 +792,48 @@ def convert_project_full(src, output_path):
         ET.SubElement(schem_el, 'instance', **kwargs)
 
     _write_canvas(schem_el, component_instances, all_nets)
+
+    # --- Board half: a sibling .brd makes this project ONE <layout>
+    # (Eagle can't have more than one board per schematic). Import is
+    # project-scoped by design — element->instance binding is REFDES
+    # identity, which only the schematic can vouch for.
+    brd_path = src.with_suffix('.brd')
+    if brd_path.exists():
+        from babel.eagle_board_parser import convert_board
+
+        # Eagle flattens module-instance parts onto the board two ways
+        # (modtest ground truth): 'NAMUR3:C1' natively (offset-less
+        # instance) — already the IR canon INST:REFDES — and numerically
+        # ('C101' = C1 + moduleinst offset=100). Map the numeric spelling
+        # back; pure recorded-offset arithmetic, no guessing.
+        name_map = {}
+        known = {i['designator'] for i in component_instances}
+        mod_parts = {m.get('name'): [mi.get('name') for mi in m.findall('instance')
+                                     if not mi.get('module')]
+                     for m in module_els}
+        for minst in module_instances:
+            for part in mod_parts.get(minst['module'], ()):
+                addr = f'{minst["designator"]}:{part}'
+                known.add(addr)
+                offset = minst.get('offset')
+                if offset and offset != '0':
+                    m = re.match(r'^(.*?)(\d+)$', part)
+                    if m:
+                        flat = f'{m.group(1)}{int(m.group(2)) + int(offset)}'
+                        name_map[flat] = addr
+
+        net_names = {n.get('name') for n in schem_el.findall('net')}
+        layout_el = convert_board(brd_path, name_map=name_map, known=known,
+                                  net_names=net_names)
+        # every board element must resolve — diagnostics over silence
+        unresolved = sorted({e.get('name') for e in layout_el
+                             if e.tag == 'element'
+                             and not e.get('footprint')} - known)
+        if unresolved:
+            raise ValueError(
+                f'{brd_path}: board elements with no schematic instance: '
+                f'{", ".join(unresolved[:10])} — REFDES identity broken')
+        proj_el.append(layout_el)
 
     tree_str = ET.tostring(proj_el, encoding='unicode')
     from xml.dom import minidom

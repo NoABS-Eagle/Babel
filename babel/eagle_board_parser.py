@@ -18,10 +18,11 @@ import xml.etree.ElementTree as ET
 
 from babel import import_log
 from babel.eagle_parser import (convert_geometry, convert_geometry_mapped,
-                                _pkg_layer, _um, fmt, parse_rot)
+                                convert_package, _pkg_layer, _um, fmt, parse_rot)
 
 
-def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset()):
+def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset(),
+                     ir_name=None):
     """Eagle <element> -> IR <element> (ir_schema.md "<element>"): placement
     (x/y/rot/side) + <text> placeholder overrides for smashed attributes.
 
@@ -39,7 +40,7 @@ def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset()):
     deleted NAME rendering bottom-blue near R17).
     """
     el = ET.SubElement(layout, 'element')
-    el.set('name', e.get('name'))
+    el.set('name', ir_name or e.get('name'))
     el.set('x', _um(e.get('x'))); el.set('y', _um(e.get('y')))
     rot, mirror = parse_rot(e.get('rot'))
     if rot:
@@ -122,7 +123,8 @@ def _copper_map(stack):
     return m
 
 
-def _convert_signal(s, layout, layout_name, copper_map, stack, brd_path):
+def _convert_signal(s, layout, layout_name, copper_map, stack, brd_path,
+                    name_map=None, net_names=None):
     """Eagle <signal> -> IR <signal>: contactrefs, copper tracks (wire ->
     line/arc), through vias, pour polygons (contour only).
 
@@ -132,13 +134,22 @@ def _convert_signal(s, layout, layout_name, copper_map, stack, brd_path):
     """
     sig = ET.SubElement(layout, 'signal')
     sig.set('name', s.get('name'))
+    if net_names is not None and s.get('name') not in net_names:
+        # Module-crossing nets get Eagle-INTERNAL flattened names on the
+        # board (machine N$1009, offset-prefixed '1AI1' — modtest ground
+        # truth): the name is a board fact we keep as-is, connectivity is
+        # held by contactrefs. Never silent, though.
+        import_log.log(layout_name, s.get('name'),
+                       'SIGNAL_NAME has no schematic net,',
+                       'kept as board fact (module-crossing net)')
     airwires = 0
 
     for c in s:
         tag = c.tag
         if tag == 'contactref':
             cr = ET.SubElement(sig, 'contactref')
-            cr.set('element', c.get('element'))
+            el_name = c.get('element')
+            cr.set('element', (name_map or {}).get(el_name, el_name))
             cr.set('pad', c.get('pad'))
 
         elif tag == 'wire':
@@ -201,9 +212,25 @@ def _convert_signal(s, layout, layout_name, copper_map, stack, brd_path):
                        f'{airwires} (connectivity lives in contactref)')
 
 
-def convert_board(brd_path, layout_name='main'):
-    """Parse one .brd file -> IR <layout> element (slices 1-2: <plain> +
-    <element>)."""
+def convert_board(brd_path, layout_name='main', name_map=None, known=None,
+                  net_names=None):
+    """Parse one .brd file -> IR <layout> element.
+
+    Project-scoped context (all optional — a standalone call skips the
+    validation, the harness/tests use that):
+    - name_map: Eagle board designator -> IR element address. Eagle flattens
+      module-instance parts onto the board TWO ways (modtest ground truth):
+      'NAMUR3:C1' natively for offset-less instances — the exact IR canon
+      INST:REFDES — and numerically ('C101' = C1 + offset 100) when the
+      instance carries offset=. The map (built by eagle_project_parser from
+      the moduleinsts) normalizes the second spelling into the first.
+    - known: set of resolvable IR element addresses (top designators +
+      INST:REFDES). An element outside it must be a PADLESS board-only
+      object -> its footprint is embedded per-layout and referenced by the
+      element's footprint= attr; pads present -> hard reject.
+    - net_names: schematic net names; a signal outside it is kept under its
+      board name with a log note (Eagle renames module-crossing nets).
+    """
     root = ET.parse(brd_path).getroot()
     board = root.find('.//board')
     if board is None:
@@ -239,18 +266,50 @@ def convert_board(brd_path, layout_name='main'):
                 import_log.log(layout_name, child.tag, 'PLAIN_UNSUPPORTED dropped,',
                                f'layer={eagle_layer}')
 
+    embedded_fps = set()
     elements = board.find('elements')
     if elements is not None:
         for e in elements:
+            eagle_name = e.get('name')
+            ir_name = (name_map or {}).get(eagle_name, eagle_name)
+            fp_attr = None
+            if known is not None and ir_name not in known:
+                # not a schematic part: legal ONLY as a PADLESS board-only
+                # object (logo/art/fiducial — decisions.md "Контейнер платы",
+                # случай (А)); anything with pads is electrical and MUST
+                # come from the schematic — REFDES identity broken otherwise
+                lib_name, pkg_name = e.get('library'), e.get('package')
+                pkg_el = board.find(f'libraries/library[@name="{lib_name}"]'
+                                    f'/packages/package[@name="{pkg_name}"]')
+                if pkg_el is None or pkg_el.find('smd') is not None \
+                        or pkg_el.find('pad') is not None:
+                    raise ValueError(
+                        f'{brd_path}: element {eagle_name!r} ({lib_name}:'
+                        f'{pkg_name}) has no schematic instance but carries '
+                        f'pads — electrical parts must exist in the '
+                        f'schematic (REFDES identity)')
+                fp_attr = pkg_name
+                if pkg_name not in embedded_fps:
+                    embedded_fps.add(pkg_name)
+                    fp_el = convert_package(pkg_el, pkg_name)
+                    fp_el.set('library', lib_name)
+                    layout.append(fp_el)
+                import_log.log(layout_name, eagle_name,
+                               'BOARD_ONLY padless element, footprint',
+                               f'{lib_name}:{pkg_name} embedded per-layout')
             _convert_element(e, layout, layout_name,
                              pkg_placeholders.get(
                                  (e.get('library'), e.get('package')),
-                                 frozenset()))
+                                 frozenset()),
+                             ir_name=ir_name)
+            if fp_attr:
+                layout[-1].set('footprint', fp_attr)
 
     signals = board.find('signals')
     if signals is not None:
         for s in signals:
-            _convert_signal(s, layout, layout_name, copper_map, stack, brd_path)
+            _convert_signal(s, layout, layout_name, copper_map, stack,
+                            brd_path, name_map=name_map, net_names=net_names)
 
     # Opaque source metadata IR must give back on export to the SAME format
     # (ir_schema.md "<passthrough>"): design rules, autorouter setup, approved

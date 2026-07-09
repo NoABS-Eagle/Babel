@@ -164,6 +164,30 @@ def export_board(ir_path, output_path=None, layout_name=None):
     comp_by_name = {c.get('name'): c for c in root.findall('component')}
     inst_by_des = ({i.get('name'): i for i in schem.findall('instance')}
                    if schem is not None else {})
+    module_by_name = {m.get('name'): m for m in root.findall('module')}
+    local_fp = {f.get('name'): f for f in layout.findall('footprint')}
+
+    def _resolve_instance(des):
+        """IR element address -> (instance, eagle board designator).
+        'INST:REFDES' (module-instance part, ir_schema.md "<element>") uses
+        the module canvas instance; the Eagle spelling flattens numerically
+        when the moduleinst carries offset= (C1 @ offset 100 -> C101), and
+        keeps the native colon form otherwise — exact import inverse."""
+        if ':' not in des:
+            return inst_by_des.get(des), des
+        minst_name, part = des.split(':', 1)
+        minst = inst_by_des.get(minst_name)
+        mod = module_by_name.get(minst.get('module')) if minst is not None else None
+        if mod is None:
+            return None, des
+        part_inst = next((i for i in mod.findall('instance')
+                          if i.get('name') == part), None)
+        offset = minst.get('offset')
+        if offset and offset != '0':
+            m = re.match(r'^(.*?)(\d+)$', part)
+            if m:
+                return part_inst, f'{m.group(1)}{int(m.group(2)) + int(offset)}'
+        return part_inst, des
 
     stack = _stack(layout)
 
@@ -202,10 +226,19 @@ def export_board(ir_path, output_path=None, layout_name=None):
 
     # --- elements + the libraries (packages only) they need
     elements_ir = layout.findall('element')
-    el_binding = {}                          # designator -> (lib, fp_el)
+    el_binding = {}          # IR address -> (lib, comp, inst, fp, eagle_name)
     for e in elements_ir:
         des = e.get('name')
-        inst = inst_by_des.get(des)
+        if e.get('footprint'):
+            # board-only padless object: footprint embedded per-layout
+            fp = local_fp.get(e.get('footprint'))
+            if fp is None:
+                raise ValueError(f'{ir_path}: element {des!r} references '
+                                 f'layout footprint {e.get("footprint")!r} '
+                                 f'that is not embedded')
+            el_binding[des] = (fp.get('library') or 'babel', None, None, fp, des)
+            continue
+        inst, eagle_name = _resolve_instance(des)
         comp = comp_by_name.get(inst.get('component')) if inst is not None else None
         fp = _instance_footprint(comp, inst) if comp is not None else None
         if fp is None:
@@ -213,11 +246,11 @@ def export_board(ir_path, output_path=None, layout_name=None):
                 f'{ir_path}: element {des!r} has no schematic instance with a '
                 f'footprint — REFDES identity broken, cannot export the board')
         el_binding[des] = (comp.get('library') or root.get('name') or 'babel',
-                          comp, inst, fp)
+                          comp, inst, fp, eagle_name)
 
     libraries_el = ET.SubElement(board, 'libraries')
     pkgs_by_lib = {}
-    for lib, comp, inst, fp in el_binding.values():
+    for lib, comp, inst, fp, eagle_name in el_binding.values():
         pkgs_by_lib.setdefault(_eagle_name(lib), {})[fp.get('name')] = fp
     for lib_name, fps in sorted(pkgs_by_lib.items()):
         lib_el = ET.SubElement(libraries_el, 'library', name=lib_name)
@@ -260,15 +293,18 @@ def export_board(ir_path, output_path=None, layout_name=None):
     elements_el = ET.SubElement(board, 'elements')
     for e in elements_ir:
         des = e.get('name')
-        lib, comp, inst, fp = el_binding[des]
+        lib, comp, inst, fp, eagle_name = el_binding[des]
         el_out = ET.SubElement(elements_el, 'element')
-        el_out.set('name', _eagle_designator(des))
+        el_out.set('name', _eagle_designator(eagle_name))
         el_out.set('library', _eagle_name(lib))
         el_out.set('package', _eagle_name(fp.get('name')))
-        value = next((a.get('value', '') for a in inst.findall('attr')
-                      if a.get('name') == 'VALUE'),
-                     next((a.get('value', '') for a in comp.findall('attr')
-                           if a.get('name') == 'VALUE'), ''))
+        value = ''
+        if inst is not None:
+            value = next((a.get('value', '') for a in inst.findall('attr')
+                          if a.get('name') == 'VALUE'),
+                         next((a.get('value', '') for a in comp.findall('attr')
+                               if a.get('name') == 'VALUE'), '')
+                         if comp is not None else '')
         el_out.set('value', value)
         el_out.set('x', _tomm(e.get('x'))); el_out.set('y', _tomm(e.get('y')))
         rot = _element_rot(e)
@@ -292,7 +328,10 @@ def export_board(ir_path, output_path=None, layout_name=None):
         for c in sig:
             if c.tag == 'contactref':
                 cr = ET.SubElement(s_out, 'contactref')
-                cr.set('element', _eagle_designator(c.get('element')))
+                el_ref = c.get('element')
+                eagle_ref = (el_binding[el_ref][4] if el_ref in el_binding
+                             else _resolve_instance(el_ref)[1])
+                cr.set('element', _eagle_designator(eagle_ref))
                 cr.set('pad', _eagle_designator(c.get('pad')))
             elif c.tag == 'line':
                 anti, n = _copper_num(c.get('layer'), stack)
