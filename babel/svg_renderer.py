@@ -55,7 +55,8 @@ _LAYER_COLORS = {
     -131: _E[7],
     139:  _E[4],   # courtyard (Eagle 39 color=4 red, dashed)
     -139: _E[4],
-    120:  _E[15],  # Dimension — white; ALL cuts (outline, slots)
+    120:  _E[11],  # Dimension — cyan; ALL cuts (outline, slots). NOT white/
+                   # yellow: must be tell-apart-able from silk 121 at 1px
     147:  _E[13],  # PLATING marker (Eagle projection: layer 156)
     148:  _E[7],   # Document notes (dimmed like fab)
     151:  _E[7],   # fab (Eagle 51, dimmed below)
@@ -161,8 +162,12 @@ def _arc(cx_ir, cy_ir, r_ir, start_deg, sweep_deg, color, lw, x_min, y_max, scal
                    x_min, y_max, scale)
     rp = r_ir * scale
     large = 1 if abs(sweep_deg) > 180 else 0
-    # CCW in IR (positive sweep) → CW in SVG (Y-flipped) → sweep-flag=1
-    cw = 1 if sweep_deg > 0 else 0
+    # IR positive sweep = CCW (Y-up). After the Y flip the point moves in
+    # the direction of DECREASING screen angle, and SVG sweep-flag=1 means
+    # INCREASING screen angle (its Y is down) — so positive sweep maps to
+    # flag 0. (Was inverted; caught by eye on modtest.brd dxf art —
+    # every arc bulged to the mirrored side.)
+    cw = 0 if sweep_deg > 0 else 1
     dash_attr = f' stroke-dasharray="{dash}"' if dash else ''
     return (f'<path d="M{x1s:.1f},{y1s:.1f} A{rp:.1f},{rp:.1f} 0 {large} {cw} {x2s:.1f},{y2s:.1f}" '
             f'stroke="{color}" stroke-width="{lw:.1f}" fill="none" stroke-linecap="round"{dash_attr}/>')
@@ -856,7 +861,10 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
         group = by_layer.get(layer_n, [])
         if not group:
             continue
-        color = _LAYER_COLORS.get(layer_n, _E[7]) if layer_n is not None else _E[4]
+        # unknown (user) layers: neutral gray — anything from the known
+        # palette would masquerade as a semantic layer (150 dxf art used to
+        # render silk-yellow)
+        color = _LAYER_COLORS.get(layer_n, '#9A9A9A') if layer_n is not None else _E[4]
         dash  = _LAYER_DASH.get(layer_n, '')
         opacity = _FAB_OPACITY if layer_n in _DIM_LAYERS else ''
         if opacity:
