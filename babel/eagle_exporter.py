@@ -258,11 +258,12 @@ def export_symbol(sym_el, sym_name, coerce_sup=False):
             # IR fill<=0 (unfilled closed contour) has no direct equivalent,
             # so fall back to a closed wire outline instead of lying about
             # the fill visually.
-            verts = [(v.get('x', '0'), v.get('y', '0')) for v in el.findall('vertex')]
+            verts = [(v.get('x', '0'), v.get('y', '0'), v.get('curve'))
+                     for v in el.findall('vertex')]
             if float(el.get('fill', '100')) <= 0 and len(verts) >= 2:
                 w = _tomm(el.get('width', '0'))
                 lyr = _eagle_layer(el)
-                for (ax, ay), (bx, by) in zip(verts, verts[1:] + verts[:1]):
+                for (ax, ay, _), (bx, by, _) in zip(verts, verts[1:] + verts[:1]):
                     w_el = ET.SubElement(sym, 'wire')
                     w_el.set('x1', _tomm(ax)); w_el.set('y1', _tomm(ay))
                     w_el.set('x2', _tomm(bx)); w_el.set('y2', _tomm(by))
@@ -271,10 +272,11 @@ def export_symbol(sym_el, sym_name, coerce_sup=False):
                 pg = ET.SubElement(sym, 'polygon')
                 pg.set('width', _tomm(el.get('width', '0')))
                 pg.set('layer', _eagle_layer(el))
-                for x, y in verts:
+                for x, y, curve in verts:
                     ve = ET.SubElement(pg, 'vertex')
                     ve.set('x', _tomm(x))
                     ve.set('y', _tomm(y))
+                    if curve: ve.set('curve', curve)
 
         elif t == 'pin':
             p = ET.SubElement(sym, 'pin')
@@ -498,11 +500,12 @@ def export_package(fp_el, pkg_name):
             # Same fill<=0 fallback as the symbol-side branch above —
             # Eagle <polygon> has no percent-fill concept, so an unfilled
             # IR contour becomes a closed wire outline instead.
-            verts = [(v.get('x', '0'), v.get('y', '0')) for v in el.findall('vertex')]
+            verts = [(v.get('x', '0'), v.get('y', '0'), v.get('curve'))
+                     for v in el.findall('vertex')]
             if float(el.get('fill', '100')) <= 0 and len(verts) >= 2:
                 w = _tomm(el.get('width', '0'))
                 lyr = str(eagle_num)
-                for (ax, ay), (bx, by) in zip(verts, verts[1:] + verts[:1]):
+                for (ax, ay, _), (bx, by, _) in zip(verts, verts[1:] + verts[:1]):
                     w_el = ET.SubElement(pkg, 'wire')
                     w_el.set('x1', _tomm(ax)); w_el.set('y1', _tomm(ay))
                     w_el.set('x2', _tomm(bx)); w_el.set('y2', _tomm(by))
@@ -511,10 +514,11 @@ def export_package(fp_el, pkg_name):
                 pg = ET.SubElement(pkg, 'polygon')
                 pg.set('width', _tomm(el.get('width', '0')))
                 pg.set('layer', str(eagle_num))
-                for x, y in verts:
+                for x, y, curve in verts:
                     ve = ET.SubElement(pg, 'vertex')
                     ve.set('x', _tomm(x))
                     ve.set('y', _tomm(y))
+                    if curve: ve.set('curve', curve)
 
         elif t == 'text':
             te = ET.SubElement(pkg, 'text')

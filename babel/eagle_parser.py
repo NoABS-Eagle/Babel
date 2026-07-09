@@ -429,6 +429,9 @@ def convert_geometry(child, parent, ir_layer):
             ve = ET.SubElement(pg, 'vertex')
             ve.set('x', str(round(float(v.get('x', '0')) * 1000)))
             ve.set('y', str(round(float(v.get('y', '0')) * 1000)))
+            if v.get('curve'):
+                # arc to the NEXT vertex, degrees CCW+ (ir_schema.md <polygon>)
+                ve.set('curve', fmt(v.get('curve')))
         return True
 
     if tag == 'text':

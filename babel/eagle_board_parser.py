@@ -12,10 +12,12 @@ only builds the <layout> element, the pairing/validation against the
 schematic lives in eagle_project_parser.
 """
 import math
+import re
 import xml.etree.ElementTree as ET
 
 from babel import import_log
-from babel.eagle_parser import convert_geometry_mapped, _pkg_layer, _um, fmt, parse_rot
+from babel.eagle_parser import (convert_geometry, convert_geometry_mapped,
+                                _pkg_layer, _um, fmt, parse_rot)
 
 
 def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset()):
@@ -87,6 +89,117 @@ def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset()):
             t.set('hidden', 'yes')
 
 
+def _parse_layer_setup(board, brd_path):
+    """Eagle designrules layerSetup ('(1+2*15+16)') -> ordered list of Eagle
+    copper layer numbers, top first. THE source of the stack: Eagle numbers
+    inner layers from BOTH ends (a 4-layer board uses 1,2,15,16), so inner
+    IR numbers come from stack ORDER, not from the Eagle number. Blind/
+    buried via spans ('[t:...:b]' brackets) -> hard reject (decisions.md
+    "VIA — только сквозные")."""
+    setup = '(1*16)'
+    dr = board.find('designrules')
+    if dr is not None:
+        for p in dr.findall('param'):
+            if p.get('name') == 'layerSetup':
+                setup = p.get('value', setup)
+    if '[' in setup or ':' in setup:
+        raise ValueError(
+            f'{brd_path}: layerSetup {setup!r} declares blind/buried via '
+            f'spans — IR expresses only through vias (hard reject)')
+    stack = [int(tok) for tok in re.findall(r'\d+', setup)]
+    if not stack:
+        raise ValueError(f'{brd_path}: unparseable layerSetup {setup!r}')
+    return stack
+
+
+def _copper_map(stack):
+    """Ordered Eagle copper stack -> {eagle_n: IR layer string}: top='1',
+    bottom='-1', inner '2'..'N-1' top-down (ir_schema.md "Слои платы")."""
+    m = {stack[0]: '1', stack[-1]: '-1'}
+    for i, n in enumerate(stack[1:-1], start=2):
+        m[n] = str(i)
+    return m
+
+
+def _convert_signal(s, layout, layout_name, copper_map, stack, brd_path):
+    """Eagle <signal> -> IR <signal>: contactrefs, copper tracks (wire ->
+    line/arc), through vias, pour polygons (contour only).
+
+    Deliberately NOT carried: class (net classes are schematic truth, the
+    project pairing validates .sch vs .brd nets), airwires (layer 19 —
+    connectivity already lives in contactref, Eagle recomputes ratsnest).
+    """
+    sig = ET.SubElement(layout, 'signal')
+    sig.set('name', s.get('name'))
+    airwires = 0
+
+    for c in s:
+        tag = c.tag
+        if tag == 'contactref':
+            cr = ET.SubElement(sig, 'contactref')
+            cr.set('element', c.get('element'))
+            cr.set('pad', c.get('pad'))
+
+        elif tag == 'wire':
+            eagle_n = int(c.get('layer'))
+            if eagle_n == 19:
+                airwires += 1
+                continue
+            ir_layer = copper_map.get(eagle_n)
+            if ir_layer is None:
+                import_log.log(layout_name, s.get('name'),
+                               'SIGNAL_WIRE dropped, non-copper layer',
+                               str(eagle_n))
+                continue
+            convert_geometry(c, sig, ir_layer)
+
+        elif tag == 'via':
+            extent = c.get('extent', '')
+            span = [int(t) for t in extent.split('-')] if extent else []
+            if span != [stack[0], stack[-1]]:
+                raise ValueError(
+                    f'{brd_path}: via at ({c.get("x")},{c.get("y")}) has '
+                    f'extent {extent!r} (blind/buried) — IR expresses only '
+                    f'through vias (hard reject)')
+            v = ET.SubElement(sig, 'via')
+            v.set('x', _um(c.get('x'))); v.set('y', _um(c.get('y')))
+            v.set('drill', _um(c.get('drill')))
+            if c.get('diameter'):
+                v.set('diameter', _um(c.get('diameter')))
+            if c.get('shape') in ('square',):
+                v.set('shape', c.get('shape'))
+
+        elif tag == 'polygon':
+            eagle_n = int(c.get('layer'))
+            ir_layer = copper_map.get(eagle_n)
+            if ir_layer is None:
+                import_log.log(layout_name, s.get('name'),
+                               'SIGNAL_POLYGON dropped, non-copper layer',
+                               str(eagle_n))
+                continue
+            if c.get('pour') == 'cutout':
+                ir_layer = '!' + ir_layer     # anti-copper of that layer
+            convert_geometry(c, sig, ir_layer)
+            pg = sig[-1]
+            # pour parameters beyond the shared geometry conversion
+            if c.get('pour') == 'hatch':
+                # fill percent = stroke width / hatch pitch (ir_schema.md
+                # "fill — единый процент")
+                spacing = float(c.get('spacing', '1.27'))
+                w = float(c.get('width', '0'))
+                pg.set('fill', str(max(1, min(100, round(w / spacing * 100)))))
+            if c.get('rank'):
+                pg.set('rank', c.get('rank'))
+            if c.get('thermals') == 'no':
+                pg.set('thermals', '0')
+            if c.get('isolate'):
+                pg.set('clearance', _um(c.get('isolate')))
+
+    if airwires:
+        import_log.log(layout_name, s.get('name'), 'AIRWIRES dropped,',
+                       f'{airwires} (connectivity lives in contactref)')
+
+
 def convert_board(brd_path, layout_name='main'):
     """Parse one .brd file -> IR <layout> element (slices 1-2: <plain> +
     <element>)."""
@@ -109,10 +222,11 @@ def convert_board(brd_path, layout_name='main'):
                 pkg_placeholders[(lib.get('name'), pkg.get('name'))] = \
                     phs & {'NAME', 'VALUE'}
 
+    stack = _parse_layer_setup(board, brd_path)
+    copper_map = _copper_map(stack)
+
     layout = ET.Element('layout', name=layout_name)
-    # copper stack size: fixed 2 until the <signal> slice lands (then it is
-    # derived from the copper layers actually used, ir_schema.md `copper`).
-    layout.set('copper', '2')
+    layout.set('copper', str(len(stack)))
 
     plain = board.find('plain')
     if plain is not None:
@@ -131,5 +245,10 @@ def convert_board(brd_path, layout_name='main'):
                              pkg_placeholders.get(
                                  (e.get('library'), e.get('package')),
                                  frozenset()))
+
+    signals = board.find('signals')
+    if signals is not None:
+        for s in signals:
+            _convert_signal(s, layout, layout_name, copper_map, stack, brd_path)
 
     return layout

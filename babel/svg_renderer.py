@@ -124,6 +124,10 @@ def _bounds(elems_iter):
             x, y = _v(el.get('x')), _v(el.get('y'))
             r = _v(el.get('drill', '1000')) * 1.2
             pts += [(x - r, y - r), (x + r, y + r)]
+        elif t == 'via':
+            x, y = _v(el.get('x')), _v(el.get('y'))
+            r = (_v(el.get('diameter', '0')) or _v(el.get('drill', '300')) * 1.5) / 2
+            pts += [(x - r, y - r), (x + r, y + r)]
         elif t == 'hole':
             x, y = _v(el.get('x')), _v(el.get('y'))
             r = _v(el.get('drill')) / 2
@@ -173,6 +177,39 @@ def _arc(cx_ir, cy_ir, r_ir, start_deg, sweep_deg, color, lw, x_min, y_max, scal
     dash_attr = f' stroke-dasharray="{dash}"' if dash else ''
     return (f'<path d="M{x1s:.1f},{y1s:.1f} A{rp:.1f},{rp:.1f} 0 {large} {cw} {x2s:.1f},{y2s:.1f}" '
             f'stroke="{color}" stroke-width="{lw:.1f}" fill="none" stroke-linecap="round"{dash_attr}/>')
+
+
+def _poly_pts(el):
+    """IR <polygon> -> flat (x, y) mm point list, tessellating curved
+    vertices (`curve` = arc to the NEXT vertex, degrees CCW+ — same
+    construction as eagle_parser.eagle_arc)."""
+    vs = el.findall('vertex')
+    pts = []
+    n = len(vs)
+    for i, v in enumerate(vs):
+        x1, y1 = _v(v.get('x')), _v(v.get('y'))
+        pts.append((x1, y1))
+        curve = float(v.get('curve') or 0)
+        if not curve or n < 2:
+            continue
+        nxt = vs[(i + 1) % n]
+        x2, y2 = _v(nxt.get('x')), _v(nxt.get('y'))
+        chord = math.hypot(x2 - x1, y2 - y1)
+        if chord < 1e-9:
+            continue
+        a = math.radians(abs(curve))
+        r = chord / (2 * math.sin(a / 2))
+        d = r * math.cos(a / 2)
+        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+        sign = 1 if curve > 0 else -1
+        cx = mx + sign * d * (-(y2 - y1) / chord)
+        cy = my + sign * d * ((x2 - x1) / chord)
+        start = math.atan2(y1 - cy, x1 - cx)
+        steps = max(2, int(abs(curve) / 15))
+        for k in range(1, steps):
+            ang = start + math.radians(curve) * k / steps
+            pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+    return pts
 
 
 def _shape(x_ir, y_ir, w_ir, h_ir, roundness, outline_ir, color, x_min, y_max, scale,
@@ -821,7 +858,7 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
         (copper-by-construction; the far-side smd is tinted separately
         below). No/unparseable layer and anti (!) objects -> 'drop'
         (subtractive geometry is not rendered yet)."""
-        if el.tag in ('smd', 'pad', 'hole'):
+        if el.tag in ('smd', 'pad', 'hole', 'via'):
             return None
         try:
             return int((el.get('layer') or '').strip())
@@ -896,10 +933,22 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
                                    color, **kw, rot_deg=float(el.get('rot', 0))))
 
             elif t == 'polygon':
-                coords = [_tr(_v(v.get('x')), _v(v.get('y')), **kw)
-                          for v in el.findall('vertex')]
+                coords = [_tr(px, py, **kw) for px, py in _poly_pts(el)]
                 pts_str = ' '.join(f'{xs:.1f},{ys:.1f}' for xs, ys in coords)
-                out.append(f'<polygon points="{pts_str}" fill="{color}" stroke="none"/>')
+                # copper polygons (pours) translucent: the recomputed fill
+                # isn't stored, an opaque contour fill would bury the board
+                op = ' fill-opacity="0.35"' if layer_n is not None and abs(layer_n) < 100 else ''
+                out.append(f'<polygon points="{pts_str}" fill="{color}" stroke="none"{op}/>')
+
+            elif t == 'via':
+                xs, ys = _tr(_v(el.get('x')), _v(el.get('y')), **kw)
+                dia = _v(el.get('diameter', '0')) or _v(el.get('drill')) * 1.5
+                ro = dia / 2 * kw['scale']
+                ri = _v(el.get('drill')) / 2 * kw['scale']
+                out.append(f'<circle cx="{xs:.1f}" cy="{ys:.1f}" r="{ro:.1f}" '
+                           f'fill="{_E[2]}"/>')      # Eagle Vias color 2 green
+                out.append(f'<circle cx="{xs:.1f}" cy="{ys:.1f}" r="{ri:.1f}" '
+                           f'fill="{_BG}"/>')
 
             elif t == 'smd':
                 x, y = _v(el.get('x')), _v(el.get('y'))
