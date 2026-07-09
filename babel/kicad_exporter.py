@@ -20,8 +20,9 @@ _PIN_DIR = {
 
 # IR signed layer number (ir_schema.md "Плата (Board IR)") -> KiCad layer
 # name. 125/127 (Eagle tNames/tValues) have no KiCad home -> F.Fab, same
-# place the old 'labels' bucket went. 146 Milling -> Edge.Cuts is the
-# standard KiCad convention for milled slots.
+# place the old 'labels' bucket went. 120 carries ALL cuts (incl. slots) ->
+# Edge.Cuts; 147 PLATING has no KiCad concept -> Dwgs.User so the marker
+# stays VISIBLE as a fab note (Edge.Cuts would turn the marker into a cut).
 _FP_LAYER = {
     1:    'F.Cu',      -1:   'B.Cu',
     121:  'F.SilkS',   -121: 'B.SilkS',
@@ -32,7 +33,7 @@ _FP_LAYER = {
     139:  'F.CrtYd',   -139: 'B.CrtYd',
     151:  'F.Fab',     -151: 'B.Fab',
     120:  'Edge.Cuts',
-    146:  'Edge.Cuts',
+    147:  'Dwgs.User',
     148:  'Dwgs.User',
 }
 

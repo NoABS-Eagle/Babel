@@ -55,8 +55,8 @@ _LAYER_COLORS = {
     -131: _E[7],
     139:  _E[4],   # courtyard (Eagle 39 color=4 red, dashed)
     -139: _E[4],
-    120:  _E[15],  # Dimension — white
-    146:  _E[15],  # Milling
+    120:  _E[15],  # Dimension — white; ALL cuts (outline, slots)
+    147:  _E[13],  # PLATING marker (Eagle projection: layer 156)
     148:  _E[7],   # Document notes (dimmed like fab)
     151:  _E[7],   # fab (Eagle 51, dimmed below)
     -151: _E[1],
@@ -70,7 +70,7 @@ _DIM_LAYERS = {148, 151, -151}
 _FAB_OPACITY = '0.45'
 
 # Paint order, bottom-most first; pads (layer None) are painted with copper.
-_LAYER_Z = [139, -139, 151, -151, 148, 146, 120, -121, -129, -1, None, 1,
+_LAYER_Z = [139, -139, 151, -151, 148, 120, 147, -121, -129, -1, None, 1,
             121, 125, -125, 127, -127, 129, 131, -131]
 
 # Symbol layers
@@ -848,7 +848,11 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
     for el in all_els:
         by_layer.setdefault(_el_layer(el), []).append(el)
 
-    for layer_n in _LAYER_Z:
+    # _LAYER_Z first (correct paint order for the known set), then any layer
+    # numbers outside it (user layers etc.) on top, in numeric order.
+    extra = sorted((k for k in by_layer if k not in _LAYER_Z),
+                   key=lambda v: abs(v))
+    for layer_n in list(_LAYER_Z) + extra:
         group = by_layer.get(layer_n, [])
         if not group:
             continue

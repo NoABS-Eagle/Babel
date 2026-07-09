@@ -40,8 +40,12 @@ PKG_LAYER_MAP = {
     # 44 Drills / 45 Holes: display channels in Eagle too (drill renderings,
     # no stored objects) — no map entry; the impossible stray object would
     # fall through to +100 as a plain user layer. IR side: CHANNEL_DRILLS.
-    46: '146',                 # Milling (standalone)
+    46: '120',                 # Milling: cut, merged into 120 + PLATING copy below
     48: '148',                 # Document (standalone)
+    156: '147',                # PLATING marker (canonical Eagle projection —
+                               # Eagle has no native concept; 156 adopted from
+                               # the user's real-board convention, must map
+                               # back or 147 wouldn't round-trip)
     51: '151',  52: '-151',    # tDocu / bDocu
 }
 
@@ -55,6 +59,12 @@ PKG_LAYER_MAP = {
 # boards keep art on odd system-range layers: modtest.brd has 150 wires on
 # a user-created layer 50 "dxf").
 _PKG_LAYER_JUNK = {17, 18, 19, 23, 24, 33, 34, 35, 36, 37, 38, 43}
+
+# Eagle Milling (46) means in practice "cut the fab treats as plated" (the
+# very reason it is DRC-exempt there: copper must stay flush for plating to
+# grow into). IR states that bit explicitly: the object becomes a cut on 120
+# AND a marker copy on 147 PLATING (ir_schema.md "Резы и металлизация").
+_PKG_LAYER_COPY = {46: '147'}
 
 
 def _pkg_layer(eagle_n):
@@ -322,6 +332,21 @@ def convert_symbol(sym_el, sym_name):
 # Footprint (package) conversion
 # ---------------------------------------------------------------------------
 
+def convert_geometry_mapped(child, parent):
+    """convert_geometry with the layer mapping applied from the child's own
+    Eagle layer number — the entry point for package/board drawing children.
+    Also the single home of the _PKG_LAYER_COPY rule: Eagle Milling (46)
+    yields TWO IR objects, the cut on 120 and its marker copy on 147 PLATING."""
+    raw = child.get('layer')
+    eagle_n = int(raw) if raw else None
+    ir_layer = _pkg_layer(eagle_n) if eagle_n is not None else None
+    handled = convert_geometry(child, parent, ir_layer)
+    copy_layer = _PKG_LAYER_COPY.get(eagle_n)
+    if handled and copy_layer is not None:
+        convert_geometry(child, parent, copy_layer)
+    return handled
+
+
 def convert_geometry(child, parent, ir_layer):
     """One Eagle drawing primitive (wire/circle/rectangle/polygon/text/hole)
     -> IR element appended to `parent` with layer=ir_layer. The SINGLE home
@@ -475,7 +500,7 @@ def convert_package(pkg_el, pkg_name):
             el.set('shape', ir_shape)
 
         elif tag in ('hole', 'wire', 'circle', 'rectangle', 'polygon', 'text'):
-            convert_geometry(child, fp, ir_layer)
+            convert_geometry_mapped(child, fp)
 
     d3 = parse_3d(desc_text)
     if d3:

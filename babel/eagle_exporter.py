@@ -58,6 +58,10 @@ def _pkg_eagle_layer(ln):
         if n == -1:
             return 16
         return abs(n)          # inner copper: number preserved
+    if n == 147:
+        return 156             # PLATING: canonical Eagle projection (the
+                               # |n|-100 formula would give 47 Measures — a
+                               # system layer collision)
     base = abs(n) - 100
     return base if n > 0 else base + 1
 
@@ -357,9 +361,35 @@ def _model3d_comment(m3):
     return '<!--3d:' + json.dumps(data, separators=(',', ':')) + '-->'
 
 
+def _geom_sig(el):
+    """Geometry identity of an element, layer excluded — the key for the
+    cut/PLATING twin fold below."""
+    return (el.tag,
+            tuple(sorted((k, v) for k, v in el.attrib.items() if k != 'layer')),
+            (el.text or '').strip())
+
+
 def export_package(fp_el, pkg_name):
     pkg = ET.Element('package')
     pkg.set('name', _eagle_name(pkg_name))
+
+    # Cut/PLATING twin fold (ir_schema.md "Резы и металлизация"): a cut on
+    # 120 with an EXACT copy on 147 goes to Eagle as ONE object on 46
+    # Milling (DRC-exempt there, so pours stay flush for the plating) and
+    # the copy is not emitted — the deterministic inverse of the import
+    # rule 46 -> 120 + 147 copy. Unmatched 120 -> 20, unmatched 147 -> 156.
+    plating_pool = {}
+    for el in fp_el:
+        if el.get('layer') == '147':
+            plating_pool.setdefault(_geom_sig(el), []).append(id(el))
+    milled = set()      # ids of 120 elements to emit on 46
+    folded = set()      # ids of 147 twins to skip
+    for el in fp_el:
+        if el.get('layer') == '120':
+            pool = plating_pool.get(_geom_sig(el))
+            if pool:
+                folded.add(pool.pop())
+                milled.add(id(el))
 
     desc_text = ''
     desc = fp_el.find('description')
@@ -385,7 +415,9 @@ def export_package(fp_el, pkg_name):
             # an smd's rare far-side marker layer="-1" selects Bottom(16).
             eagle_num = 16 if el.get('layer') == '-1' else 1
         else:
-            eagle_num = _pkg_eagle_layer(el.get('layer'))
+            if id(el) in folded:
+                continue
+            eagle_num = 46 if id(el) in milled else _pkg_eagle_layer(el.get('layer'))
             if eagle_num is None:
                 continue
 

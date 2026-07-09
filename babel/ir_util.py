@@ -77,7 +77,17 @@ LAYER_VALUES = 127        # tValues 27
 LAYER_MASK = 129          # tStop 29 / F.Mask
 LAYER_PASTE = 131         # tCream 31 / F.Paste
 LAYER_COURTYARD = 139     # tKeepout 39 / F.CrtYd
-LAYER_MILLING = 146       # standalone
+# NOTE: there is no separate milling layer — EVERY through-cut (board
+# outline, cutout, slot of any shape) lives on LAYER_DIMENSION 120; the
+# geometry states the final material boundary (width>0 = removed stroke,
+# width=0 = cut along the path). Eagle's 20/46 split dissolves at import
+# (46 -> 120 + a copy on 147, see eagle_parser).
+LAYER_PLATING = 147       # standalone; marker overlay: cut walls are plated
+                          # where covered by this layer's filled stroke
+                          # (ir_schema.md "Резы и металлизация"). Participates
+                          # in DRC/pour recompute: covered cut stretches are
+                          # clearance-exempt — plating must grow into copper;
+                          # bare cuts on 120 repel copper by default.
 LAYER_DOCUMENT = 148      # standalone, side-less notes (Dwgs.User/Cmts.User)
 LAYER_FAB = 151           # tDocu 51 / F.Fab — assembly drawing
 
