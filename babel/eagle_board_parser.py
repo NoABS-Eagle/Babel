@@ -11,6 +11,7 @@ import — Eagle can't have more than one board per schematic); this module
 only builds the <layout> element, the pairing/validation against the
 schematic lives in eagle_project_parser.
 """
+import copy
 import math
 import re
 import xml.etree.ElementTree as ET
@@ -250,5 +251,16 @@ def convert_board(brd_path, layout_name='main'):
     if signals is not None:
         for s in signals:
             _convert_signal(s, layout, layout_name, copper_map, stack, brd_path)
+
+    # Opaque source metadata IR must give back on export to the SAME format
+    # (ir_schema.md "<passthrough>"): design rules, autorouter setup, approved
+    # DRC errors. Raw XML as-is; also the board exporter's stack source (the
+    # original layerSetup keeps inner-layer numbering stable on round-trip).
+    pt_children = [board.find(t) for t in ('designrules', 'autorouter', 'errors')]
+    if any(c is not None for c in pt_children):
+        pt = ET.SubElement(layout, 'passthrough', tool='eagle')
+        for c in pt_children:
+            if c is not None:
+                pt.append(copy.deepcopy(c))
 
     return layout

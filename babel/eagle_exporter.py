@@ -372,6 +372,107 @@ def _geom_sig(el):
             (el.text or '').strip())
 
 
+def _emit_geometry(parent, el, eagle_num):
+    """One IR drawing primitive (hole/line/arc/shape/polygon/text) ->
+    Eagle element(s) appended to `parent` on layer eagle_num. The emission
+    twin of eagle_parser.convert_geometry and its SINGLE home on the way
+    out -- shared by export_package and the board exporter. Returns True
+    if the tag was handled."""
+    t = el.tag
+    if t == 'hole':
+        h = ET.SubElement(parent, 'hole')
+        h.set('x', _tomm(el.get('x'))); h.set('y', _tomm(el.get('y')))
+        h.set('drill', _tomm(el.get('drill')))
+
+        return True
+    if t == 'line':
+        w = ET.SubElement(parent, 'wire')
+        w.set('x1', _tomm(el.get('x1'))); w.set('y1', _tomm(el.get('y1')))
+        w.set('x2', _tomm(el.get('x2'))); w.set('y2', _tomm(el.get('y2')))
+        w.set('width', _tomm(el.get('width', '152'))); w.set('layer', str(eagle_num))
+
+        return True
+    if t == 'arc':
+        _emit_arc(parent, el, str(eagle_num))
+
+        return True
+    if t == 'shape':
+        rn = int(el.get('roundness', 0))
+        x, y = float(el.get('x')) / 1000, float(el.get('y')) / 1000
+        w2 = float(el.get('w', '0')) / 2000
+        h2 = float(el.get('h', '0')) / 2000
+        outline_mm = _tomm(el.get('outline', '0'))
+        lyr = str(eagle_num)
+        if rn == 100:
+            c = ET.SubElement(parent, 'circle')
+            c.set('x', fmt(x)); c.set('y', fmt(y))
+            c.set('radius', fmt(w2))
+            c.set('width', outline_mm); c.set('layer', lyr)
+        elif float(el.get('outline', '0')) == 0:
+            r_el = ET.SubElement(parent, 'rectangle')
+            r_el.set('x1', fmt(x - w2)); r_el.set('y1', fmt(y - h2))
+            r_el.set('x2', fmt(x + w2)); r_el.set('y2', fmt(y + h2))
+            r_el.set('layer', lyr)
+        else:
+            corners = [(x-w2, y-h2), (x+w2, y-h2), (x+w2, y+h2), (x-w2, y+h2)]
+            for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1]):
+                w_el = ET.SubElement(parent, 'wire')
+                w_el.set('x1', fmt(ax)); w_el.set('y1', fmt(ay))
+                w_el.set('x2', fmt(bx)); w_el.set('y2', fmt(by))
+                w_el.set('width', outline_mm); w_el.set('layer', lyr)
+
+        return True
+    if t == 'polygon':
+        # Same fill<=0 fallback as the symbol-side branch above —
+        # Eagle <polygon> has no percent-fill concept, so an unfilled
+        # IR contour becomes a closed wire outline instead.
+        verts = [(v.get('x', '0'), v.get('y', '0'), v.get('curve'))
+                 for v in el.findall('vertex')]
+        if float(el.get('fill', '100')) <= 0 and len(verts) >= 2:
+            w = _tomm(el.get('width', '0'))
+            lyr = str(eagle_num)
+            for (ax, ay, _), (bx, by, _) in zip(verts, verts[1:] + verts[:1]):
+                w_el = ET.SubElement(parent, 'wire')
+                w_el.set('x1', _tomm(ax)); w_el.set('y1', _tomm(ay))
+                w_el.set('x2', _tomm(bx)); w_el.set('y2', _tomm(by))
+                w_el.set('width', w); w_el.set('layer', lyr)
+        else:
+            pg = ET.SubElement(parent, 'polygon')
+            pg.set('width', _tomm(el.get('width', '0')))
+            pg.set('layer', str(eagle_num))
+            for x, y, curve in verts:
+                ve = ET.SubElement(pg, 'vertex')
+                ve.set('x', _tomm(x))
+                ve.set('y', _tomm(y))
+                if curve: ve.set('curve', curve)
+
+        return True
+    if t == 'text':
+        te = ET.SubElement(parent, 'text')
+        te.set('x', _tomm(el.get('x'))); te.set('y', _tomm(el.get('y')))
+        te.set('size', _tomm(el.get('size')))
+        rot = _rot_attr(float(el.get('rot', 0)))
+        if rot: te.set('rot', rot)
+        align = el.get('align', 'bottom-left')
+        if align != 'bottom-left': te.set('align', align)
+        if el.get('ratio'): te.set('ratio', el.get('ratio'))
+        # `>VALUE` always -> tValues (27), regardless of which IR
+        # layer bucket it's actually sitting in (confirmed real:
+        # always `fab` — a single, side-less documentation layer;
+        # the pool footprint has no top/bottom of its own at all,
+        # that only exists once an instance is placed+mirrored on a
+        # board, same reason the SYMBOL-side `>VALUE` is always 96
+        # unconditionally, never bValue-style). Per the user — only
+        # `>VALUE`, NOT `>NAME` (stays on whatever layer it's on).
+        eagle_layer = '27' if (el.text or '').strip() == '>VALUE' else str(eagle_num)
+        te.set('layer', eagle_layer)
+        te.set('font', 'vector')  # always — see export_symbol's text branch
+        te.text = el.text or ''
+
+        return True
+    return False
+
+
 def export_package(fp_el, pkg_name):
     pkg = ET.Element('package')
     pkg.set('name', _eagle_name(pkg_name))
@@ -457,90 +558,8 @@ def export_package(fp_el, pkg_name):
             if el.get('thermals') == '0': p.set('thermals', 'no')
             if el.get('stopmask') == '0': p.set('stop', 'no')
 
-        elif t == 'hole':
-            h = ET.SubElement(pkg, 'hole')
-            h.set('x', _tomm(el.get('x'))); h.set('y', _tomm(el.get('y')))
-            h.set('drill', _tomm(el.get('drill')))
-
-        elif t == 'line':
-            w = ET.SubElement(pkg, 'wire')
-            w.set('x1', _tomm(el.get('x1'))); w.set('y1', _tomm(el.get('y1')))
-            w.set('x2', _tomm(el.get('x2'))); w.set('y2', _tomm(el.get('y2')))
-            w.set('width', _tomm(el.get('width', '152'))); w.set('layer', str(eagle_num))
-
-        elif t == 'arc':
-            _emit_arc(pkg, el, str(eagle_num))
-
-        elif t == 'shape':
-            rn = int(el.get('roundness', 0))
-            x, y = float(el.get('x')) / 1000, float(el.get('y')) / 1000
-            w2 = float(el.get('w', '0')) / 2000
-            h2 = float(el.get('h', '0')) / 2000
-            outline_mm = _tomm(el.get('outline', '0'))
-            lyr = str(eagle_num)
-            if rn == 100:
-                c = ET.SubElement(pkg, 'circle')
-                c.set('x', fmt(x)); c.set('y', fmt(y))
-                c.set('radius', fmt(w2))
-                c.set('width', outline_mm); c.set('layer', lyr)
-            elif float(el.get('outline', '0')) == 0:
-                r_el = ET.SubElement(pkg, 'rectangle')
-                r_el.set('x1', fmt(x - w2)); r_el.set('y1', fmt(y - h2))
-                r_el.set('x2', fmt(x + w2)); r_el.set('y2', fmt(y + h2))
-                r_el.set('layer', lyr)
-            else:
-                corners = [(x-w2, y-h2), (x+w2, y-h2), (x+w2, y+h2), (x-w2, y+h2)]
-                for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1]):
-                    w_el = ET.SubElement(pkg, 'wire')
-                    w_el.set('x1', fmt(ax)); w_el.set('y1', fmt(ay))
-                    w_el.set('x2', fmt(bx)); w_el.set('y2', fmt(by))
-                    w_el.set('width', outline_mm); w_el.set('layer', lyr)
-
-        elif t == 'polygon':
-            # Same fill<=0 fallback as the symbol-side branch above —
-            # Eagle <polygon> has no percent-fill concept, so an unfilled
-            # IR contour becomes a closed wire outline instead.
-            verts = [(v.get('x', '0'), v.get('y', '0'), v.get('curve'))
-                     for v in el.findall('vertex')]
-            if float(el.get('fill', '100')) <= 0 and len(verts) >= 2:
-                w = _tomm(el.get('width', '0'))
-                lyr = str(eagle_num)
-                for (ax, ay, _), (bx, by, _) in zip(verts, verts[1:] + verts[:1]):
-                    w_el = ET.SubElement(pkg, 'wire')
-                    w_el.set('x1', _tomm(ax)); w_el.set('y1', _tomm(ay))
-                    w_el.set('x2', _tomm(bx)); w_el.set('y2', _tomm(by))
-                    w_el.set('width', w); w_el.set('layer', lyr)
-            else:
-                pg = ET.SubElement(pkg, 'polygon')
-                pg.set('width', _tomm(el.get('width', '0')))
-                pg.set('layer', str(eagle_num))
-                for x, y, curve in verts:
-                    ve = ET.SubElement(pg, 'vertex')
-                    ve.set('x', _tomm(x))
-                    ve.set('y', _tomm(y))
-                    if curve: ve.set('curve', curve)
-
-        elif t == 'text':
-            te = ET.SubElement(pkg, 'text')
-            te.set('x', _tomm(el.get('x'))); te.set('y', _tomm(el.get('y')))
-            te.set('size', _tomm(el.get('size')))
-            rot = _rot_attr(float(el.get('rot', 0)))
-            if rot: te.set('rot', rot)
-            align = el.get('align', 'bottom-left')
-            if align != 'bottom-left': te.set('align', align)
-            if el.get('ratio'): te.set('ratio', el.get('ratio'))
-            # `>VALUE` always -> tValues (27), regardless of which IR
-            # layer bucket it's actually sitting in (confirmed real:
-            # always `fab` — a single, side-less documentation layer;
-            # the pool footprint has no top/bottom of its own at all,
-            # that only exists once an instance is placed+mirrored on a
-            # board, same reason the SYMBOL-side `>VALUE` is always 96
-            # unconditionally, never bValue-style). Per the user — only
-            # `>VALUE`, NOT `>NAME` (stays on whatever layer it's on).
-            eagle_layer = '27' if (el.text or '').strip() == '>VALUE' else str(eagle_num)
-            te.set('layer', eagle_layer)
-            te.set('font', 'vector')  # always — see export_symbol's text branch
-            te.text = el.text or ''
+        else:
+            _emit_geometry(pkg, el, eagle_num)
 
     return pkg
 
