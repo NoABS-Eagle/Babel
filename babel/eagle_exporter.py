@@ -1096,7 +1096,7 @@ def _port_geometry(module_els, module_insts):
     return out
 
 
-def _emit_segment(seg_out, seg_el, port_geom=None, multi_parts=frozenset()):
+def _emit_segment(seg_out, seg_el, port_geom=None, multi_parts={}):
     """One Eagle <segment>'s content from one IR <segment> — shared by the
     top-level nets and module nets (same content model both places,
     eagle.dtd: (pinref | portref | wire | junction | label)*).
@@ -1175,8 +1175,15 @@ def _emit_segment(seg_out, seg_el, port_geom=None, multi_parts=frozenset()):
         # NSIP83086 pin "VISO.OUT" — the old dot-based split
         # minted a phantom gate VISO and Eagle refused the file).
         raw_pin = p.get('pin')
-        if p.get('part') in multi_parts:
+        gate_names = multi_parts.get(p.get('part'))
+        if gate_names is not None:
             pin_gate, _, pin_name = raw_pin.partition('.')
+            if pin_gate not in gate_names:
+                # never mint a phantom gate silently (the VISO.OUT lesson):
+                # a gate that isn't on the component is a corrupt composite
+                raise ValueError(
+                    f'{p.get("part")}: pinref pin {raw_pin!r} does not '
+                    f'decode to a known gate (has: {sorted(gate_names)})')
         else:
             pin_gate, pin_name = 'G$1', raw_pin
         ET.SubElement(seg_out, 'pinref', part=p.get('part'),
@@ -1381,7 +1388,8 @@ def _export_module(modules_el, mod_el, lib_name, comp_by_name, dev_name_by_fp, p
     for el in mod_el:
         if el.tag in ('line', 'arc', 'shape'):
             _emit_deco(plain_el, el)
-    multi_parts = {i.get('name') for i in insts
+    multi_parts = {i.get('name'): {g for g, _ in component_gates(comp_by_name[i.get('component')])}
+                   for i in insts
                    if i.get('component') in comp_by_name
                    and is_multi_gate(comp_by_name[i.get('component')])}
     for net_el in mod_el.findall('net'):
@@ -1664,7 +1672,8 @@ def export_schematic(ir_path, output_path=None):
         _emit_frame(plain_els[sheet_idx], bbox,
                     inst_el, comp_by_name[inst_el.get('component')], pool)
 
-    multi_parts = {i.get('name') for i in part_insts
+    multi_parts = {i.get('name'): {g for g, _ in component_gates(comp_by_name[i.get('component')])}
+                   for i in part_insts
                    if i.get('component') in comp_by_name
                    and is_multi_gate(comp_by_name[i.get('component')])}
     for inst_el in part_insts:

@@ -504,6 +504,15 @@ def _collect_sheet(sheet_el, parts, pool, comp_by_name, comps_by_lib, ctx, port_
                          part['deviceset'], part['technology'])) if part else None
                     pin_name = p.get('pin')
                     if comp_el is not None and is_multi_gate(comp_el):
+                        if '.' in (p.get('gate') or ''):
+                            # the GATE.pin composite is undecodable when the
+                            # gate name itself carries a dot (pin names with
+                            # dots are FINE — maximus "VISO.OUT")
+                            raise ValueError(
+                                f'{part_name}: gate {p.get("gate")!r} contains '
+                                f'a dot — the GATE.pin encoding cannot express '
+                                f'it unambiguously; rename the gate in the '
+                                f'library and re-import')
                         pin_name = f"{p.get('gate')}.{pin_name}"
                     seg['pinrefs'].append((part_name, pin_name))
                 for p in seg_el.findall('portref'):
