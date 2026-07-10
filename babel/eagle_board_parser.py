@@ -337,6 +337,8 @@ def convert_board(brd_path, layout_name='main', name_map=None, known=None,
     # tool state Eagle must get back verbatim; the synthesized fallback
     # table knows neither
     pt_children.append(root.find('.//drawing/layers'))
+    # ...and the grid settings — same tool-state nature
+    pt_children.append(root.find('.//drawing/grid'))
     if any(c is not None for c in pt_children):
         pt = ET.SubElement(layout, 'passthrough', tool='eagle')
         for c in pt_children:

@@ -205,11 +205,19 @@ def export_board(ir_path, output_path=None, layout_name=None):
     settings = ET.SubElement(drawing, 'settings')
     ET.SubElement(settings, 'setting').set('alwaysvectorfont', 'no')
     ET.SubElement(settings, 'setting').set('verticaltext', 'up')
-    grid = ET.SubElement(drawing, 'grid')
-    for k, v in [('distance', '0.1'), ('unitdist', 'inch'), ('unit', 'inch'),
-                 ('style', 'lines'), ('multiple', '1'), ('display', 'no'),
-                 ('altdistance', '0.01'), ('altunitdist', 'inch'), ('altunit', 'inch')]:
-        grid.set(k, v)
+    # grid: the source's own settings via the eagle passthrough (tool
+    # state, verbatim — same as the layer table below); defaults only for
+    # IR-born projects
+    _pt_grid = layout.find("passthrough[@tool='eagle']/grid")
+    if _pt_grid is not None:
+        import copy as _copy
+        drawing.append(_copy.deepcopy(_pt_grid))
+    else:
+        grid = ET.SubElement(drawing, 'grid')
+        for k, v in [('distance', '0.1'), ('unitdist', 'inch'), ('unit', 'inch'),
+                     ('style', 'lines'), ('multiple', '1'), ('display', 'no'),
+                     ('altdistance', '0.01'), ('altunitdist', 'inch'), ('altunit', 'inch')]:
+            grid.set(k, v)
     # layer table: the SOURCE's own <layers> (visibility selection, user
     # layer names/colors) travels via the eagle passthrough and comes back
     # verbatim; only an IR-born project (no passthrough) gets the synthetic
