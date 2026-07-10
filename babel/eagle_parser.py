@@ -254,11 +254,11 @@ def convert_symbol(sym_el, sym_name):
 
         elif tag == 'frame':
             # ir_schema.md "Frame": a Frame-role symbol carries exactly one
-            # <shape> on the FRAME layer, geometric role only (bounding
-            # rectangle) — Eagle's own <frame> columns/rows/border-* are a
-            # print-tiling/decoration concern with no IR equivalent (same
-            # "IR doesn't store color/decoration" principle as everywhere
-            # else), dropped. This is Eagle's SECOND way to place a frame
+            # <shape> on the FRAME layer (bounding rectangle). columns/rows
+            # — the reference-zone grid (A1/B2 lookup zones, ISO 5457) —
+            # are CARRIED as optional shape attrs (revised 2026-07-10: a
+            # general drawing concept, Altium has sheet zones too, not
+            # Eagle decoration); border-* toggles stay dropped. This is Eagle's SECOND way to place a frame
             # (the first being a bare <frame> directly in a sheet's <plain>,
             # handled separately by the schematic importer, not here) — a
             # stock "Frame" library deviceset (e.g. frames.lbr) whose SYMBOL
