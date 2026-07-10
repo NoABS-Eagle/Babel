@@ -958,7 +958,55 @@ def _emit_instance(instances_el, inst_el):
     rot = _instance_rot_attr(inst_el)
     if rot:
         kwargs['rot'] = rot
-    ET.SubElement(instances_el, 'instance', **kwargs)
+    texts = inst_el.findall('text')
+    if texts:
+        kwargs['smashed'] = 'yes'
+    out = ET.SubElement(instances_el, 'instance', **kwargs)
+    # placeholder records back to ABSOLUTE coords/angles — Eagle 9 treats a
+    # missing record on a smashed instance as hidden (exact inverse of the
+    # import-side localization; same mechanism as the board <element>)
+    inst_rot = float(inst_el.get('rot', 0))
+    inst_mirror = inst_el.get('mirror') == '1'
+    ex_um, ey_um = float(inst_el.get('x')), float(inst_el.get('y'))
+    for t in texts:
+        a = ET.SubElement(out, 'attribute')
+        a.set('name', (t.text or '').strip().lstrip('>'))
+        if t.get('hidden') == 'yes' and t.get('x') is None:
+            # suppression-only override (no user-placed geometry)
+            a.set('x', _tomm(inst_el.get('x'))); a.set('y', _tomm(inst_el.get('y')))
+            a.set('size', '1.778'); a.set('layer', '96')
+            a.set('display', 'off')
+            continue
+        lx, ly = float(t.get('x', 0)), float(t.get('y', 0))
+        lrot = float(t.get('rot', 0))
+        if inst_mirror:
+            lx = -lx
+            # NOTE: lrot is NOT pre-negated — the mirror branch of the
+            # arot formula below is the whole inverse (negating here too
+            # applied the flip twice: C48 ELITAN came back R180 for R0)
+        r = math.radians(inst_rot)
+        ax = ex_um + lx * math.cos(r) - ly * math.sin(r)
+        ay = ey_um + lx * math.sin(r) + ly * math.cos(r)
+        arot = (inst_rot + lrot) % 360 if not inst_mirror else (inst_rot - lrot) % 360
+        amirror = (t.get('mirror') == '1') != inst_mirror
+        a.set('x', _tomm(str(round(ax)))); a.set('y', _tomm(str(round(ay))))
+        a.set('size', _tomm(t.get('size', '1778')))
+        a.set('layer', _SYM_TEXT_LAYER.get(t.get('layer', 'VALUES'),
+                                           t.get('layer', '96')))
+        if t.get('font') == 'vector':
+            a.set('font', 'vector')
+        if t.get('ratio'):
+            a.set('ratio', t.get('ratio'))
+        rs = f'{arot:g}'
+        if amirror:
+            a.set('rot', f'MR{rs}')
+        elif arot:
+            a.set('rot', f'R{rs}')
+        align = t.get('align', 'bottom-left')
+        if align != 'bottom-left':
+            a.set('align', align)
+        if t.get('hidden') == 'yes':
+            a.set('display', 'off')
 
 
 # Eagle draws a module port as a 0.2" pin starting ON the block perimeter

@@ -36,7 +36,7 @@ from pathlib import Path
 
 from babel.eagle_parser import (
     convert_symbol, convert_package, convert_deviceset, collect_attributes,
-    parse_rot, _um,
+    parse_rot, _um, LAYER_MAP,
 )
 from babel.eagle_exporter import _rotate_vec, _SIDE_NORMAL, _port_geometry, _PORT_PIN_LEN_UM
 from babel.ir_util import component_gates, is_multi_gate
@@ -420,6 +420,66 @@ def _collect_sheet(sheet_el, parts, pool, comp_by_name, comps_by_lib, ctx, port_
                                     'DEVICE_VARIANT not found among component footprints, '
                                     'instance footprint left unresolved')
 
+            # Placeholder RECORDS (smashed positions) — Eagle 9 stores
+            # explicit per-instance <attribute> records for every displayed
+            # placeholder and treats their ABSENCE as hidden (dialect
+            # 9.6.2; with the old 7.7.0 tag Eagle fell back to symbol
+            # default positions, masking the loss). Same mechanism as
+            # board <element>: localized <text> overrides + explicit
+            # hidden suppression (tolmach: 271 records were dropped).
+            ph = []
+            shown_ph = set()
+            ex, ey = float(inst_el.get('x')), float(inst_el.get('y'))
+            for a in inst_el.findall('attribute'):
+                aname = a.get('name')
+                hidden_rec = a.get('display') == 'off'
+                # off-records still carry a user-placed POSITION (ELITAN on
+                # tolmach) — keep the geometry, mark hidden
+                shown_ph.add(aname)
+                arot, amirror = parse_rot(a.get('rot'))
+                dx = float(a.get('x', ex)) - ex
+                dy = float(a.get('y', ey)) - ey
+                r = math.radians(angle_deg)
+                lx = dx * math.cos(r) + dy * math.sin(r)
+                ly = -dx * math.sin(r) + dy * math.cos(r)
+                lrot = (arot - angle_deg) % 360
+                if mirror:
+                    lx = -lx
+                    lrot = (-lrot) % 360
+                rec = {'text': '>' + aname,
+                       'x': str(round(lx * 1000)), 'y': str(round(ly * 1000)),
+                       'size': _um(a.get('size', '1.778')),
+                       'rot': str(round(lrot, 4) if lrot % 1 else int(lrot)),
+                       'align': a.get('align', 'bottom-left'),
+                       'layer': LAYER_MAP.get(int(a.get('layer', 96)),
+                                              a.get('layer', '96'))}
+                if a.get('font') == 'vector':
+                    rec['font'] = 'vector'
+                if a.get('ratio'):
+                    rec['ratio'] = a.get('ratio')
+                if amirror != mirror:
+                    rec['mirror'] = '1'
+                if hidden_rec:
+                    rec['hidden'] = 'yes'
+                ph.append(rec)
+            if inst_el.get('smashed') == 'yes':
+                gates = component_gates(comp_el)
+                sym_name = dict(gates).get(gate_name) or gates[0][1]
+                sym_el_ph = pool.get(sym_name)
+                sym_phs = {(t.text or '').strip().lstrip('>')
+                           for t in (sym_el_ph.findall('text')
+                                     if sym_el_ph is not None else [])
+                           if (t.text or '').strip().startswith('>')}
+                shown_upper = {n.upper() for n in shown_ph}
+                for name in sorted(sym_phs):
+                    # case-insensitive: Eagle records uppercase attribute
+                    # names while the symbol may spell its placeholder
+                    # lowercase (tolmach 'C': >allocated vs ALLOCATED)
+                    if name.upper() not in shown_upper:
+                        ph.append({'text': '>' + name, 'hidden': 'yes'})
+            if ph:
+                inst['ph'] = ph
+
             if part_name not in seen_designator_gate:
                 seen_designator_gate.add(part_name)
                 if part.get('value'):
@@ -497,6 +557,11 @@ def _write_canvas(parent_el, instances, nets):
             inst_el.set('footprint', inst['footprint'])
         for k, v in inst['attrs']:
             ET.SubElement(inst_el, 'attr', name=k, value=v)
+        for rec in inst.get('ph', ()):
+            t = ET.SubElement(inst_el, 'text')
+            t.text = rec.pop('text')
+            for k, v in rec.items():
+                t.set(k, v)
 
     for net in nets:
         net_kwargs = {'name': net['name']}

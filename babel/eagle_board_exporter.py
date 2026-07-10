@@ -118,7 +118,8 @@ def _emit_element_attribute(el_out, t, e):
     lrot = float(t.get('rot', 0))
     if mirror:
         lx = -lx
-        lrot = (-lrot) % 360
+        # lrot NOT pre-negated: the mirror branch of the arot formula is
+        # the whole inverse (same double-flip as the schematic side)
     r = math.radians(rot)
     ax = ex + lx * math.cos(r) - ly * math.sin(r)
     ay = ey + lx * math.sin(r) + ly * math.cos(r)
