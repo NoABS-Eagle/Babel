@@ -702,7 +702,7 @@ def _synth_native_frame(frame_el, bbox_um, pool, ctx):
         ctx['symbols_el'].append(sym_el)
         pool[comp_name] = sym_el
         comp_el = ET.Element('component', name=comp_name, prefix='FRAME',
-                             symbol=comp_name)
+                             symbol=comp_name, synth='frame')
         ctx['proj_el'].append(comp_el)
         cache[comp_name] = comp_el
     ctx['synth_frame_n'] = n = ctx.get('synth_frame_n', 0) + 1

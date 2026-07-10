@@ -181,6 +181,19 @@ def export_symbol(sym_el, sym_name, coerce_sup=False):
         elif t == 'arc':
             _emit_arc(sym, el, _eagle_layer(el))
 
+        elif t == 'shape' and el.get('layer') == 'FRAME':
+            # Frame-role shape (ir_schema.md "Frame") -> the symbol's own
+            # native <frame> — Eagle draws the cartouche from it
+            x, y = float(el.get('x')) / 1000, float(el.get('y')) / 1000
+            w2 = float(el.get('w', '0')) / 2000
+            h2 = float(el.get('h', '0')) / 2000
+            fr = ET.SubElement(sym, 'frame')
+            fr.set('x1', fmt(x - w2)); fr.set('y1', fmt(y - h2))
+            fr.set('x2', fmt(x + w2)); fr.set('y2', fmt(y + h2))
+            fr.set('columns', el.get('columns', '6'))
+            fr.set('rows', el.get('rows', '4'))
+            fr.set('layer', '94')
+
         elif t == 'shape':
             rn = int(el.get('roundness', 0))
             x, y = float(el.get('x')) / 1000, float(el.get('y')) / 1000
@@ -1355,7 +1368,8 @@ def _export_module(modules_el, mod_el, lib_name, comp_by_name, dev_name_by_fp, p
 
     for inst_el in frame_insts:
         comp_el = comp_by_name[inst_el.get('component')]
-        _emit_frame(plain_el, _frame_bbox(inst_el, comp_el, pool), inst_el, comp_el, pool)
+        if comp_el.get('synth') == 'frame':
+            _emit_frame(plain_el, _frame_bbox(inst_el, comp_el, pool), inst_el, comp_el, pool)
     for inst_el in insts:
         _emit_instance(instances_el, inst_el)
     for el in mod_el:
@@ -1404,7 +1418,17 @@ def export_schematic(ir_path, output_path=None):
         comp_el = comp_by_name.get(inst_el.get('component'))
         if comp_el is None:
             continue
-        (frame_insts if _is_frame_component(comp_el, pool) else part_insts).append(inst_el)
+        if _is_frame_component(comp_el, pool):
+            frame_insts.append(inst_el)
+            # a REAL library frame (not synthesized from a native <frame>
+            # or a KiCad page) is an ordinary part: its deviceset/symbol/
+            # instance — placeholder records included — round-trips like
+            # any other component; only synthesized frames keep the native
+            # <frame> projection below
+            if comp_el.get('synth') != 'frame':
+                part_insts.append(inst_el)
+        else:
+            part_insts.append(inst_el)
 
     frames = sorted(
         ((_frame_bbox(inst_el, comp_by_name[inst_el.get('component')], pool), inst_el)
@@ -1626,6 +1650,8 @@ def export_schematic(ir_path, output_path=None):
         ET.SubElement(moduleinsts_els[sheet_idx], 'moduleinst', **kwargs)
 
     for sheet_idx, (bbox, inst_el) in enumerate(frames):
+        if comp_by_name[inst_el.get('component')].get('synth') != 'frame':
+            continue
         _emit_frame(plain_els[sheet_idx], bbox,
                     inst_el, comp_by_name[inst_el.get('component')], pool)
 

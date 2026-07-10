@@ -275,6 +275,11 @@ def convert_symbol(sym_el, sym_name):
             el.set('rot', '0')
             el.set('outline', _um(child.get('width', '0')))
             el.set('layer', 'FRAME')
+            # cartouche grid — needed to re-emit the symbol's <frame>
+            if child.get('columns'):
+                el.set('columns', child.get('columns'))
+            if child.get('rows'):
+                el.set('rows', child.get('rows'))
 
         elif tag == 'pin':
             direction = child.get('direction', 'io')

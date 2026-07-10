@@ -425,7 +425,7 @@ def _build_frame_component(width_mm, height_mm, pool, symbols_el, proj_el):
     symbols_el.append(sym_el)
     pool[comp_name] = sym_el
 
-    comp_el = ET.Element('component', name=comp_name, prefix='FRAME', symbol=comp_name)
+    comp_el = ET.Element('component', name=comp_name, prefix='FRAME', symbol=comp_name, synth='frame')
     proj_el.append(comp_el)
     return comp_name
 
