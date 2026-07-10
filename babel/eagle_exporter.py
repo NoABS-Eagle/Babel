@@ -1206,11 +1206,17 @@ def _emit_segment(seg_out, seg_el, port_geom=None):
         ET.SubElement(seg_out, 'junction',
                       x=_tomm(j.get('x')), y=_tomm(j.get('y')))
     for l in seg_el.findall('label'):
-        ET.SubElement(seg_out, 'label',
-                      x=_tomm(l.get('x')), y=_tomm(l.get('y')),
-                      size=_tomm(l.get('size', '1270')),
-                      rot=(_rot_attr(float(l.get('rot', '0'))) or 'R0'),
-                      layer=_LYR_INFO, xref='yes')
+        rot_s = _rot_attr(float(l.get('rot', '0'))) or 'R0'
+        if l.get('mirror') == '1':
+            rot_s = 'M' + rot_s
+        lab = ET.SubElement(seg_out, 'label',
+                            x=_tomm(l.get('x')), y=_tomm(l.get('y')),
+                            size=_tomm(l.get('size', '1270')),
+                            rot=rot_s, layer=_LYR_INFO)
+        # only FLAG styles are Eagle xref cross-references; crummy = plain
+        # wire caption (forcing xref on those was the visible regression)
+        if l.get('style', 'crummy') != 'crummy':
+            lab.set('xref', 'yes')
 
 
 def _emit_deco(plain_el, el):

@@ -523,10 +523,17 @@ def _collect_sheet(sheet_el, parts, pool, comp_by_name, comps_by_lib, ctx, port_
                 for j in seg_el.findall('junction'):
                     seg['junctions'].append((_um(j.get('x')), _um(j.get('y'))))
                 for l in seg_el.findall('label'):
-                    deg, _ = parse_rot(l.get('rot'))
+                    deg, lmirror = parse_rot(l.get('rot'))
+                    # xref="yes" = Eagle's cross-reference FLAG -> flag
+                    # style ('passive': рамка без стрелок — Eagle xref не
+                    # кодирует направление); plain label = crummy, the
+                    # legitimate wire caption (user: флажок на середине
+                    # провода выглядит плохо). Mirror carried, was dropped.
                     seg['labels'].append((
                         _um(l.get('x')), _um(l.get('y')), _um(l.get('size', '1.778')),
                         str(round(deg)),
+                        '1' if lmirror else '',
+                        'passive' if l.get('xref') == 'yes' else 'crummy',
                     ))
                 net['segments'].append(seg)
             nets.append(net)
@@ -579,8 +586,11 @@ def _write_canvas(parent_el, instances, nets):
                 ET.SubElement(seg_el, 'line', x1=x1, y1=y1, x2=x2, y2=y2, width=width)
             for jx, jy in seg['junctions']:
                 ET.SubElement(seg_el, 'junction', x=jx, y=jy)
-            for lx, ly, size, rot in seg['labels']:
-                ET.SubElement(seg_el, 'label', x=lx, y=ly, size=size, rot=rot, style='crummy')
+            for lx, ly, size, rot, lmirror, style in seg['labels']:
+                l_el = ET.SubElement(seg_el, 'label', x=lx, y=ly, size=size,
+                                     rot=rot, style=style)
+                if lmirror:
+                    l_el.set('mirror', '1')
 
 
 # ---------------------------------------------------------------------------
@@ -768,8 +778,8 @@ def _collect_tiled_pages(sheet_els, parts, pool, comp_by_name, comps_by_lib, ctx
                                  for x1_, y1_, x2_, y2_, w in seg['wires']]
                 seg['junctions'] = [(str(int(jx) + tile_x_offset), jy)
                                      for jx, jy in seg['junctions']]
-                seg['labels'] = [(str(int(lx) + tile_x_offset), ly, size, rot)
-                                  for lx, ly, size, rot in seg['labels']]
+                seg['labels'] = [(str(int(lx) + tile_x_offset), *rest)
+                                  for lx, *rest in seg['labels']]
         instances.extend(page_instances)
         nets.extend(page_nets)
 
