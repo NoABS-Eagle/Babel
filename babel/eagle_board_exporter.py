@@ -207,7 +207,18 @@ def export_board(ir_path, output_path=None, layout_name=None):
                  ('style', 'lines'), ('multiple', '1'), ('display', 'no'),
                  ('altdistance', '0.01'), ('altunitdist', 'inch'), ('altunit', 'inch')]:
         grid.set(k, v)
-    drawing.append(ET.parse(_LAYERS_FILE).getroot())
+    # copper layer table follows the ACTUAL stack (layerSetup, already the
+    # authority via passthrough): members active+visible, the rest
+    # active="no" — the static table marked all 16 active and Eagle showed
+    # phantom inner layers on every 2/4-layer board (user caught it)
+    layers_root = ET.parse(_LAYERS_FILE).getroot()
+    for l in layers_root:
+        n = int(l.get('number'))
+        if 1 <= n <= 16:
+            in_stack = n in stack
+            l.set('active', 'yes' if in_stack else 'no')
+            l.set('visible', 'yes' if in_stack else 'no')
+    drawing.append(layers_root)
 
     board = ET.SubElement(drawing, 'board')
     plain = ET.SubElement(board, 'plain')
