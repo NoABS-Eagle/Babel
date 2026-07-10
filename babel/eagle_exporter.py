@@ -571,11 +571,18 @@ def _device_names(comp_el):
     fp_els = comp_el.findall('footprint')
     if not fp_els:
         return ['']
-    single = len(fp_els) == 1
+    # A variant-less footprint is Eagle's device named '' — legal and REAL
+    # even alongside named siblings (maximus NSIP83086(V): devices '' and
+    # '-SO-20W'; inventing a name from the package here leaked into Eagle's
+    # derived VALUE, ERC caught the schematic/board mismatch). The
+    # footprint-name fallback stays only for the ambiguous case of SEVERAL
+    # variant-less footprints (KiCad-sourced components have no variants at
+    # all and need distinct device names).
+    unnamed = sum(1 for fp in fp_els if not fp.get('variant'))
     seen = {}
     names = []
     for fp_el in fp_els:
-        if single and not fp_el.get('variant'):
+        if unnamed == 1 and not fp_el.get('variant'):
             dev_name = ''
         else:
             dev_name = _eagle_name(fp_el.get('variant', fp_el.get('name')))
