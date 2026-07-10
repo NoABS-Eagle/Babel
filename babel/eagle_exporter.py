@@ -903,7 +903,8 @@ def _emit_part(parts_el, inst_el, comp_el, lib_name, dev_name_by_fp):
         # экспорт схемы" — testData/vimdrones.zip "R6"/"R11", a generic
         # resistor instance actually placed as a fuse holder).
         dev_name = next(iter(fp_map.values()), '')
-        if len(fp_map) > 1:
+        if len(set(fp_map.values())) > 1:   # distinct DEVICES, not map keys
+                                            # (each fp adds name+variant keys)
             import_log.log(inst_el.get('name'), comp_el.get('name'),
                             'DEVICE_VARIANT unknown, using ->', dev_name)
     part = ET.SubElement(parts_el, 'part', name=inst_el.get('name'), library=lib_name,
@@ -1499,11 +1500,18 @@ def export_schematic(ir_path, output_path=None):
     # {component_el: {footprint_name: device_name}} — _device_names()
     # returns names in the same order as comp_el.findall('footprint'), zip
     # them for an O(1) lookup by the instance's own recorded footprint.
-    dev_name_by_fp = {
-        comp_el: dict(zip((fp.get('name') for fp in comp_el.findall('footprint')),
-                           _device_names(comp_el)))
-        for comp_el in used_components
-    }
+    # Keyed by BOTH the footprint name and its variant: one package can
+    # back several devices (name key collides and silently keeps the last —
+    # luminoso CON-2P, ERC caught the wrong device), so instances of such
+    # components record the VARIANT, which is unique by construction.
+    dev_name_by_fp = {}
+    for comp_el in used_components:
+        m = {}
+        for fp, dev in zip(comp_el.findall('footprint'), _device_names(comp_el)):
+            m[fp.get('name')] = dev
+            if fp.get('variant'):
+                m[fp.get('variant')] = dev
+        dev_name_by_fp[comp_el] = m
     # One Eagle <part> per PHYSICAL component (designator), not per IR
     # <instance> — a multi-gate component has several <instance>s sharing
     # one designator (ir_schema.md "Размещение многорежимного компонента"),

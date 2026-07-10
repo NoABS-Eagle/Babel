@@ -342,7 +342,16 @@ def _collect_sheet(sheet_el, parts, pool, comp_by_name, comps_by_lib, ctx, port_
                 fp_by_variant = {fp.get('variant'): fp.get('name') for fp in fp_variants}
                 fp_name = fp_by_variant.get(device)
                 if fp_name:
-                    inst['footprint'] = fp_name
+                    # Package NAME is NOT a unique device identity: one
+                    # package can back several devices (luminoso CON-2P:
+                    # devices -B2B-XH and -DS1069M both use B2B-XH-A; ERC
+                    # caught the wrong device coming back). When ambiguous,
+                    # record the VARIANT string — unique by construction.
+                    names = [fp.get('name') for fp in fp_variants]
+                    if names.count(fp_name) > 1:
+                        inst['footprint'] = device
+                    else:
+                        inst['footprint'] = fp_name
                 else:
                     import_log.log(part_name, part.get('device', ''),
                                     'DEVICE_VARIANT not found among component footprints, '

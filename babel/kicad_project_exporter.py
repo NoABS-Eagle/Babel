@@ -271,7 +271,13 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
     fps = comp_el.findall('footprint')
     inst_fp = inst_el.get('footprint')
     if inst_fp:
-        fp_ref = f'{lib_name}:{sanitize_filename(inst_fp)}'
+        # the recorded key is the footprint NAME or, for ambiguous package
+        # names (one package backing several devices), the VARIANT — resolve
+        # to the real package name either way
+        fp_name = next((fp.get('name') for fp in fps
+                        if inst_fp in (fp.get('variant'), fp.get('name'))),
+                       inst_fp)
+        fp_ref = f'{lib_name}:{sanitize_filename(fp_name)}'
     elif len(fps) == 1:
         fp_ref = f'{lib_name}:{sanitize_filename(fps[0].get("name", ""))}'
     else:
