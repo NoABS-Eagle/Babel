@@ -126,9 +126,15 @@ def check(stem):
             print(f'  FAIL element {n}: attrs lost: {sorted(d)[:4]}')
     else:
         n_at = sum(len(v) for v in aa.values())
-        extra = sum(len(ab.get(n, set()) - aa[n]) for n in aa)
+        extra_names = Counter(k for n in aa for k, _ in ab.get(n, set()) - aa[n])
+        extra = sum(extra_names.values())
+        # extras are legitimate ONLY as sch->board merge products; name the
+        # names so injected garbage is visible to the eye (a synthesized
+        # 'DESCRIPTION' slipped through a bare count once)
+        names = (' [' + ', '.join(f'{k}x{v}' for k, v in extra_names.most_common(6)) + ']'
+                 if extra_names else '')
         print(f'  ok  element attributes ({n_at} records survive'
-              + (f', +{extra} merged from sch)' if extra else ')'))
+              + (f', +{extra} merged from sch{names})' if extra else ')'))
 
     sa, sb = _signal_geom(a), _signal_geom(b)
     if set(sa) != set(sb):

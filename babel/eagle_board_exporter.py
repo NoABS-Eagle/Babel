@@ -335,7 +335,11 @@ def export_board(ir_path, output_path=None, layout_name=None):
             # attribute names on entry), inverse of the import lowercasing.
             emitted_l = {n.lower() for n in emitted}
             for aname, aval in sorted(_resolved_attrs(comp, inst).items()):
-                if aname.lower() in emitted_l or aname.lower() in ('name', 'value'):
+                # 'value'/'description' in the component attribute container
+                # are IR bookkeeping (deviceset description text, value
+                # default) — not Eagle attributes, never baked onto elements
+                if aname.lower() in emitted_l or \
+                        aname.lower() in ('name', 'value', 'description'):
                     continue
                 a = ET.SubElement(el_out, 'attribute')
                 a.set('name', aname.upper()); a.set('value', aval)
