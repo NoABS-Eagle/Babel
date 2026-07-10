@@ -14,7 +14,8 @@ from xml.dom import minidom
 from babel import import_log
 from babel.eagle_exporter import (_LAYERS_FILE, _eagle_designator, _eagle_name,
                                   _emit_arc, _emit_geometry, _geom_sig,
-                                  _pkg_eagle_layer, _tomm, export_package)
+                                  _pkg_eagle_layer, _resolved_attrs, _tomm,
+                                  export_package)
 from babel.ir_util import parse_layer
 
 _GEOM_TAGS = ('line', 'arc', 'shape', 'polygon', 'text', 'hole')
@@ -313,8 +314,25 @@ def export_board(ir_path, output_path=None, layout_name=None):
             el_out.set('smashed', 'yes')
         if rot:
             el_out.set('rot', rot)
+        emitted = set()
         for t in texts:
             _emit_element_attribute(el_out, t, e)
+            emitted.add((t.text or '').strip().lstrip('>'))
+        if inst is not None and comp is not None:
+            # Eagle keeps a value copy of every part attribute ON the board
+            # element (editable from the board editor; can even exist only
+            # there) — regenerate the copies from the shared instance, the
+            # IR's one value home. Hidden records: element coords, tValues.
+            for aname, aval in sorted(_resolved_attrs(comp, inst).items()):
+                if aname in emitted or aname in ('NAME', 'VALUE'):
+                    continue
+                a = ET.SubElement(el_out, 'attribute')
+                a.set('name', aname); a.set('value', aval)
+                a.set('x', _tomm(e.get('x'))); a.set('y', _tomm(e.get('y')))
+                a.set('size', '1.778'); a.set('layer', '27')
+                if rot:
+                    a.set('rot', rot.lstrip('M'))
+                a.set('display', 'off')
 
     signals_el = ET.SubElement(board, 'signals')
     net_class = ({n.get('name'): n.get('class') for n in schem.findall('net')}

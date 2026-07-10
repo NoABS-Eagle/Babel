@@ -823,8 +823,64 @@ def convert_project_full(src, output_path):
                         name_map[flat] = addr
 
         net_names = {n.get('name') for n in schem_el.findall('net')}
+        board_attrs = {}
         layout_el = convert_board(brd_path, name_map=name_map, known=known,
-                                  net_names=net_names)
+                                  net_names=net_names, attr_sink=board_attrs)
+
+        # Board-side attribute values merge into the SHARED instance —
+        # Eagle allows editing/adding element attributes right in the board
+        # editor without syncing the .sch part (luminoso ground truth: 75
+        # elements with brd-only attrs), while the IR attribute model keeps
+        # ONE value home. Union rule, deterministic: absent -> add (logged);
+        # empty vs non-empty -> non-empty wins; two DIFFERENT non-empty
+        # values -> hard reject (no side is authoritative, a human must
+        # pick). Module-instance parts merge across ALL siblings with the
+        # same rules (per-sibling divergence of non-empty values is
+        # inexpressible: the module canvas is shared).
+        inst_el_by_name = {i.get('name'): i for i in schem_el.findall('instance')}
+        mod_inst_by_addr = {}
+        for m in module_els:
+            for mi_el in m.findall('instance'):
+                if mi_el.get('module'):
+                    continue
+                for minst in module_instances:
+                    if minst['module'] == m.get('name'):
+                        addr = f'{minst["designator"]}:{mi_el.get("name")}'
+                        mod_inst_by_addr[addr] = mi_el
+        for el_name, battrs in board_attrs.items():
+            # explicit None test: a childless ET.Element is FALSY, `or`
+            # would drop every instance that has no <attr> children yet —
+            # exactly the ones this merge exists to fill
+            target = inst_el_by_name.get(el_name)
+            if target is None:
+                target = mod_inst_by_addr.get(el_name)
+
+            if target is None:
+                continue
+            existing = {a.get('name'): a for a in target.findall('attr')}
+            added = []
+            for aname, bval in battrs.items():
+                cur = existing.get(aname)
+                if cur is None:
+                    ET.SubElement(target, 'attr', name=aname, value=bval)
+                    existing[aname] = target[-1]
+                    added.append(aname)
+                    continue
+                cval = cur.get('value') or ''
+                if cval == bval or not bval:
+                    continue
+                if not cval:
+                    cur.set('value', bval)
+                    added.append(aname)
+                    continue
+                raise ValueError(
+                    f'{brd_path}: element {el_name!r} attribute {aname!r} '
+                    f'diverges between board ({bval!r}) and schematic '
+                    f'({cval!r}) — no side is authoritative, reconcile in '
+                    f'Eagle and re-import')
+            if added:
+                import_log.log(el_name, ','.join(sorted(added)),
+                               'BOARD_ATTRS merged into shared instance')
         # every board element must resolve — diagnostics over silence
         unresolved = sorted({e.get('name') for e in layout_el
                              if e.tag == 'element'

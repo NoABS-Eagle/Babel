@@ -22,7 +22,7 @@ from babel.eagle_parser import (convert_geometry, convert_geometry_mapped,
 
 
 def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset(),
-                     ir_name=None):
+                     ir_name=None, attr_sink=None):
     """Eagle <element> -> IR <element> (ir_schema.md "<element>"): placement
     (x/y/rot/side) + <text> placeholder overrides for smashed attributes.
 
@@ -54,6 +54,15 @@ def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset(),
     ex, ey = float(e.get('x')), float(e.get('y'))
     for a in e.findall('attribute'):
         aname = a.get('name')
+        if attr_sink is not None and aname not in ('NAME', 'VALUE'):
+            # Eagle keeps attribute VALUES on the board element too, and
+            # they can exist ONLY there (board-editor edits don't sync back
+            # to the .sch part — luminoso ground truth: 75 elements with
+            # brd-only attrs). Collected for the project-level merge into
+            # the shared instance; the element itself stores only placement
+            # overrides, values stay one-home (ir_schema.md attribute model).
+            attr_sink.setdefault(ir_name or e.get('name'), {})[aname] = \
+                a.get('value') or ''
         if a.get('display') == 'off':
             # no placeholder is created (ir_schema.md); suppression of the
             # footprint's own >NAME/>VALUE is handled uniformly below
@@ -213,7 +222,7 @@ def _convert_signal(s, layout, layout_name, copper_map, stack, brd_path,
 
 
 def convert_board(brd_path, layout_name='main', name_map=None, known=None,
-                  net_names=None):
+                  net_names=None, attr_sink=None):
     """Parse one .brd file -> IR <layout> element.
 
     Project-scoped context (all optional — a standalone call skips the
@@ -301,7 +310,8 @@ def convert_board(brd_path, layout_name='main', name_map=None, known=None,
                              pkg_placeholders.get(
                                  (e.get('library'), e.get('package')),
                                  frozenset()),
-                             ir_name=ir_name)
+                             ir_name=ir_name,
+                             attr_sink=attr_sink if fp_attr is None else None)
             if fp_attr:
                 layout[-1].set('footprint', fp_attr)
 

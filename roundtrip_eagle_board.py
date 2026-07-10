@@ -56,6 +56,14 @@ def _elements(board):
     return out
 
 
+def _element_attrs(board):
+    """element -> {(attr name, value)}, NAME/VALUE excluded (placeholders)."""
+    return {e.get('name'): {(a.get('name'), a.get('value') or '')
+                            for a in e.findall('attribute')
+                            if a.get('name') not in ('NAME', 'VALUE')}
+            for e in board.find('elements')}
+
+
 def _signal_geom(board):
     """signal name -> (contactref set, wire multiset, via multiset, polygon count)."""
     out = {}
@@ -107,6 +115,20 @@ def check(stem):
                 print(f'  FAIL element {n}: {ea[n]} != {eb[n]}')
         else:
             print(f'  ok  {len(ea)} elements (package/x/y/rot)')
+
+    # attribute VALUES must survive: src set ⊆ rt set (the import's union
+    # merge may legitimately ADD schematic-side attrs to the board copies)
+    aa, ab = _element_attrs(a), _element_attrs(b)
+    lost = {n: aa[n] - ab.get(n, set()) for n in aa if aa[n] - ab.get(n, set())}
+    if lost:
+        ok = False
+        for n, d in list(lost.items())[:5]:
+            print(f'  FAIL element {n}: attrs lost: {sorted(d)[:4]}')
+    else:
+        n_at = sum(len(v) for v in aa.values())
+        extra = sum(len(ab.get(n, set()) - aa[n]) for n in aa)
+        print(f'  ok  element attributes ({n_at} records survive'
+              + (f', +{extra} merged from sch)' if extra else ')'))
 
     sa, sb = _signal_geom(a), _signal_geom(b)
     if set(sa) != set(sb):
