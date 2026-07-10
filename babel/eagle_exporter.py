@@ -572,7 +572,9 @@ def _device_names(comp_el):
 
 def export_deviceset(comp_el):
     ds = ET.Element('deviceset')
-    cid = _eagle_name(comp_el.get('name', ''))
+    # renamed-from: flat-pool @N uniquification of same-named devicesets
+    # from same-nicknamed libraries — the Eagle-facing name is the original
+    cid = _eagle_name(comp_el.get('renamed-from') or comp_el.get('name', ''))
     ds.set('name', cid)
     if comp_el.get('prefix'):
         ds.set('prefix', comp_el.get('prefix'))
@@ -908,7 +910,7 @@ def _emit_part(parts_el, inst_el, comp_el, lib_name, dev_name_by_fp):
             import_log.log(inst_el.get('name'), comp_el.get('name'),
                             'DEVICE_VARIANT unknown, using ->', dev_name)
     part = ET.SubElement(parts_el, 'part', name=inst_el.get('name'), library=lib_name,
-                          deviceset=_eagle_name(comp_el.get('name')), device=dev_name)
+                          deviceset=_eagle_name(comp_el.get('renamed-from') or comp_el.get('name')), device=dev_name)
     value = _resolved_attrs(comp_el, inst_el).get('value')
     if value:
         part.set('value', value)

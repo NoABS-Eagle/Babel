@@ -163,8 +163,12 @@ def export_board(ir_path, output_path=None, layout_name=None):
 
     schem = root.find('schematic')
     comp_by_name = {c.get('name'): c for c in root.findall('component')}
-    inst_by_des = ({i.get('name'): i for i in schem.findall('instance')}
-                   if schem is not None else {})
+    # first-wins: multi-gate parts share a designator across instances and
+    # the attribute home is the FIRST gate (importer convention)
+    inst_by_des = {}
+    if schem is not None:
+        for i in schem.findall('instance'):
+            inst_by_des.setdefault(i.get('name'), i)
     module_by_name = {m.get('name'): m for m in root.findall('module')}
     local_fp = {f.get('name'): f for f in layout.findall('footprint')}
 
@@ -313,7 +317,8 @@ def export_board(ir_path, output_path=None, layout_name=None):
             # the user's text and EMPTY is a legal state (luminoso SJ1).
             value = _resolved_attrs(comp, inst).get('value', '')
             if not value and comp.get('uservalue') != 'yes':
-                value = _eagle_name(comp.get('name')) + (fp.get('variant') or '')
+                value = (_eagle_name(comp.get('renamed-from') or comp.get('name'))
+                         + (fp.get('variant') or ''))
         el_out.set('value', value)
         el_out.set('x', _tomm(e.get('x'))); el_out.set('y', _tomm(e.get('y')))
         rot = _element_rot(e)

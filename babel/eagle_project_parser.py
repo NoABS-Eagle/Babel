@@ -67,9 +67,39 @@ def _convert_embedded_libraries(schematic_el, symbols_el, proj_el, pool, src_ste
     if libs_el is None:
         return comps_by_lib
 
+    def _canon(el, skip=()):
+        import copy as _copy
+        c = _copy.deepcopy(el)
+        for k in skip:
+            c.attrib.pop(k, None)
+        return ET.tostring(c, encoding='unicode')
+
+    def _unique(base, taken):
+        n = 1
+        while f'{base}@{n}' in taken:
+            n += 1
+        return f'{base}@{n}'
+
+    # Same-NICKNAME collisions are real (PowerPCB: six duplicate pairs —
+    # urn-pinned managed library + a plain edited copy, both "mosfet", with
+    # DIVERGED content: 2N7002 on SOT23 in one, SOT23-3 in the other; the
+    # old silent "first wins" dedup bound Q16 to the wrong package).
+    # Identical twins still dedup; diverged twins get Eagle's own "@N"
+    # suffix convention — on the library nickname, the component name and
+    # the symbol name alike, never silently.
+    lib_nicknames_taken = set()
+
     for lib_el in libs_el.findall('library'):
         lib_name = lib_el.get('name') or src_stem
         lib_urn = lib_el.get('urn', '')
+        if lib_name in lib_nicknames_taken:
+            eff_lib_name = _unique(lib_name, lib_nicknames_taken)
+            import_log.log(lib_name, lib_urn or '(no urn)',
+                           'LIBRARY nickname collision, renamed to', eff_lib_name)
+        else:
+            eff_lib_name = lib_name
+        lib_nicknames_taken.add(eff_lib_name)
+        sym_renames = {}
         packages_el = lib_el.find('packages')
         packages = {p.get('name'): p for p in packages_el.findall('package')} \
             if packages_el is not None else {}
@@ -78,9 +108,17 @@ def _convert_embedded_libraries(schematic_el, symbols_el, proj_el, pool, src_ste
         if symbols_container is not None:
             for sym_el in symbols_container.findall('symbol'):
                 sym_name = sym_el.get('name')
-                if sym_name in pool:
-                    continue   # already converted (shared across sheets/modules)
                 converted = convert_symbol(sym_el, sym_name)
+                if sym_name in pool:
+                    if _canon(pool[sym_name]) == _canon(converted):
+                        continue   # identical twin (shared across sheets/modules)
+                    new_name = _unique(sym_name, pool)
+                    converted.set('name', new_name)
+                    sym_renames[sym_name] = new_name
+                    import_log.log(eff_lib_name, sym_name,
+                                   'SYMBOL name collision (diverged content), '
+                                   'renamed to', new_name)
+                    sym_name = new_name
                 symbols_el.append(converted)
                 pool[sym_name] = converted
 
@@ -98,9 +136,34 @@ def _convert_embedded_libraries(schematic_el, symbols_el, proj_el, pool, src_ste
                 # to the exact component it actually names.
                 ds_name = ds_el.get('name')
                 for comp_el in convert_deviceset(ds_el, packages):
+                    # this library's diverged-symbol renames apply to the
+                    # component's gate references before any comparison
+                    if sym_renames:
+                        if comp_el.get('symbol') in sym_renames:
+                            comp_el.set('symbol', sym_renames[comp_el.get('symbol')])
+                        for g in comp_el.findall('gate'):
+                            if g.get('symbol') in sym_renames:
+                                g.set('symbol', sym_renames[g.get('symbol')])
                     comp_name = comp_el.get('name')
                     tech_name = comp_name[len(ds_name):] if comp_name.startswith(ds_name) else ''
-                    if proj_el.find(f'component[@name="{comp_name}"]') is None:
+                    existing = proj_el.find(f'component[@name="{comp_name}"]')
+                    if existing is not None and \
+                            _canon(existing, skip=('library',)) != _canon(comp_el, skip=('library',)):
+                        new_name = _unique(comp_name,
+                                           {c.get('name') for c in proj_el.findall('component')})
+                        comp_el.set('name', new_name)
+                        # flat-pool uniqueness only; the EAGLE-facing name
+                        # (deviceset naming, implicit-value derivation) stays
+                        # the original — same-named devicesets in different
+                        # libraries are legal Eagle, and the exporter already
+                        # separates the libraries (mosfet / mosfet@1)
+                        comp_el.set('renamed-from', comp_name)
+                        import_log.log(eff_lib_name, comp_name,
+                                       'COMPONENT name collision (diverged content), '
+                                       'renamed to', new_name)
+                        comp_name = new_name
+                        existing = None
+                    if existing is None and proj_el.find(f'component[@name="{comp_name}"]') is None:
                         # `library=` — the component's ORIGIN library
                         # nickname, not a live reference (same "copy, not
                         # link" discipline ir_schema.md "Component instance"
@@ -114,7 +177,7 @@ def _convert_embedded_libraries(schematic_el, symbols_el, proj_el, pool, src_ste
                         # forced to (KiCad has no notion of library ORDER/
                         # grouping worth preserving; Eagle's is real and
                         # used).
-                        comp_el.set('library', lib_name)
+                        comp_el.set('library', eff_lib_name)
                         proj_el.append(comp_el)
                     comps[(ds_name, tech_name)] = proj_el.find(f'component[@name="{comp_name}"]')
                 devices_el = ds_el.find('devices')
@@ -846,7 +909,14 @@ def convert_project_full(src, output_path):
         # pick). Module-instance parts merge across ALL siblings with the
         # same rules (per-sibling divergence of non-empty values is
         # inexpressible: the module canvas is shared).
-        inst_el_by_name = {i.get('name'): i for i in schem_el.findall('instance')}
+        # FIRST-wins on duplicate names: a multi-gate part is several
+        # <instance> elements sharing one designator, and the importer puts
+        # the part's attrs on the FIRST gate — the merge must target the
+        # same element (last-wins silently stranded merged attrs on a gate
+        # nobody reads: PowerPCB module LMV324, 4 gates).
+        inst_el_by_name = {}
+        for i in schem_el.findall('instance'):
+            inst_el_by_name.setdefault(i.get('name'), i)
         mod_inst_by_addr = {}
         for m in module_els:
             for mi_el in m.findall('instance'):
@@ -855,7 +925,7 @@ def convert_project_full(src, output_path):
                 for minst in module_instances:
                     if minst['module'] == m.get('name'):
                         addr = f'{minst["designator"]}:{mi_el.get("name")}'
-                        mod_inst_by_addr[addr] = mi_el
+                        mod_inst_by_addr.setdefault(addr, mi_el)
         for el_name, battrs in board_attrs.items():
             # explicit None test: a childless ET.Element is FALSY, `or`
             # would drop every instance that has no <attr> children yet —
