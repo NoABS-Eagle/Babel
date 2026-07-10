@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from pathlib import Path
 from babel.eagle_parser import fmt
-from babel.ir_util import parse_layer, symbol_pool, component_gates
+from babel.ir_util import parse_layer, symbol_pool, component_gates, is_multi_gate
 from babel import import_log
 
 
@@ -1096,7 +1096,7 @@ def _port_geometry(module_els, module_insts):
     return out
 
 
-def _emit_segment(seg_out, seg_el, port_geom=None):
+def _emit_segment(seg_out, seg_el, port_geom=None, multi_parts=frozenset()):
     """One Eagle <segment>'s content from one IR <segment> — shared by the
     top-level nets and module nets (same content model both places,
     eagle.dtd: (pinref | portref | wire | junction | label)*).
@@ -1168,16 +1168,16 @@ def _emit_segment(seg_out, seg_el, port_geom=None):
         # IR encodes gate in the pin name itself for multi-gate
         # components ("A.OUT", same GATE.pin form <pin-mapping>
         # already uses — ir_schema.md "Размещение
-        # многорежимного компонента", same split already done
-        # for <connect> above) — Eagle wants them split into
-        # separate gate=/pin= attributes instead. Single-gate
-        # components never have a '.' in the pin name (IR pin
-        # names are cleaned identifiers, KiCad/Eagle pin
-        # designators don't contain '.'), so this split is safe
-        # without checking component mode explicitly.
+        # многорежимного компонента") — Eagle wants them split
+        # into separate gate=/pin= attributes. The split is gated
+        # on the COMPONENT MODE, never on the dot: a single-gate
+        # pin may legitimately contain '.' in its NAME (maximus
+        # NSIP83086 pin "VISO.OUT" — the old dot-based split
+        # minted a phantom gate VISO and Eagle refused the file).
         raw_pin = p.get('pin')
-        pin_gate, sep, pin_name = raw_pin.partition('.')
-        if not sep:
+        if p.get('part') in multi_parts:
+            pin_gate, _, pin_name = raw_pin.partition('.')
+        else:
             pin_gate, pin_name = 'G$1', raw_pin
         ET.SubElement(seg_out, 'pinref', part=p.get('part'),
                       gate=_eagle_name(pin_gate),
@@ -1381,13 +1381,16 @@ def _export_module(modules_el, mod_el, lib_name, comp_by_name, dev_name_by_fp, p
     for el in mod_el:
         if el.tag in ('line', 'arc', 'shape'):
             _emit_deco(plain_el, el)
+    multi_parts = {i.get('name') for i in insts
+                   if i.get('component') in comp_by_name
+                   and is_multi_gate(comp_by_name[i.get('component')])}
     for net_el in mod_el.findall('net'):
         net_out = ET.SubElement(nets_el, 'net',
                                  name=_eagle_designator(net_el.get('name')),
                                  **{'class': class_num.get(net_el.get('class'), '0')})
         for seg_el in net_el.findall('segment'):
             seg_out = ET.SubElement(net_out, 'segment')
-            _emit_segment(seg_out, seg_el)
+            _emit_segment(seg_out, seg_el, multi_parts=multi_parts)
 
 
 def export_schematic(ir_path, output_path=None):
@@ -1661,6 +1664,9 @@ def export_schematic(ir_path, output_path=None):
         _emit_frame(plain_els[sheet_idx], bbox,
                     inst_el, comp_by_name[inst_el.get('component')], pool)
 
+    multi_parts = {i.get('name') for i in part_insts
+                   if i.get('component') in comp_by_name
+                   and is_multi_gate(comp_by_name[i.get('component')])}
     for inst_el in part_insts:
         _emit_instance(instances_els[part_sheet[inst_el.get('name')]], inst_el)
 
@@ -1732,7 +1738,7 @@ def export_schematic(ir_path, output_path=None):
                                      **{'class': class_num.get(net_el.get('class'), '0')})
             for seg_el in segs:
                 seg_out = ET.SubElement(net_out, 'segment')
-                _emit_segment(seg_out, seg_el, port_geom)
+                _emit_segment(seg_out, seg_el, port_geom, multi_parts=multi_parts)
 
     xml_str = minidom.parseString(ET.tostring(eagle, encoding='unicode')) \
                      .toprettyxml(indent='  ')
