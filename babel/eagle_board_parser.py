@@ -77,6 +77,9 @@ def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset(),
         # attribute x/y/rot as ABSOLUTE board values, like KiCad pad angles)
         dx, dy = float(a.get('x', ex)) - ex, float(a.get('y', ey)) - ey
         arot, amirror = parse_rot(a.get('rot'))
+        if amirror != mirror:
+            # reading-direction flip relative to the element's own side
+            t.set('mirror', '1')
         r = math.radians(rot)
         lx = dx * math.cos(r) + dy * math.sin(r)
         ly = -dx * math.sin(r) + dy * math.cos(r)

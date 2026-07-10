@@ -87,8 +87,16 @@ def _signal_geom(board):
 
 def _plain_layers(board):
     plain = board.find('plain')
-    return Counter(c.get('layer') for c in (plain if plain is not None else ())
-                   if c.tag != 'dimension')
+    items = []
+    for c in (plain if plain is not None else ()):
+        if c.tag == 'dimension':
+            continue
+        if c.tag == 'text':
+            # rot string carries the M(irror) flag — its loss must FAIL
+            items.append(('text', c.get('layer'), c.get('rot') or 'R0'))
+        else:
+            items.append(c.get('layer'))
+    return Counter(items)
 
 
 def check(stem):

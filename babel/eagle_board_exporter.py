@@ -124,10 +124,13 @@ def _emit_element_attribute(el_out, t, e):
     ay = ey + lx * math.sin(r) + ly * math.cos(r)
     arot = (rot + lrot) % 360 if not mirror else (rot - lrot) % 360
     a.set('x', _tomm(str(round(ax)))); a.set('y', _tomm(str(round(ay))))
+    amirror = (t.get('mirror') == '1') != mirror
     a.set('size', _tomm(t.get('size', '1778')))
     eagle_layer = _pkg_eagle_layer(t.get('layer') or '125')
     a.set('layer', str(eagle_layer if eagle_layer is not None else 25))
-    if arot:
+    if amirror:
+        a.set('rot', f'MR{arot:g}')
+    elif arot:
         a.set('rot', f'R{arot:g}')
     if t.get('font') == 'vector':
         a.set('font', 'vector')

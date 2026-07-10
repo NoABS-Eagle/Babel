@@ -425,7 +425,10 @@ def _emit_geometry(parent, el, eagle_num):
         te.set('x', _tomm(el.get('x'))); te.set('y', _tomm(el.get('y')))
         te.set('size', _tomm(el.get('size')))
         rot = _rot_attr(float(el.get('rot', 0)))
-        if rot: te.set('rot', rot)
+        if el.get('mirror') == '1':
+            te.set('rot', 'M' + (rot or 'R0'))   # MR0 stays explicit
+        elif rot:
+            te.set('rot', rot)
         align = el.get('align', 'bottom-left')
         if align != 'bottom-left': te.set('align', align)
         if el.get('ratio'): te.set('ratio', el.get('ratio'))

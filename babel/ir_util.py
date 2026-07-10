@@ -230,6 +230,11 @@ def place_ir_element(el, ex_um, ey_um, rot_deg, bottom):
         set_pt(c, 'x', 'y')
         if c.get('rot') is not None or t in ('shape', 'text', 'smd'):
             c.set('rot', f'{obj_rot(float(c.get("rot", 0))):g}')
+        if t == 'text' and bottom:
+            # reading-direction flips with the side
+            c.set('mirror', '' if c.get('mirror') == '1' else '1')
+            if c.get('mirror') == '':
+                del c.attrib['mirror']
     if c.get('layer') is not None:
         c.set('layer', place_layer(c.get('layer'), bottom))
     elif t == 'smd':

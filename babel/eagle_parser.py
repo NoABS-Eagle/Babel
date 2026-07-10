@@ -406,8 +406,10 @@ def convert_geometry(child, parent, ir_layer):
     if tag == 'text':
         if ir_layer is None:
             return True
-        rot, _ = parse_rot(child.get('rot'))
+        rot, mirror = parse_rot(child.get('rot'))
         el = ET.SubElement(parent, 'text')
+        if mirror:
+            el.set('mirror', '1')     # reading-direction flip (bottom-side texts)
         el.set('layer', ir_layer)
         el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
         el.set('size', _um(child.get('size')))

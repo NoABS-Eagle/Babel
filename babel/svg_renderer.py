@@ -248,12 +248,19 @@ def _align_to_svg(align):
     return ta, db
 
 
-def _text(x_ir, y_ir, txt, size_mm, rot_deg, align, color, x_min, y_max, scale):
+def _text(x_ir, y_ir, txt, size_mm, rot_deg, align, color, x_min, y_max, scale,
+          mirror=False):
     xs, ys = _tr(x_ir, y_ir, x_min, y_max, scale)
     sp = max(size_mm * scale, 6)
     ta, db = _align_to_svg(align)
-    # Eagle CCW rotation in Y-up → negate for SVG (Y-down, CW-positive)
-    r_attr = f' transform="rotate({-rot_deg:.0f},{xs:.1f},{ys:.1f})"' if rot_deg else ''
+    # Eagle CCW rotation in Y-up → negate for SVG (Y-down, CW-positive);
+    # mirror = reading-direction flip around the anchor (bottom-side texts)
+    tf = []
+    if rot_deg:
+        tf.append(f'rotate({-rot_deg:.0f},{xs:.1f},{ys:.1f})')
+    if mirror:
+        tf.append(f'translate({2*xs:.1f},0) scale(-1,1)')
+    r_attr = f' transform="{" ".join(tf)}"' if tf else ''
     return (f'<text x="{xs:.1f}" y="{ys:.1f}" font-size="{sp:.0f}" font-family="monospace" '
             f'fill="{color}" text-anchor="{ta}" dominant-baseline="{db}"{r_attr}>'
             f'{txt}</text>')
@@ -987,7 +994,7 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
                 out.append(_text(_v(el.get('x')), _v(el.get('y')),
                                   el.text or '', _v(el.get('size', '1270')),
                                   float(el.get('rot', 0)), el.get('align', 'bottom-left'),
-                                  color, **kw))
+                                  color, **kw, mirror=el.get('mirror') == '1'))
 
         if opacity:
             out.append('</g>')
