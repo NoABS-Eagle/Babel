@@ -300,12 +300,20 @@ def export_board(ir_path, output_path=None, layout_name=None):
         el_out.set('library', _eagle_name(lib))
         el_out.set('package', _eagle_name(fp.get('name')))
         value = ''
-        if inst is not None:
-            value = next((a.get('value', '') for a in inst.findall('attr')
-                          if a.get('name') == 'VALUE'),
-                         next((a.get('value', '') for a in comp.findall('attr')
-                               if a.get('name') == 'VALUE'), '')
-                         if comp is not None else '')
+        if inst is not None and comp is not None:
+            # IR's VALUE concept = the (lowercase) 'value' attribute on the
+            # shared instance — the schematic importer's naming convention.
+            # uservalue != yes and no explicit value -> Eagle's own
+            # derivation, which it BAKES into element@value on the board
+            # (unlike the .sch part, where an absent value= suffices):
+            # deviceset+technology+device. The IR component name IS
+            # deviceset+technology (per-technology component split) and the
+            # footprint variant keeps the device name verbatim incl. its
+            # leading dash ('-SOT89'). With uservalue="yes" the value is
+            # the user's text and EMPTY is a legal state (luminoso SJ1).
+            value = _resolved_attrs(comp, inst).get('value', '')
+            if not value and comp.get('uservalue') != 'yes':
+                value = _eagle_name(comp.get('name')) + (fp.get('variant') or '')
         el_out.set('value', value)
         el_out.set('x', _tomm(e.get('x'))); el_out.set('y', _tomm(e.get('y')))
         rot = _element_rot(e)
@@ -323,11 +331,14 @@ def export_board(ir_path, output_path=None, layout_name=None):
             # element (editable from the board editor; can even exist only
             # there) — regenerate the copies from the shared instance, the
             # IR's one value home. Hidden records: element coords, tValues.
+            # Names go back UPPERCASE — Eagle's own canon (its UI uppercases
+            # attribute names on entry), inverse of the import lowercasing.
+            emitted_l = {n.lower() for n in emitted}
             for aname, aval in sorted(_resolved_attrs(comp, inst).items()):
-                if aname in emitted or aname in ('NAME', 'VALUE'):
+                if aname.lower() in emitted_l or aname.lower() in ('name', 'value'):
                     continue
                 a = ET.SubElement(el_out, 'attribute')
-                a.set('name', aname); a.set('value', aval)
+                a.set('name', aname.upper()); a.set('value', aval)
                 a.set('x', _tomm(e.get('x'))); a.set('y', _tomm(e.get('y')))
                 a.set('size', '1.778'); a.set('layer', '27')
                 if rot:

@@ -52,7 +52,7 @@ def _elements(board):
     out = {}
     for e in board.find('elements'):
         out[e.get('name')] = (e.get('package'), _f(e.get('x')), _f(e.get('y')),
-                              e.get('rot') or 'R0')
+                              e.get('rot') or 'R0', e.get('value') or '')
     return out
 
 

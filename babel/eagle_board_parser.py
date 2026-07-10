@@ -54,14 +54,17 @@ def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset(),
     ex, ey = float(e.get('x')), float(e.get('y'))
     for a in e.findall('attribute'):
         aname = a.get('name')
-        if attr_sink is not None and aname not in ('NAME', 'VALUE'):
+        if attr_sink is not None and aname.lower() not in ('name', 'value'):
             # Eagle keeps attribute VALUES on the board element too, and
             # they can exist ONLY there (board-editor edits don't sync back
             # to the .sch part — luminoso ground truth: 75 elements with
             # brd-only attrs). Collected for the project-level merge into
             # the shared instance; the element itself stores only placement
             # overrides, values stay one-home (ir_schema.md attribute model).
-            attr_sink.setdefault(ir_name or e.get('name'), {})[aname] = \
+            # LOWERCASED: the schematic importer's convention for attr
+            # names (Eagle names are case-insensitive, displayed upper) —
+            # mixed case here would seed case-duplicate attrs at the merge.
+            attr_sink.setdefault(ir_name or e.get('name'), {})[aname.lower()] = \
                 a.get('value') or ''
         if a.get('display') == 'off':
             # no placeholder is created (ir_schema.md); suppression of the
