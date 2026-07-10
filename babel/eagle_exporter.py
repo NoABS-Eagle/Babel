@@ -749,7 +749,7 @@ def export(ir_path, output_path=None):
             packages_map[pid] = fp_el
 
     eagle = ET.Element('eagle')
-    eagle.set('version', '7.7.0')
+    eagle.set('version', '9.6.2')   # the dialect our ground truths came from; a 7.7.0 tag made Eagle 9 take its legacy text path and Cyrillic vector text stopped rendering (user ground truth)
     drawing = ET.SubElement(eagle, 'drawing')
 
     settings = ET.SubElement(drawing, 'settings')
@@ -1405,7 +1405,7 @@ def export_schematic(ir_path, output_path=None):
     def _sy(sheet_idx, y_um):
         return _tomm(y_um)
 
-    eagle = ET.Element('eagle', version='7.7.0')
+    eagle = ET.Element('eagle', version='9.6.2')
     drawing = ET.SubElement(eagle, 'drawing')
     settings = ET.SubElement(drawing, 'settings')
     ET.SubElement(settings, 'setting').set('alwaysvectorfont', 'no')

@@ -200,7 +200,7 @@ def export_board(ir_path, output_path=None, layout_name=None):
     stack = _stack(layout)
 
     eagle = ET.Element('eagle')
-    eagle.set('version', '7.7.0')
+    eagle.set('version', '9.6.2')   # the dialect our ground truths came from; a 7.7.0 tag made Eagle 9 take its legacy text path and Cyrillic vector text stopped rendering (user ground truth)
     drawing = ET.SubElement(eagle, 'drawing')
     settings = ET.SubElement(drawing, 'settings')
     ET.SubElement(settings, 'setting').set('alwaysvectorfont', 'no')
