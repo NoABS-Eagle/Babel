@@ -210,18 +210,25 @@ def export_board(ir_path, output_path=None, layout_name=None):
                  ('style', 'lines'), ('multiple', '1'), ('display', 'no'),
                  ('altdistance', '0.01'), ('altunitdist', 'inch'), ('altunit', 'inch')]:
         grid.set(k, v)
-    # copper layer table follows the ACTUAL stack (layerSetup, already the
-    # authority via passthrough): members active+visible, the rest
-    # active="no" — the static table marked all 16 active and Eagle showed
-    # phantom inner layers on every 2/4-layer board (user caught it)
-    layers_root = ET.parse(_LAYERS_FILE).getroot()
-    for l in layers_root:
-        n = int(l.get('number'))
-        if 1 <= n <= 16:
-            in_stack = n in stack
-            l.set('active', 'yes' if in_stack else 'no')
-            l.set('visible', 'yes' if in_stack else 'no')
-    drawing.append(layers_root)
+    # layer table: the SOURCE's own <layers> (visibility selection, user
+    # layer names/colors) travels via the eagle passthrough and comes back
+    # verbatim; only an IR-born project (no passthrough) gets the synthetic
+    # table, with copper activation following the actual stack (the static
+    # table once marked all 16 copper active — phantom inner layers).
+    pt_pre = layout.find("passthrough[@tool='eagle']")
+    src_layers = pt_pre.find('layers') if pt_pre is not None else None
+    if src_layers is not None:
+        import copy as _copy
+        drawing.append(_copy.deepcopy(src_layers))
+    else:
+        layers_root = ET.parse(_LAYERS_FILE).getroot()
+        for l in layers_root:
+            n = int(l.get('number'))
+            if 1 <= n <= 16:
+                in_stack = n in stack
+                l.set('active', 'yes' if in_stack else 'no')
+                l.set('visible', 'yes' if in_stack else 'no')
+        drawing.append(layers_root)
 
     board = ET.SubElement(drawing, 'board')
     plain = ET.SubElement(board, 'plain')

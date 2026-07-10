@@ -332,6 +332,11 @@ def convert_board(brd_path, layout_name='main', name_map=None, known=None,
     # DRC errors. Raw XML as-is; also the board exporter's stack source (the
     # original layerSetup keeps inner-layer numbering stable on round-trip).
     pt_children = [board.find(t) for t in ('designrules', 'autorouter', 'errors')]
+    # the drawing-level <layers> table too: layer VISIBILITY selection and
+    # user-layer definitions (names/colors — e.g. modtest's 50 "dxf") are
+    # tool state Eagle must get back verbatim; the synthesized fallback
+    # table knows neither
+    pt_children.append(root.find('.//drawing/layers'))
     if any(c is not None for c in pt_children):
         pt = ET.SubElement(layout, 'passthrough', tool='eagle')
         for c in pt_children:
