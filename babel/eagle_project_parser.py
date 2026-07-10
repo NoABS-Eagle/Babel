@@ -617,6 +617,35 @@ def _frame_bbox_um(frame_kind, frame_src):
     return x1, y1, x2, y2
 
 
+def _synth_native_frame(frame_el, bbox_um, pool, ctx):
+    """A NATIVE Eagle <frame> in <plain> -> a first-class IR Frame instance
+    (synthesized Frame component + placed instance), the same shape the
+    instance-frame mechanism already produces. Without this the native
+    frame was consumed for tiling only and LOST from the IR canvas — the
+    schematic exporters could no longer split pages (PowerPCB ground truth:
+    sheet 2 native frame, 219 parts declared stray). Mirrors
+    kicad_project_parser's page-frame synthesis: centered FRAME-layer shape,
+    prefix FRAME. One component per distinct size, cached in ctx."""
+    x1, y1, x2, y2 = bbox_um
+    w, h = x2 - x1, y2 - y1
+    comp_name = f'FRAME-{round(w/1000)}X{round(h/1000)}MM'
+    cache = ctx.setdefault('synth_frames', {})
+    if comp_name not in cache:
+        sym_el = ET.Element('symbol', name=comp_name)
+        ET.SubElement(sym_el, 'shape', x='0', y='0', w=str(w), h=str(h),
+                      roundness='0', outline='150', rot='0', layer='FRAME')
+        ctx['symbols_el'].append(sym_el)
+        pool[comp_name] = sym_el
+        comp_el = ET.Element('component', name=comp_name, prefix='FRAME',
+                             symbol=comp_name)
+        ctx['proj_el'].append(comp_el)
+        cache[comp_name] = comp_el
+    ctx['synth_frame_n'] = n = ctx.get('synth_frame_n', 0) + 1
+    return {'component': comp_name, 'library': '', 'designator': f'FRAME${n}',
+            'x': str((x1 + x2) // 2), 'y': str((y1 + y2) // 2),
+            'rot': '0', 'mirror': '0', 'attrs': []}
+
+
 def _collect_tiled_pages(sheet_els, parts, pool, comp_by_name, comps_by_lib, ctx, page_label,
                           on_page=None):
     """N <sheet> elements -> one tiled canvas worth of (instances, nets),
@@ -654,6 +683,10 @@ def _collect_tiled_pages(sheet_els, parts, pool, comp_by_name, comps_by_lib, ctx
         frame_kind, frame_src = _validate_and_collect_frame(
             sheet_el, page_label(idx), parts, comp_by_name, pool)
         x1, y1, x2, y2 = _frame_bbox_um(frame_kind, frame_src)
+        if frame_kind == 'plain':
+            instances.append({**_synth_native_frame(frame_src, (x1, y1, x2, y2),
+                                                    pool, ctx),
+                              'x': str((x1 + x2) // 2 + tile_x_offset)})
 
         port_geom = None
         if on_page is not None:
@@ -755,7 +788,8 @@ def convert_project_full(src, output_path):
                      for (ds_name, tech_name), comp_el in comps.items()}
 
     class_name_by_num = _collect_classes(schematic_el, proj_el)
-    ctx = {'class_name_by_num': class_name_by_num}
+    ctx = {'class_name_by_num': class_name_by_num,
+           'symbols_el': symbols_el, 'proj_el': proj_el}
 
     # Nesting depth check (ir_schema.md "Вложенность запрещена", format-
     # agnostic invariant): a <module>'s own <sheet> must never carry a
