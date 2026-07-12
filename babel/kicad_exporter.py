@@ -5,6 +5,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from babel.ir_util import (parse_layer, symbol_pool, component_gates,
                            resolve_model3d_file, sanitize_filename, arc_mid)
+from babel.kicad_layers import ir_to_kicad
 
 _SYM_VERSION = 20251024   # KiCad 10
 _FP_VERSION  = 20251024
@@ -19,28 +20,9 @@ _PIN_DIR = {
     'sup': 'power_in',
 }
 
-# IR signed layer number (ir_schema.md "Плата (Board IR)") -> KiCad layer
-# name. 125/127 (Eagle tNames/tValues) have no KiCad home -> F.Fab, same
-# place the old 'labels' bucket went. 120 carries ALL cuts (incl. slots) ->
-# Edge.Cuts; 147 PLATING has no KiCad concept -> Dwgs.User so the marker
-# stays VISIBLE as a fab note (Edge.Cuts would turn the marker into a cut).
-_FP_LAYER = {
-    1:    'F.Cu',      -1:   'B.Cu',
-    121:  'F.SilkS',   -121: 'B.SilkS',
-    125:  'F.Fab',     -125: 'B.Fab',
-    127:  'F.Fab',     -127: 'B.Fab',
-    129:  'F.Mask',    -129: 'B.Mask',
-    131:  'F.Paste',   -131: 'B.Paste',
-    139:  'F.CrtYd',   -139: 'B.CrtYd',
-    151:  'F.Fab',     -151: 'B.Fab',
-    120:  'Edge.Cuts',
-    147:  'Dwgs.User',
-    148:  'Dwgs.User',
-}
-
-
 def _fp_kicad_layer(ln):
     """IR footprint layer attribute -> KiCad layer name, or None (drop).
+    Layer projection is the user-editable table in babel/kicad_layers.py.
     Anti layers ('!...') have no KiCad footprint equivalent."""
     try:
         anti, n = parse_layer(ln)
@@ -48,7 +30,7 @@ def _fp_kicad_layer(ln):
         return None
     if anti:
         return None
-    return _FP_LAYER.get(n)
+    return ir_to_kicad(n)
 
 
 def _f(v):
@@ -117,6 +99,15 @@ def _justify(align, flip_v=False):
     return f' (justify {" ".join(kws)})' if kws else ''
 
 
+def _norm_text_angle(rot, align):
+    """KiCad symbol-field text is never upside down: its angle folds to
+    [0, 180) (0/180 -> 0, 90/270 -> 90) and the justify is PRESERVED — only
+    the position rotates. Ground truth: the SAME R symbol placed by KiCad at
+    rot=180 keeps its library justify verbatim (VALUE bottom-right stays
+    'right bottom'); flipping the anchor (horizontal or both) was wrong."""
+    return rot % 180, align
+
+
 def _build_pin_map(fp_el, gate_name=None):
     """pin_name → first_pad_number from <pin-mapping>.
 
@@ -181,7 +172,11 @@ def _sym_geom(sym_el, pin_to_pad):
             rnd  = int(el.get('roundness', 0))
             outline = _mm(el.get('outline', '0'))
             sw   = _f(outline)
-            fill = 'none' if outline else 'background'
+            # outline=0 is a SOLID shape (cap plates, mosfet dots): KiCad
+            # 'outline' fills with the foreground color, matching svg_renderer
+            # (fc=color) and the <polygon> path below. 'background' (pale body
+            # color) was wrong here — it left solid shapes looking unfilled.
+            fill = 'none' if outline else 'outline'
             if rnd == 100:
                 yield (f'      (circle (center {_f(x)} {_f(y)}) (radius {_f(w/2)})\n'
                        f'        (stroke (width {sw}) (type default))\n'
@@ -281,6 +276,20 @@ def export_symbol(comp_el, root, lib_name):
     for a in (attrs_el.findall('attr') if attrs_el is not None else []):
         attrs[a.get('name', '')] = '' if multi else a.get('value', '')
 
+    # Device/technology attributes (manf#, package, digikey#, ...) live on the
+    # FOOTPRINT in IR, not the component — convert_deviceset parks Eagle's
+    # <technology> attributes there (component/footprint two-level split). For
+    # an ATOMIC KiCad symbol the .kicad_sym itself must carry their VALUES, or
+    # every placed instance shows fields the library symbol lacks (KiCad's
+    # "not atomic"). Bake the single footprint's attrs in; a multi-footprint
+    # component can't (its variants carry DIFFERENT values for the same key),
+    # so its placeholders stay blank exactly as before. Component-level attrs
+    # (value/description) win on the rare key clash.
+    if not multi and fps:
+        fp_attrs_el = fps[0].find('attributes')
+        for a in (fp_attrs_el.findall('attr') if fp_attrs_el is not None else []):
+            attrs.setdefault(a.get('name', ''), a.get('value', ''))
+
     datasheet = attrs.pop('datasheet', '')
     value_val = attrs.pop('value', comp_id)
 
@@ -295,11 +304,12 @@ def export_symbol(comp_el, root, lib_name):
         txt = (el.text or '').strip()
         if not txt.startswith('>'):
             continue
-        rot = float(el.get('rot', 0))
+        rot, align = _norm_text_angle(float(el.get('rot', 0)),
+                                      el.get('align', 'bottom-left'))
         info = {
-            'at':    (_mm(el.get('x', 0)), _mm(el.get('y', 0)), rot % 360),
+            'at':    (_mm(el.get('x', 0)), _mm(el.get('y', 0)), rot),
             'size':  _mm(el.get('size', '1270')),
-            'align': el.get('align', 'bottom-left'),
+            'align': align,
             'ratio': int(el.get('ratio', '8')),
         }
         if txt == '>NAME':    name_style  = info

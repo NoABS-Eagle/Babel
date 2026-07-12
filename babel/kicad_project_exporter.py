@@ -45,6 +45,7 @@ from babel.kicad_schematic import _collinear_between
 from babel.kicad_exporter import (
     export as export_library, export_symbol,
     _f, _mm, _q, _justify, _build_pin_map, _eagle_overbar_to_kicad,
+    _norm_text_angle,
 )
 
 _SCH_VERSION = 20260306   # ground truth: real KiCad 10.0 output (user-saved
@@ -178,12 +179,26 @@ def _placeholder_styles(sym_el):
 
 def _inst_point(lx_um, ly_um, inst_el):
     """Symbol-local point (µm, Y-up) -> absolute IR canvas point (µm, Y-up)
-    under the instance transform — mirror-then-rotate, the same canonical
-    order svg_renderer/_abs_pin_pos_mm use."""
+    for FIELD/placeholder placement under the instance transform.
+
+    Mirror negates local X (mirror-Y convention, matching the `(mirror y)` we
+    emit) AND reverses the rotation sense. That theta flip is what makes this
+    DIVERGE, deliberately, from the body/pin transform (svg_renderer._inst_point
+    / _abs_pin_pos_mm use plain mirror-then-rotate-CCW): KiCad applies a
+    DIFFERENT rule to a mirrored symbol's field anchors than to its body —
+    their own field-mirror vs body-mirror inconsistency. Without the flip the
+    fields of a mirrored, rotated symbol land 180° off (Bug 1). Ground-truthed
+    against six hand-placed IRLML9301 instances in real KiCad 10 (rot 0/90/180/
+    270 × mirror none/x/y): the negate-theta form reproduces all six field
+    offsets exactly; the old CCW form matched only the unmirrored + mirror@rot0
+    cases and inverted mirror@rot90/270. Pin connectivity is untouched (KiCad
+    recomputes pins itself from `(mirror y)`+angle — this function never moves
+    them)."""
     x, y = lx_um, ly_um
+    theta = math.radians(float(inst_el.get('rot', '0')))
     if inst_el.get('mirror') == '1':
         x = -x
-    theta = math.radians(float(inst_el.get('rot', '0')))
+        theta = -theta          # mirror reverses rotation handedness for fields
     xr = x * math.cos(theta) - y * math.sin(theta)
     yr = x * math.sin(theta) + y * math.cos(theta)
     return float(inst_el.get('x')) + xr, float(inst_el.get('y')) + yr
@@ -239,12 +254,21 @@ def _page_for_point(pages, x_um, y_um, label):
 
 def _emit_property(lines, name, value, ax, ay, rot, size_mm, align, hide,
                    indent='\t\t'):
+    # KiCad never renders property text upside down: its angle is only 0 or
+    # 90. Fold 180/270 back and mirror the anchor so the text lands the same
+    # place, right-side up — else a rotated symbol's Reference/Value inverts.
+    rot, align = _norm_text_angle(rot, align)
     j = _justify(align)
+    # Emit an explicit stroke thickness (ratio 8 = the library-field default,
+    # same as export_symbol). Without it KiCad turns on auto-thickness (~15%
+    # of size), rendering the instance's text noticeably bolder than the
+    # library symbol it came from.
+    th = size_mm * 0.08
     lines.append(f'{indent}(property {_q(name)} {_q(value)}')
-    lines.append(f'{indent}\t(at {_f(ax)} {_f(ay)} {_f(rot % 360)})')
+    lines.append(f'{indent}\t(at {_f(ax)} {_f(ay)} {_f(rot)})')
     lines.append(f'{indent}\t(effects')
-    lines.append(f'{indent}\t\t(font (size {_f(size_mm)} {_f(size_mm)}))'
-                 + (j if j.strip() else ''))
+    lines.append(f'{indent}\t\t(font (size {_f(size_mm)} {_f(size_mm)}) '
+                 f'(thickness {_f(th)}))' + (j if j.strip() else ''))
     if hide:
         lines.append(f'{indent}\t\t(hide yes)')
     lines.append(f'{indent}\t)')
@@ -252,12 +276,22 @@ def _emit_property(lines, name, value, ax, ay, rot, size_mm, align, hide,
 
 
 def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
-                          ns, unit_n, gate_sym_name):
+                          ns, unit_n, gate_sym_name, sym_uuid_sink=None):
     """One IR component <instance> -> one placed `(symbol ...)` block."""
     designator = inst_el.get('name')
     comp_name = comp_el.get('name')
     lib_id = f'{lib_name}:{comp_name}'
     page.lib_ids.add(comp_name)
+
+    # Power/supply symbols (a `sup`-direction pin — the same test
+    # export_symbol uses to mark the lib symbol `(power)`) carry no footprint
+    # and must be EXCLUDED from the board: KiCad excludes any reference
+    # starting with '#'. Prefix it so "Update PCB from Schematic" stops
+    # demanding a footprint for +P1/GND rails (the reference is hidden anyway;
+    # a supply symbol shows its Value = the net name).
+    is_supply = bool(_sup_pin_names(comp_el, pool))
+    ref = ('#' + designator if is_supply and not designator.startswith('#')
+           else designator)
 
     kx, ky = page.pt(inst_el.get('x'), inst_el.get('y'))
     rot = float(inst_el.get('rot', '0')) % 360
@@ -294,10 +328,20 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
             lx, ly, lrot, lsize, lalign = styles[key]
             axu, ayu = _inst_point(lx, ly, inst_el)
             ax, ay = page.pt(axu, ayu)
-            return ax, ay, (lrot + rot) % 360, lsize / 1000, lalign
+            # Field ANGLE is the library placeholder's own angle, NOT
+            # lrot + symbol rotation: KiCad does not spin field text with the
+            # symbol — it keeps the text readable (library angle) and only
+            # moves its position. Ground truth: a C symbol placed by KiCad at
+            # rot=90 keeps Reference/Value at angle 0, position rotated.
+            return ax, ay, lrot, lsize / 1000, lalign
         return kx, ky + default_dy_mm, 0, 1.27, 'center'
 
     u = _quuid(ns, 'sym', page.name, designator, unit_n)
+    # The board footprint links to the PRIMARY unit's symbol (unit 1); record
+    # its uuid so the board exporter can emit the matching (path ...) — the
+    # sheet-schematic link that makes "Update PCB from Schematic" a no-op.
+    if unit_n == 1 and sym_uuid_sink is not None:
+        sym_uuid_sink[designator] = u
     lines = ['\t(symbol',
              f'\t\t(lib_id {_q(lib_id)})',
              f'\t\t(at {_f(kx)} {_f(ky)} {_f(rot)})']
@@ -314,10 +358,14 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
               f'\t\t(uuid "{u}")']
 
     ax, ay, arot, asize, aalign = _abs_style('NAME', -2.54)
-    _emit_property(lines, 'Reference', designator, ax, ay, arot, asize, aalign,
-                   hide=designator.startswith('#'))
+    _emit_property(lines, 'Reference', ref, ax, ay, arot, asize, aalign,
+                   hide=ref.startswith('#'))
     ax, ay, arot, asize, aalign = _abs_style('VALUE', 2.54)
-    _emit_property(lines, 'Value', value, ax, ay, arot, asize, aalign, hide=False)
+    # Show Value only if the symbol actually has a >VALUE placeholder — an IC
+    # with no value (and no >VALUE, e.g. it displays >MANF# instead) must NOT
+    # sprout a Value field. Matches Eagle: no placeholder = not displayed.
+    _emit_property(lines, 'Value', value, ax, ay, arot, asize, aalign,
+                   hide='VALUE' not in styles)
     _emit_property(lines, 'Footprint', fp_ref, kx, ky, 0, 1.27, 'center', hide=True)
     _emit_property(lines, 'Datasheet', attrs.pop('datasheet', ''), kx, ky, 0,
                    1.27, 'center', hide=True)
@@ -333,7 +381,7 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
     lines += ['\t\t(instances',
               f'\t\t\t(project {_q(proj_name)}',
               f'\t\t\t\t(path "/{page.uuid}"',
-              f'\t\t\t\t\t(reference {_q(designator)})',
+              f'\t\t\t\t\t(reference {_q(ref)})',
               f'\t\t\t\t\t(unit {unit_n})',
               '\t\t\t\t)',
               '\t\t\t)',
@@ -856,7 +904,7 @@ def _pages_from_frames(canvas_el, frame_insts, comp_by_name, pool, name_fn, ns):
 
 
 def _emit_canvas(pages, canvas_el, part_insts, comp_by_name, pool, lib_name,
-                 proj_name, ns, hier_ports=None):
+                 proj_name, ns, hier_ports=None, sym_uuid_sink=None):
     """Everything except sheets: placed symbols, nets, deco, notes."""
     part_page = {}
     comp_by_desig = {}
@@ -879,7 +927,8 @@ def _emit_canvas(pages, canvas_el, part_insts, comp_by_name, pool, lib_name,
             unit_n = letters.index(gate) + 1
             gate_sym = gates[letters.index(gate)][1]
         _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name,
-                              proj_name, ns, unit_n, gate_sym)
+                              proj_name, ns, unit_n, gate_sym,
+                              sym_uuid_sink=sym_uuid_sink)
 
     for el in canvas_el:
         if el.tag in ('line', 'arc', 'shape', 'text', 'note'):
@@ -963,15 +1012,23 @@ def _write_page(page, out_dir, comp_by_name, ir_root, lib_name,
 
 
 def _write_kicad_pro(out_dir, proj_name, ir_root, top_pages, class_patterns):
+    # Schematic wire/bus default for every net class. UNITS TRAP (ground
+    # truth freq/multigate .kicad_pro): net-class SCHEMATIC widths are in
+    # MILS (wire_width 6, bus_width 12) while the PCB widths in the same JSON
+    # are in mm (track_width 0.2). A class without wire_width renders wires —
+    # and the junction dots sized from them — at zero width, i.e. invisible.
+    _WIRE_MIL, _BUS_MIL = 6, 12
     classes = [{
         'name': 'Default', 'priority': 2147483647,
         'clearance': 0.2, 'track_width': 0.2,
         'via_diameter': 0.6, 'via_drill': 0.3,
+        'wire_width': _WIRE_MIL, 'bus_width': _BUS_MIL,
     }]
     ir_classes = ir_root.find('classes')
     if ir_classes is not None:
         for i, cl in enumerate(ir_classes.findall('class')):
-            c = {'name': cl.get('name'), 'priority': i}
+            c = {'name': cl.get('name'), 'priority': i,
+                 'wire_width': _WIRE_MIL, 'bus_width': _BUS_MIL}
             for src, dst in (('width', 'track_width'), ('drill', 'via_drill'),
                               ('clearance', 'clearance')):
                 if cl.get(src) is not None:
@@ -985,7 +1042,50 @@ def _write_kicad_pro(out_dir, proj_name, ir_root, top_pages, class_patterns):
             'classes': classes,
             'netclass_patterns': class_patterns,
         },
+        # WITHOUT a schematic.drawing block KiCad renders wires and junction
+        # dots at zero size (invisible), regardless of the net-class
+        # wire_width. default_line_thickness (6 mil) is what actually sizes
+        # schematic wires; junction_size_choice=3 is KiCad's normal dot size.
+        # Ground truth: multigate.kicad_pro. KiCad fills the rest of the
+        # schematic section with defaults on open.
+        'schematic': {
+            'drawing': {
+                'dashed_lines_dash_length_ratio': 12.0,
+                'dashed_lines_gap_length_ratio': 3.0,
+                'default_line_thickness': 6.0,
+                'default_text_size': 50.0,
+                'field_names': [],
+                'intersheets_ref_own_page': False,
+                'intersheets_ref_prefix': '',
+                'intersheets_ref_short': False,
+                'intersheets_ref_show': False,
+                'intersheets_ref_suffix': '',
+                'junction_size_choice': 3,
+                'label_size_ratio': 0.375,
+                'overbar_offset_ratio': 1.23,
+                'pin_symbol_size': 25.0,
+                'text_offset_ratio': 0.15,
+            },
+        },
     }
+
+    # The six-number DRC core (ir_schema.md "DRC-ядро") -> KiCad
+    # design_settings.rules (key names ground truth: Pocket-Lab .kicad_pro)
+    rules_el = ir_root.find('layout/rules')
+    if rules_el is not None:
+        mm = lambda a: float(rules_el.get(a)) / 1000
+        rules = {}
+        for attr, key in (('clearance', 'min_clearance'),
+                          ('edge_clearance', 'min_copper_edge_clearance'),
+                          ('min_width', 'min_track_width'),
+                          ('min_drill', 'min_through_hole_diameter'),
+                          ('min_annular', 'min_via_annular_width'),
+                          ('min_drill_web', 'min_hole_to_hole')):
+            if rules_el.get(attr):
+                rules[key] = mm(attr)
+        if rules_el.get('min_drill') and rules_el.get('min_annular'):
+            rules['min_via_diameter'] = mm('min_drill') + 2 * mm('min_annular')
+        pro['board'] = {'design_settings': {'rules': rules}}
     if len(top_pages) > 1:
         pro['schematic'] = {'top_level_sheets': [
             {'filename': p.fname, 'name': p.name, 'uuid': p.uuid}
@@ -1092,10 +1192,12 @@ def export_project(ir_path, output_dir):
         _emit_nets(m_pages, mod_el, part_page, comp_by_desig, pool, ns,
                    hier_ports=hier_ports)
 
-    # --- Top canvas content.
+    # --- Top canvas content. sym_uuids collects primary-unit symbol uuids
+    # so the board footprints can carry the matching (path ...) link.
+    sym_uuids = {}
     part_page, comp_by_desig = _emit_canvas(
         top_pages, schem_el, part_insts, comp_by_name, pool, lib_name,
-        proj_name, ns)
+        proj_name, ns, sym_uuid_sink=sym_uuids)
 
     # Module instances: the sheet-pin position IS the port's connection
     # point on the parent (the IR wires already end there), so sheets carry
@@ -1146,6 +1248,18 @@ def export_project(ir_path, output_dir):
         _write_page(mpage, out_dir, comp_by_name, ir_root, lib_name,
                     is_module=True)
     _write_kicad_pro(out_dir, proj_name, ir_root, top_pages, class_patterns)
+
+    # --- Board: KiCad's pcb editor only opens boards through a project,
+    # so the layout (when present) is written as {proj}.kicad_pcb here.
+    # sym_paths ties each footprint to its schematic symbol (flat design:
+    # a single-segment /uuid path — ground truth). Module-instance parts
+    # (INST:REFDES, inside sub-sheets) would need the sheet-uuid prefix and
+    # are not linked yet (logged).
+    if ir_root.find('layout') is not None:
+        from babel.kicad_board_exporter import export_board_kicad
+        sym_paths = {d: f'/{u}' for d, u in sym_uuids.items()}
+        export_board_kicad(ir_path, out_dir / f'{proj_name}.kicad_pcb',
+                           sym_paths=sym_paths, lib_nickname=lib_name)
 
     pro_path = out_dir / f'{proj_name}.kicad_pro'
     print(f'Written: {pro_path}  ({len(top_pages)} page(s), '
