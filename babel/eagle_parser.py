@@ -42,10 +42,12 @@ PKG_LAYER_MAP = {
     # fall through to +100 as a plain user layer. IR side: CHANNEL_DRILLS.
     46: '120',                 # Milling: cut, merged into 120 + PLATING copy below
     48: '148',                 # Document (standalone)
-    156: '147',                # PLATING marker (canonical Eagle projection —
+    156: '146',                # PLATING marker (canonical Eagle projection —
                                # Eagle has no native concept; 156 adopted from
                                # the user's real-board convention, must map
-                               # back or 147 wouldn't round-trip)
+                               # back or 146 wouldn't round-trip). 146 = +100
+                               # image of Milling 46 (PLATING marks plated
+                               # milled edges); freed 147 for Measures 47.
     51: '151',  52: '-151',    # tDocu / bDocu
 }
 
@@ -63,8 +65,8 @@ _PKG_LAYER_JUNK = {17, 18, 19, 23, 24, 33, 34, 35, 36, 37, 38, 43}
 # Eagle Milling (46) means in practice "cut the fab treats as plated" (the
 # very reason it is DRC-exempt there: copper must stay flush for plating to
 # grow into). IR states that bit explicitly: the object becomes a cut on 120
-# AND a marker copy on 147 PLATING (ir_schema.md "Резы и металлизация").
-_PKG_LAYER_COPY = {46: '147'}
+# AND a marker copy on 146 PLATING (ir_schema.md "Резы и металлизация").
+_PKG_LAYER_COPY = {46: '146'}
 
 
 def _pkg_layer(eagle_n):
@@ -322,7 +324,7 @@ def convert_geometry_mapped(child, parent):
     """convert_geometry with the layer mapping applied from the child's own
     Eagle layer number — the entry point for package/board drawing children.
     Also the single home of the _PKG_LAYER_COPY rule: Eagle Milling (46)
-    yields TWO IR objects, the cut on 120 and its marker copy on 147 PLATING."""
+    yields TWO IR objects, the cut on 120 and its marker copy on 146 PLATING."""
     raw = child.get('layer')
     eagle_n = int(raw) if raw else None
     ir_layer = _pkg_layer(eagle_n) if eagle_n is not None else None
@@ -415,6 +417,13 @@ def convert_geometry(child, parent, ir_layer):
         el = ET.SubElement(parent, 'text')
         if mirror:
             el.set('mirror', '1')     # reading-direction flip (bottom-side texts)
+            # Eagle MR{α} = rotate α, THEN mirror; IR text semantics is
+            # mirror-then-rotate (svg_renderer transform order, KiCad
+            # mirrored-text encoding, place_ir_element — all agree) — the
+            # equivalent IR angle is −α. Same convention bug family as
+            # element MR rotation (tolmach ground truth: bottom 90° texts
+            # sat 180° off in a live KiCad render).
+            rot = (-rot) % 360
         el.set('layer', ir_layer)
         el.set('x', _um(child.get('x'))); el.set('y', _um(child.get('y')))
         el.set('size', _um(child.get('size')))

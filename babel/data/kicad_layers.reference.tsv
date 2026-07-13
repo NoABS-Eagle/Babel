@@ -1,0 +1,46 @@
+# KiCad <-> IR layer projection — REFERENCE copy (pristine example + fallback).
+#
+# This file is the shipped reference. The code operates on the WORKING copy
+# (kicad_layers.tsv); if that is missing or unparseable, it falls back to
+# THIS file. Do not edit the reference — edit the working copy.
+#
+# The layer mapping is a property of the KiCad importer/exporter, not of the
+# IR, which is why it lives in data you can edit rather than in code.
+#
+# Columns (whitespace-separated):   IR   KiCad
+#   IR    : IR layer number. When the KiCad name starts with "F.", the layer
+#           is PAIRED and the code derives the bottom side automatically
+#           (-IR <-> "B."+name). Standalone names (Edge.Cuts, *.User) have
+#           no side.
+#   KiCad : KiCad layer name (must exist in the board's (layers ...) table).
+#
+# ORDER MATTERS. Forward (IR->KiCad) uses every row. Reverse (KiCad->IR)
+# uses the FIRST row that names a given KiCad layer, so list the canonical
+# layer first and any collapsing aliases after it (e.g. 151 F.Fab is the
+# real fab layer; 125/127 also render onto F.Fab but come back as 151).
+#
+# Any IR/KiCad layer NOT listed here is DROPPED on conversion (logged, never
+# silent). To carry an extra layer: change its layer in the source, or add a
+# row here.
+
+# --- copper (inner layers In1.Cu.. are numbered from the stack, not here) ---
+1     F.Cu
+
+# --- silk / mask / paste / courtyard / fab ---
+121   F.SilkS
+129   F.Mask
+131   F.Paste
+139   F.CrtYd
+151   F.Fab
+125   F.Fab               # tNames  -> fab graphic (reverse F.Fab -> 151 above)
+127   F.Fab               # tValues -> fab graphic
+
+# --- board outline ---
+120   Edge.Cuts
+
+# --- side-less user / documentation layers (Eagle 47-50, IR 147-150) ---
+147   Eco1.User           # Eagle 47 Measures
+148   Cmts.User           # Eagle 48 Document
+149   Eco2.User           # Eagle 49 Reference
+150   Dwgs.User           # Eagle 50 dxf (canonical reverse for Dwgs.User)
+146   Dwgs.User           # PLATING marker: no KiCad concept, a visible note

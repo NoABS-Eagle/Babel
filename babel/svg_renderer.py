@@ -57,7 +57,7 @@ _LAYER_COLORS = {
     -139: _E[4],
     120:  _E[11],  # Dimension — cyan; ALL cuts (outline, slots). NOT white/
                    # yellow: must be tell-apart-able from silk 121 at 1px
-    147:  _E[13],  # PLATING marker (Eagle projection: layer 156)
+    146:  _E[13],  # PLATING marker (Eagle projection: layer 156)
     148:  _E[7],   # Document notes (dimmed like fab)
     151:  _E[7],   # fab (Eagle 51, dimmed below)
     -151: _E[1],
@@ -73,7 +73,7 @@ _DIM_LAYERS = {148, 151, -151, 129, -129, 131, -131}
 _FAB_OPACITY = '0.45'
 
 # Paint order, bottom-most first; pads (layer None) are painted with copper.
-_LAYER_Z = [139, -139, 151, -151, 148, 120, 147, 129, -129, 131, -131,
+_LAYER_Z = [139, -139, 151, -151, 148, 120, 146, 129, -129, 131, -131,
             -121, -1, None, 1, 121, 125, -125, 127, -127]
 
 # Symbol layers

@@ -19,6 +19,7 @@ import xml.etree.ElementTree as ET
 from babel import import_log
 from babel.eagle_parser import (convert_geometry, convert_geometry_mapped,
                                 convert_package, _pkg_layer, _um, fmt, parse_rot)
+from babel.ir_util import format_stack
 
 
 def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset(),
@@ -43,10 +44,17 @@ def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset(),
     el.set('name', ir_name or e.get('name'))
     el.set('x', _um(e.get('x'))); el.set('y', _um(e.get('y')))
     rot, mirror = parse_rot(e.get('rot'))
+    if mirror:
+        # Eagle MR{α} = rotate α, THEN mirror; IR <element> semantics is
+        # mirror-then-rotate (ir_util.place_ir_element) — the equivalent IR
+        # angle is −α. Proven on tolmach ground truth: bottom connectors'
+        # pads land on their track ends only with the negated angle (the
+        # round-trip could never catch this — the exporter inverts
+        # symmetrically; a live KiCad render of the export exposed it).
+        rot = (-rot) % 360
+        el.set('side', 'bottom')
     if rot:
         el.set('rot', fmt(rot))
-    if mirror:
-        el.set('side', 'bottom')
 
     smashed = e.get('smashed') == 'yes'
     shown = set()
@@ -77,6 +85,10 @@ def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset(),
         # attribute x/y/rot as ABSOLUTE board values, like KiCad pad angles)
         dx, dy = float(a.get('x', ex)) - ex, float(a.get('y', ey)) - ey
         arot, amirror = parse_rot(a.get('rot'))
+        if amirror:
+            # same Eagle MR{α} -> IR −α as everywhere (rotate-then-mirror
+            # vs IR mirror-then-rotate)
+            arot = (-arot) % 360
         if amirror != mirror:
             # reading-direction flip relative to the element's own side
             t.set('mirror', '1')
@@ -127,6 +139,103 @@ def _parse_layer_setup(board, brd_path):
     if not stack:
         raise ValueError(f'{brd_path}: unparseable layerSetup {setup!r}')
     return stack
+
+
+# Eagle designrules dimension tokens ('0.031mm', '5mil'); bare numbers are mm.
+_DR_UNIT_UM = {'mm': 1000.0, 'mic': 1.0, 'mil': 25.4, 'inch': 25400.0}
+
+
+def _dr_um(tok):
+    m = re.fullmatch(r'([0-9.]+)\s*(mm|mic|mil|inch)?', tok.strip())
+    if not m:
+        raise ValueError(f'designrules dimension {tok!r} unparseable')
+    return round(float(m.group(1)) * _DR_UNIT_UM[m.group(2) or 'mm'])
+
+
+_CLEARANCE_PARAMS = ('mdWireWire', 'mdWirePad', 'mdWireVia', 'mdPadPad',
+                     'mdPadVia', 'mdViaVia')
+# The six-number DRC core (ir_schema.md "DRC-ядро") <- Eagle designrules
+_RULE_PARAMS = {'edge_clearance': 'mdCopperDimension', 'min_width': 'msWidth',
+                'min_drill': 'msDrill', 'min_annular': 'rlMinViaOuter',
+                'min_drill_web': 'mdDrill'}
+
+
+def _dr_params(board):
+    dr = board.find('designrules')
+    return {p.get('name'): p.get('value', '')
+            for p in (dr.findall('param') if dr is not None else ())}
+
+
+def _rules_el(layout, board, layout_name):
+    params = _dr_params(board)
+    if not params:
+        return
+    rules = ET.Element('rules')
+    cl = {n: _dr_um(params[n]) for n in _CLEARANCE_PARAMS if n in params}
+    if cl:
+        if len(set(cl.values())) > 1:
+            # one IR clearance; the fab-safe merge is the MAXIMUM
+            import_log.log(layout_name, 'rules',
+                           'CLEARANCE merged as max of differing Eagle pairs:',
+                           ' '.join(f'{k}={v}' for k, v in sorted(cl.items())))
+        rules.set('clearance', str(max(cl.values())))
+    for attr, name in _RULE_PARAMS.items():
+        if name in params:
+            rules.set(attr, str(_dr_um(params[name])))
+    if rules.attrib:
+        layout.insert(0, rules)
+
+
+def bake_restring(fp_el, board):
+    """Make pad/via diameters EXPLICIT (ir_schema.md "DRC-ядро": auto sizes
+    do not exist in IR) — Eagle stores the annular ring lazily as the
+    designrules restring formula: ring = clamp(drill * rv, rlMin, rlMax);
+    pads use the Top parameters, vias the Outer ones."""
+    params = _dr_params(board)
+
+    def ring(drill, kind):
+        rv = float(params.get(f'rv{kind}', '0.25'))
+        lo = _dr_um(params.get(f'rlMin{kind}', '10mil'))
+        hi = _dr_um(params.get(f'rlMax{kind}', '20mil'))
+        return min(max(round(drill * rv), lo), hi)
+
+    baked = 0
+    for el in fp_el.iter():
+        if el.tag == 'pad' and not el.get('diameter'):
+            drill = int(el.get('drill', '1000'))
+            el.set('diameter', str(drill + 2 * ring(drill, 'PadTop')))
+            baked += 1
+        elif el.tag == 'via' and not el.get('diameter'):
+            drill = int(el.get('drill', '300'))
+            el.set('diameter', str(drill + 2 * ring(drill, 'ViaOuter')))
+            baked += 1
+    return baked
+
+
+def _stack_formula(board, stack):
+    """Eagle designrules mtCopper/mtIsolate -> IR stack formula
+    (ir_schema.md "Формула стека"). Both params are indexed by Eagle layer
+    NUMBER, not stack position (ground truth maximus.brd, stack 1 5 9 16):
+    mtCopper[n] = copper thickness of layer n; mtIsolate[n] = the WHOLE
+    dielectric gap below layer n down to the next used layer (cells of
+    unused layers are stale defaults, ignored). Missing params -> the
+    canonical defaults (35 µm copper, 1530 µm dielectric)."""
+    mt = {}
+    dr = board.find('designrules')
+    if dr is not None:
+        for p in dr.findall('param'):
+            if p.get('name') in ('mtCopper', 'mtIsolate'):
+                mt[p.get('name')] = p.get('value', '').split()
+
+    def cell(name, eagle_n, default_um):
+        cells = mt.get(name, ())
+        return _dr_um(cells[eagle_n - 1]) if eagle_n - 1 < len(cells) \
+            else default_um
+
+    coppers = [cell('mtCopper', n, 35) for n in stack]
+    dielectrics = [(cell('mtIsolate', n, 1530), None, None)
+                   for n in stack[:-1]]
+    return format_stack(coppers, dielectrics)
 
 
 def _copper_map(stack):
@@ -269,7 +378,17 @@ def convert_board(brd_path, layout_name='main', name_map=None, known=None,
     copper_map = _copper_map(stack)
 
     layout = ET.Element('layout', name=layout_name)
-    layout.set('copper', str(len(stack)))
+    layout.set('stack', _stack_formula(board, stack))
+    _rules_el(layout, board, layout_name)
+
+    # Board-level global attributes -> layout <attr> (ir_schema.md: global
+    # attrs of THIS canvas-document). Tool-specific bags (the user's NOABS_*
+    # 3D-generator settings) ride verbatim — carried, never interpreted.
+    board_attrs = board.find('attributes')
+    for a in (board_attrs if board_attrs is not None else ()):
+        if a.get('name'):
+            ET.SubElement(layout, 'attr', name=a.get('name'),
+                          value=a.get('value', ''))
 
     plain = board.find('plain')
     if plain is not None:

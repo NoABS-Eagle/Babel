@@ -1088,6 +1088,18 @@ def convert_project_full(src, output_path):
                 f'{", ".join(unresolved[:10])} — REFDES identity broken')
         proj_el.append(layout_el)
 
+        # Auto sizes do not exist in IR (ir_schema.md "DRC-ядро"): resolve
+        # Eagle's lazy restring into explicit pad/via diameters everywhere —
+        # project footprints, module canvases, the layout's vias — using
+        # THIS board's designrules.
+        from babel.eagle_board_parser import bake_restring
+        board_el = ET.parse(brd_path).getroot().find('.//board')
+        baked = bake_restring(proj_el, board_el)
+        if baked:
+            import_log.log('main', 'restring',
+                           f'{baked} auto pad/via diameter(s) baked from',
+                           'designrules restring (auto sizes do not exist in IR)')
+
     tree_str = ET.tostring(proj_el, encoding='unicode')
     from xml.dom import minidom
     xml_str = minidom.parseString(tree_str).toprettyxml(indent='  ')

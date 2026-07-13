@@ -40,7 +40,7 @@ from pathlib import Path
 
 from babel import import_log
 from babel.ir_util import (symbol_pool, component_gates, sanitize_filename,
-                            rotate_port_side, arc_mid)
+                            rotate_port_side, arc_mid, instance_designator)
 from babel.kicad_schematic import _collinear_between
 from babel.kicad_exporter import (
     export as export_library, export_symbol,
@@ -276,8 +276,17 @@ def _emit_property(lines, name, value, ax, ay, rot, size_mm, align, hide,
 
 
 def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
-                          ns, unit_n, gate_sym_name, sym_uuid_sink=None):
-    """One IR component <instance> -> one placed `(symbol ...)` block."""
+                          ns, unit_n, gate_sym_name, sym_uuid_sink=None,
+                          module_placements=None):
+    """One IR component <instance> -> one placed `(symbol ...)` block.
+
+    `module_placements` (module subsheet symbols only): a list of
+    (parent_page_uuid, minst_name, offset) — one per place the owning module
+    is instantiated. It turns the single canonical `(instances)` path into ONE
+    path PER instance, each `/{parent}/{sheet}` (ground truth: multichannel's
+    channel_strip, a subsheet instantiated 4x carries 4 paths) with that
+    instance's real designator (instance_designator: numeric offset flatten or
+    INST:REFDES colon composite). None/empty → the flat single-path form."""
     designator = inst_el.get('name')
     comp_name = comp_el.get('name')
     lib_id = f'{lib_name}:{comp_name}'
@@ -379,12 +388,23 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
     # because real KiCad always writes what it has).
 
     lines += ['\t\t(instances',
-              f'\t\t\t(project {_q(proj_name)}',
-              f'\t\t\t\t(path "/{page.uuid}"',
-              f'\t\t\t\t\t(reference {_q(ref)})',
-              f'\t\t\t\t\t(unit {unit_n})',
-              '\t\t\t\t)',
-              '\t\t\t)',
+              f'\t\t\t(project {_q(proj_name)}']
+    if module_placements:
+        for parent_uuid, minst_name, offset in module_placements:
+            sheet_uuid = _quuid(ns, 'sheet', minst_name)
+            per = instance_designator(designator, minst_name, offset)
+            if is_supply and not per.startswith('#'):
+                per = '#' + per
+            lines += [f'\t\t\t\t(path "/{parent_uuid}/{sheet_uuid}"',
+                      f'\t\t\t\t\t(reference {_q(per)})',
+                      f'\t\t\t\t\t(unit {unit_n})',
+                      '\t\t\t\t)']
+    else:
+        lines += [f'\t\t\t\t(path "/{page.uuid}"',
+                  f'\t\t\t\t\t(reference {_q(ref)})',
+                  f'\t\t\t\t\t(unit {unit_n})',
+                  '\t\t\t\t)']
+    lines += ['\t\t\t)',
               '\t\t)',
               '\t)']
     page.body.append('\n'.join(lines))
@@ -904,8 +924,12 @@ def _pages_from_frames(canvas_el, frame_insts, comp_by_name, pool, name_fn, ns):
 
 
 def _emit_canvas(pages, canvas_el, part_insts, comp_by_name, pool, lib_name,
-                 proj_name, ns, hier_ports=None, sym_uuid_sink=None):
-    """Everything except sheets: placed symbols, nets, deco, notes."""
+                 proj_name, ns, hier_ports=None, sym_uuid_sink=None,
+                 module_placements=None):
+    """Everything except sheets: placed symbols, nets, deco, notes.
+
+    `module_placements` (module canvas only) is forwarded to every symbol so
+    each carries one `(instances)` path per module instantiation."""
     part_page = {}
     comp_by_desig = {}
     for inst_el in part_insts:
@@ -928,7 +952,8 @@ def _emit_canvas(pages, canvas_el, part_insts, comp_by_name, pool, lib_name,
             gate_sym = gates[letters.index(gate)][1]
         _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name,
                               proj_name, ns, unit_n, gate_sym,
-                              sym_uuid_sink=sym_uuid_sink)
+                              sym_uuid_sink=sym_uuid_sink,
+                              module_placements=module_placements)
 
     for el in canvas_el:
         if el.tag in ('line', 'arc', 'shape', 'text', 'note'):
@@ -1157,6 +1182,29 @@ def export_project(ir_path, output_dir):
     for i, p in enumerate(top_pages):
         p.page_num = i + 1
 
+    # --- Pre-pass: place every module instance on its parent page BEFORE the
+    # subsheet symbols are emitted, so each symbol can carry one (instances)
+    # path per instantiation (parent page uuid + this instance's sheet uuid +
+    # its real designator). Placement/validation only touches top_pages, not
+    # the module pages built below — no ordering cycle.
+    modinst_table = {}   # stem -> [(parent_page_uuid, minst_name, offset), ...]
+    modinst_page = {}    # minst_name -> parent _Page (reused by the sheet loop)
+    for inst_el in module_insts:
+        stem = inst_el.get('module')
+        if stem not in {m.get('name') for m in module_els}:
+            raise ValueError(f'{inst_el.get("name")}: module "{stem}" not '
+                              f'defined in this IR.')
+        if round(float(inst_el.get('rot', '0'))) % 90:
+            raise ValueError(f'{inst_el.get("name")}: module instance rot='
+                              f'{inst_el.get("rot")} is not a multiple of 90 '
+                              f'— KiCad sheets only support axis-aligned '
+                              f'rotation.')
+        page = _page_for_point(top_pages, inst_el.get('x'), inst_el.get('y'),
+                               inst_el.get('name'))
+        modinst_page[inst_el.get('name')] = page
+        modinst_table.setdefault(stem, []).append(
+            (page.uuid, inst_el.get('name'), inst_el.get('offset')))
+
     # --- Module pages (one file per module definition).
     mod_page_by_stem = {}
     mod_el_by_stem = {}
@@ -1188,7 +1236,8 @@ def export_project(ir_path, output_dir):
                       for p in mod_el.findall('port')}
         part_page, comp_by_desig = _emit_canvas(
             m_pages, mod_el, m_parts, comp_by_name, pool, lib_name,
-            proj_name, ns, hier_ports=hier_ports)
+            proj_name, ns, hier_ports=hier_ports,
+            module_placements=modinst_table.get(stem, []))
         _emit_nets(m_pages, mod_el, part_page, comp_by_desig, pool, ns,
                    hier_ports=hier_ports)
 
@@ -1201,23 +1250,15 @@ def export_project(ir_path, output_dir):
 
     # Module instances: the sheet-pin position IS the port's connection
     # point on the parent (the IR wires already end there), so sheets carry
-    # connectivity purely by geometry — same as component pins.
+    # connectivity purely by geometry — same as component pins. Placement and
+    # module-exists/rot validation already ran in the pre-pass above; reuse
+    # the page it chose (modinst_page) so a point is resolved exactly once.
     for inst_el in module_insts:
         stem = inst_el.get('module')
-        mod_el = mod_el_by_stem.get(stem)
-        if mod_el is None:
-            raise ValueError(f'{inst_el.get("name")}: module "{stem}" not '
-                              f'defined in this IR.')
-        if round(float(inst_el.get('rot', '0'))) % 90:
-            raise ValueError(f'{inst_el.get("name")}: module instance rot='
-                              f'{inst_el.get("rot")} is not a multiple of 90 '
-                              f'— KiCad sheets only support axis-aligned '
-                              f'rotation.')
-        page = _page_for_point(top_pages, inst_el.get('x'), inst_el.get('y'),
-                               inst_el.get('name'))
+        page = modinst_page[inst_el.get('name')]
         part_page[inst_el.get('name')] = page
-        _emit_sheet(page, inst_el, mod_el, mod_page_by_stem[stem],
-                    proj_name, ns)
+        _emit_sheet(page, inst_el, mod_el_by_stem[stem],
+                    mod_page_by_stem[stem], proj_name, ns)
 
     _emit_nets(top_pages, schem_el, part_page, comp_by_desig, pool, ns)
 

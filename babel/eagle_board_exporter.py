@@ -16,17 +16,19 @@ from babel.eagle_exporter import (_LAYERS_FILE, _eagle_designator, _eagle_name,
                                   _emit_arc, _emit_geometry, _geom_sig,
                                   _pkg_eagle_layer, _resolved_attrs, _tomm,
                                   export_package)
-from babel.ir_util import parse_layer
+from babel.ir_util import parse_layer, parse_stack
 
 _GEOM_TAGS = ('line', 'arc', 'shape', 'polygon', 'text', 'hole')
 
 
 def _stack(layout_el):
-    """Ordered Eagle copper numbers for this layout, top first. Prefer the
-    original layerSetup from the eagle <passthrough> (keeps Eagle's
-    both-ends inner numbering stable on round-trip); fall back to the
-    canonical 1, 2..N-1, 16."""
-    copper = int(layout_el.get('copper', '2'))
+    """Ordered Eagle copper numbers for this layout, top first. The copper
+    COUNT comes from the stack formula (ir_schema.md "Формула стека" — the
+    one authoritative place); the Eagle NUMBERING prefers the original
+    layerSetup from the eagle <passthrough> (keeps Eagle's both-ends inner
+    numbering stable on round-trip), falling back to the canonical
+    1, 2..N-1, 16."""
+    copper = len(parse_stack(layout_el.get('stack'))[0])
     pt = layout_el.find("passthrough[@tool='eagle']")
     if pt is not None:
         dr = pt.find('designrules')
@@ -36,7 +38,32 @@ def _stack(layout_el):
                     nums = [int(t) for t in re.findall(r'\d+', p.get('value', ''))]
                     if len(nums) == copper:
                         return nums
-    return [1] + list(range(2, copper)) + [16] if copper > 1 else [1]
+    return [1] + list(range(2, copper)) + [16]
+
+
+def _apply_stack_to_designrules(dr, eagle_stack, layout_el):
+    """Write the IR stack formula's thicknesses back into the passthrough
+    designrules cells (mtCopper/mtIsolate, indexed by Eagle layer NUMBER —
+    ground truth maximus.brd). The formula is the authoritative stack fact;
+    the passthrough copy is tool state that must not contradict it after an
+    IR-side edit. Cells of unused layers keep their (junk) values. ε/tanδ
+    have no Eagle home — they simply don't travel (Eagle never knew them)."""
+    coppers, dielectrics = parse_stack(layout_el.get('stack'))
+    by_name = {p.get('name'): p for p in dr.findall('param')}
+
+    def patch(name, pairs):
+        p = by_name.get(name)
+        if p is None:
+            return
+        cells = p.get('value', '').split()
+        for eagle_n, um in pairs:
+            if eagle_n - 1 < len(cells):
+                cells[eagle_n - 1] = f'{um / 1000:g}mm'
+        p.set('value', ' '.join(cells))
+
+    patch('mtCopper', zip(eagle_stack, coppers))
+    patch('mtIsolate',
+          zip(eagle_stack[:-1], (d[0] for d in dielectrics)))
 
 
 def _copper_num(ir_layer, stack):
@@ -52,10 +79,10 @@ def _copper_num(ir_layer, stack):
 
 def _fold_plating(els):
     """The cut/PLATING twin fold (ir_schema.md "Резы и металлизация"): ids
-    of 120-cuts to emit on 46 Milling, and ids of their consumed 147 twins."""
+    of 120-cuts to emit on 46 Milling, and ids of their consumed 146 twins."""
     pool = {}
     for el in els:
-        if el.get('layer') == '147':
+        if el.get('layer') == '146':
             pool.setdefault(_geom_sig(el), []).append(id(el))
     milled, folded = set(), set()
     for el in els:
@@ -94,10 +121,12 @@ def _emit_signal_polygon(sig_out, el, eagle_n, anti):
 def _element_rot(e):
     rot = float(e.get('rot', 0))
     bottom = e.get('side') == 'bottom'
-    a = f'{rot:g}'
     if bottom:
-        return f'MR{a}'          # MR0 must stay explicit — M carries the side
-    return f'R{a}' if rot else None
+        # inverse of the parser's Eagle MR{α} -> IR −α (rotate-then-mirror
+        # vs IR's mirror-then-rotate) — MR0 must stay explicit, M carries
+        # the side
+        return f'MR{(-rot) % 360:g}'
+    return f'R{rot:g}' if rot else None
 
 
 def _emit_element_attribute(el_out, t, e):
@@ -130,7 +159,9 @@ def _emit_element_attribute(el_out, t, e):
     eagle_layer = _pkg_eagle_layer(t.get('layer') or '125')
     a.set('layer', str(eagle_layer if eagle_layer is not None else 25))
     if amirror:
-        a.set('rot', f'MR{arot:g}')
+        # arot is the IR-absolute placed angle; Eagle MR wants its own
+        # rotate-then-mirror reading — the −α inverse, as everywhere
+        a.set('rot', f'MR{(-arot) % 360:g}')
     elif arot:
         a.set('rot', f'R{arot:g}')
     if t.get('font') == 'vector':
@@ -293,7 +324,12 @@ def export_board(ir_path, output_path=None, layout_name=None):
         for pkg_name, fp in sorted(fps.items()):
             packages_el.append(export_package(fp, pkg_name))
 
-    ET.SubElement(board, 'attributes')
+    # layout <attr> children = the board's global attributes (tool bags like
+    # the user's NOABS_* 3D-generator settings travel verbatim, uninterpreted)
+    attributes_el = ET.SubElement(board, 'attributes')
+    for a in layout.findall('attr'):
+        ET.SubElement(attributes_el, 'attribute', name=a.get('name'),
+                      value=a.get('value', ''))
     ET.SubElement(board, 'variantdefs')
 
     # --- classes: same name->number enumeration as export_schematic, so a
@@ -322,6 +358,8 @@ def export_board(ir_path, output_path=None, layout_name=None):
         for tag in ('designrules', 'autorouter'):
             src_el = pt.find(tag)
             if src_el is not None:
+                if tag == 'designrules':
+                    _apply_stack_to_designrules(src_el, stack, layout)
                 board.append(src_el)
         errors_el = pt.find('errors')
 

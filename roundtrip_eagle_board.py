@@ -85,6 +85,27 @@ def _signal_geom(board):
     return out
 
 
+def _stack_params(board):
+    """layerSetup/mtCopper/mtIsolate from designrules — the stack facts the
+    IR formula carries; must come back cell-for-cell (unused cells ride the
+    passthrough verbatim, used cells are rewritten from the formula and
+    must land on the same values)."""
+    out = {}
+    dr = board.find('designrules')
+    for p in (dr.findall('param') if dr is not None else ()):
+        if p.get('name') in ('layerSetup', 'mtCopper', 'mtIsolate'):
+            out[p.get('name')] = p.get('value')
+    return out
+
+
+def _globals(board):
+    """Board-level global attributes (user tool bags like NOABS_*) — must
+    survive verbatim, uninterpreted."""
+    attrs = board.find('attributes')
+    return {(a.get('name'), a.get('value') or '')
+            for a in (attrs if attrs is not None else ())}
+
+
 def _plain_layers(board):
     plain = board.find('plain')
     items = []
@@ -164,6 +185,23 @@ def check(stem):
             nv = sum(sum(v.values()) for _, _, v, _ in sa.values())
             print(f'  ok  {len(sa)} signals ({nw} wires, {nv} vias)')
         ok = ok and not bad
+
+    ga, gb = _globals(a), _globals(b)
+    if ga != gb:
+        ok = False
+        print(f'  FAIL board globals: lost={sorted(ga - gb)[:5]} '
+              f'extra={sorted(gb - ga)[:5]}')
+    else:
+        print(f'  ok  board globals ({len(ga)} attrs)')
+
+    ka, kb = _stack_params(a), _stack_params(b)
+    if ka != kb:
+        ok = False
+        for k in sorted(set(ka) | set(kb)):
+            if ka.get(k) != kb.get(k):
+                print(f'  FAIL stack param {k}: src={ka.get(k)!r} rt={kb.get(k)!r}')
+    else:
+        print(f'  ok  stack params ({", ".join(sorted(ka)) or "none"})')
 
     pa, pb = _plain_layers(a), _plain_layers(b)
     if pa != pb:

@@ -58,10 +58,12 @@ def _pkg_eagle_layer(ln):
         if n == -1:
             return 16
         return abs(n)          # inner copper: number preserved
-    if n == 147:
-        return 156             # PLATING: canonical Eagle projection (the
-                               # |n|-100 formula would give 47 Measures — a
-                               # system layer collision)
+    if n == 146:
+        return 156             # PLATING: canonical Eagle projection. 146 is
+                               # the +100 image of Eagle 46 Milling (thematic:
+                               # PLATING marks plated milled edges); its own
+                               # |n|-100 would give 46, but PLATING must land
+                               # on the user layer 156, not on Milling.
     base = abs(n) - 100
     return base if n > 0 else base + 1
 
@@ -437,11 +439,20 @@ def _emit_geometry(parent, el, eagle_num):
         te = ET.SubElement(parent, 'text')
         te.set('x', _tomm(el.get('x'))); te.set('y', _tomm(el.get('y')))
         te.set('size', _tomm(el.get('size')))
-        rot = _rot_attr(float(el.get('rot', 0)))
+        if el.get('width'):
+            # Eagle has no text width (aspect is baked into its font) —
+            # ir_schema.md <text>: degrade, never silently
+            import_log.log('eagle', (el.text or '')[:20], 'TEXT_WIDTH dropped',
+                           f'{el.get("width")}um (Eagle cannot express it)')
         if el.get('mirror') == '1':
-            te.set('rot', 'M' + (rot or 'R0'))   # MR0 stays explicit
-        elif rot:
-            te.set('rot', rot)
+            # inverse of the parser's MR{α} -> IR −α (rotate-then-mirror vs
+            # mirror-then-rotate); MR0 stays explicit
+            rot = _rot_attr((-float(el.get('rot', 0))) % 360)
+            te.set('rot', 'M' + (rot or 'R0'))
+        else:
+            rot = _rot_attr(float(el.get('rot', 0)))
+            if rot:
+                te.set('rot', rot)
         align = el.get('align', 'bottom-left')
         if align != 'bottom-left': te.set('align', align)
         if el.get('ratio'): te.set('ratio', el.get('ratio'))
@@ -467,16 +478,16 @@ def export_package(fp_el, pkg_name):
     pkg.set('name', _eagle_name(pkg_name))
 
     # Cut/PLATING twin fold (ir_schema.md "Резы и металлизация"): a cut on
-    # 120 with an EXACT copy on 147 goes to Eagle as ONE object on 46
+    # 120 with an EXACT copy on 146 goes to Eagle as ONE object on 46
     # Milling (DRC-exempt there, so pours stay flush for the plating) and
     # the copy is not emitted — the deterministic inverse of the import
-    # rule 46 -> 120 + 147 copy. Unmatched 120 -> 20, unmatched 147 -> 156.
+    # rule 46 -> 120 + 146 copy. Unmatched 120 -> 20, unmatched 146 -> 156.
     plating_pool = {}
     for el in fp_el:
-        if el.get('layer') == '147':
+        if el.get('layer') == '146':
             plating_pool.setdefault(_geom_sig(el), []).append(id(el))
     milled = set()      # ids of 120 elements to emit on 46
-    folded = set()      # ids of 147 twins to skip
+    folded = set()      # ids of 146 twins to skip
     for el in fp_el:
         if el.get('layer') == '120':
             pool = plating_pool.get(_geom_sig(el))

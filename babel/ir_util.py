@@ -140,8 +140,8 @@ LAYER_COURTYARD = 139     # tKeepout 39 / F.CrtYd
 # outline, cutout, slot of any shape) lives on LAYER_DIMENSION 120; the
 # geometry states the final material boundary (width>0 = removed stroke,
 # width=0 = cut along the path). Eagle's 20/46 split dissolves at import
-# (46 -> 120 + a copy on 147, see eagle_parser).
-LAYER_PLATING = 147       # standalone; marker overlay: cut walls are plated
+# (46 -> 120 + a copy on 146, see eagle_parser).
+LAYER_PLATING = 146       # standalone; marker overlay: cut walls are plated
                           # where covered by this layer's filled stroke
                           # (ir_schema.md "Резы и металлизация"). Participates
                           # in DRC/pour recompute: covered cut stretches are
@@ -267,6 +267,317 @@ def parse_layer(s):
     return anti, int(s[1:] if anti else s)
 
 
+# ---------------------------------------------------------------------------
+# Arc-native contour offset (decisions.md "Заливка полигонов: МОДЕЛЬ ПЕРА").
+# The ONE vector operation Babel needs: the stored pour contour is the pen's
+# CENTERLINE; KiCad's zone outline is a hard copper boundary, so exporting a
+# pour means offsetting the contour OUTWARD by width/2. Arcs stay arcs (the
+# segment+arc class is closed under offsetting: edge offsets are edges, round
+# pen joins are arcs). Degenerate cases hard-reject — no silent approximation.
+# ---------------------------------------------------------------------------
+
+_OFF_EPS = 1e-6
+
+
+def _edge_tangents(e):
+    """Unit tangents at the start and end of an edge ('line'/'arc' tuple)."""
+    kind, x1, y1, x2, y2, curve = e
+    if kind == 'line' or not curve:
+        dx, dy = x2 - x1, y2 - y1
+        l = math.hypot(dx, dy) or 1.0
+        t = (dx / l, dy / l)
+        return t, t
+    cx, cy, r = arc_center(x1, y1, x2, y2, curve)
+    s = 1.0 if curve > 0 else -1.0
+    # tangent = radius vector rotated +90 (CCW arc) / -90 (CW arc)
+    def tang(px, py):
+        rx, ry = (px - cx) / r, (py - cy) / r
+        return (-s * ry, s * rx)
+    return tang(x1, y1), tang(x2, y2)
+
+
+def _offset_edge(e, r):
+    """One edge offset to the RIGHT of travel by r (CCW contour => outward).
+    Raises ValueError when a concave arc's radius collapses."""
+    kind, x1, y1, x2, y2, curve = e
+    if kind == 'line' or not curve:
+        dx, dy = x2 - x1, y2 - y1
+        l = math.hypot(dx, dy)
+        if l < _OFF_EPS:
+            return None
+        nx, ny = dy / l, -dx / l
+        return ('line', x1 + nx * r, y1 + ny * r, x2 + nx * r, y2 + ny * r, 0.0)
+    cx, cy, radius = arc_center(x1, y1, x2, y2, curve)
+    # CCW arc (curve>0): center on the LEFT of travel -> right offset grows
+    # the radius; CW arc: center on the right -> radius shrinks
+    r2 = radius + r if curve > 0 else radius - r
+    if r2 <= _OFF_EPS:
+        raise ValueError(
+            f'contour offset: concave arc radius {radius:.1f} <= pen '
+            f'radius {r:.1f} — degenerate result')
+    def scale(px, py):
+        return cx + (px - cx) * r2 / radius, cy + (py - cy) * r2 / radius
+    ox1, oy1 = scale(x1, y1)
+    ox2, oy2 = scale(x2, y2)
+    return ('arc', ox1, oy1, ox2, oy2, curve)
+
+
+def _edge_geo(e):
+    """('line', p1, p2) or ('arc', center, R, a_start_deg, sweep_deg, p1, p2)."""
+    kind, x1, y1, x2, y2, curve = e
+    if kind == 'line' or not curve:
+        return ('line', (x1, y1), (x2, y2))
+    cx, cy, r = arc_center(x1, y1, x2, y2, curve)
+    a1 = math.degrees(math.atan2(y1 - cy, x1 - cx))
+    return ('arc', (cx, cy), r, a1, curve, (x1, y1), (x2, y2))
+
+
+def _on_arc(geo, px, py):
+    _, (cx, cy), r, a1, sweep, _, _ = geo
+    a = math.degrees(math.atan2(py - cy, px - cx))
+    d = (a - a1) % 360 if sweep > 0 else (a1 - a) % 360
+    return d <= abs(sweep) + 1e-7
+
+
+def _on_line(geo, px, py):
+    _, (x1, y1), (x2, y2) = geo
+    dx, dy = x2 - x1, y2 - y1
+    l2 = dx * dx + dy * dy
+    if l2 < _OFF_EPS:
+        return False
+    t = ((px - x1) * dx + (py - y1) * dy) / l2
+    return -1e-9 <= t <= 1 + 1e-9 and \
+        abs((px - x1) * dy - (py - y1) * dx) / math.sqrt(l2) < 1e-3
+
+
+def _edge_intersections(ea, eb):
+    """Intersection points of two edges (each in endpoint-tuple form),
+    restricted to both segments/arc spans."""
+    ga, gb = _edge_geo(ea), _edge_geo(eb)
+    pts = []
+    if ga[0] == 'line' and gb[0] == 'line':
+        (x1, y1), (x2, y2) = ga[1], ga[2]
+        (x3, y3), (x4, y4) = gb[1], gb[2]
+        den = (x2 - x1) * (y4 - y3) - (y2 - y1) * (x4 - x3)
+        if abs(den) > _OFF_EPS:
+            t = ((x3 - x1) * (y4 - y3) - (y3 - y1) * (x4 - x3)) / den
+            pts.append((x1 + t * (x2 - x1), y1 + t * (y2 - y1)))
+    elif ga[0] == 'line' or gb[0] == 'line':
+        line, arc = (ga, gb) if ga[0] == 'line' else (gb, ga)
+        (x1, y1), (x2, y2) = line[1], line[2]
+        (cx, cy), r = arc[1], arc[2]
+        dx, dy = x2 - x1, y2 - y1
+        fx, fy = x1 - cx, y1 - cy
+        a = dx * dx + dy * dy
+        b = 2 * (fx * dx + fy * dy)
+        c = fx * fx + fy * fy - r * r
+        disc = b * b - 4 * a * c
+        if a > _OFF_EPS and disc >= 0:
+            sq = math.sqrt(disc)
+            for t in ((-b - sq) / (2 * a), (-b + sq) / (2 * a)):
+                pts.append((x1 + t * dx, y1 + t * dy))
+    else:
+        (c1x, c1y), r1 = ga[1], ga[2]
+        (c2x, c2y), r2 = gb[1], gb[2]
+        d = math.hypot(c2x - c1x, c2y - c1y)
+        if d > _OFF_EPS and abs(r1 - r2) - 1e-9 <= d <= r1 + r2 + 1e-9:
+            a = (r1 * r1 - r2 * r2 + d * d) / (2 * d)
+            h2 = r1 * r1 - a * a
+            h = math.sqrt(max(h2, 0.0))
+            mx = c1x + a * (c2x - c1x) / d
+            my = c1y + a * (c2y - c1y) / d
+            ux, uy = (c2y - c1y) / d, -(c2x - c1x) / d
+            pts.append((mx + h * ux, my + h * uy))
+            if h > _OFF_EPS:
+                pts.append((mx - h * ux, my - h * uy))
+    ok = []
+    for px, py in pts:
+        on_a = _on_line(ga, px, py) if ga[0] == 'line' else _on_arc(ga, px, py)
+        on_b = _on_line(gb, px, py) if gb[0] == 'line' else _on_arc(gb, px, py)
+        if on_a and on_b:
+            ok.append((px, py))
+    return ok
+
+
+def _trim_edge(e, px, py, at_end):
+    """Move an edge's end (at_end) or start to (px, py); arcs re-derive
+    their sweep toward the kept endpoint."""
+    kind, x1, y1, x2, y2, curve = e
+    if kind == 'line' or not curve:
+        return ('line', x1, y1, px, py, 0.0) if at_end \
+            else ('line', px, py, x2, y2, 0.0)
+    cx, cy, r = arc_center(x1, y1, x2, y2, curve)
+    a1 = math.degrees(math.atan2(y1 - cy, x1 - cx))
+    a2 = math.degrees(math.atan2(y2 - cy, x2 - cx))
+    ap = math.degrees(math.atan2(py - cy, px - cx))
+    if at_end:
+        sweep = (ap - a1) % 360 if curve > 0 else -((a1 - ap) % 360)
+        return ('arc', x1, y1, px, py, sweep)
+    sweep = (a2 - ap) % 360 if curve > 0 else -((ap - a2) % 360)
+    return ('arc', px, py, x2, y2, sweep)
+
+
+def contour_area(vertices):
+    """Signed area (CCW positive) of a closed contour [(x, y, curve), ...] —
+    shoelace over chords plus circular-segment corrections for arc edges."""
+    area = 0.0
+    n = len(vertices)
+    for i, (x1, y1, curve) in enumerate(vertices):
+        x2, y2, _ = vertices[(i + 1) % n]
+        area += (x1 * y2 - x2 * y1) / 2
+        if curve:
+            c = arc_center(x1, y1, x2, y2, curve)
+            if c is not None:
+                r = c[2]
+                a = math.radians(abs(curve))
+                seg = r * r / 2 * (a - math.sin(a))
+                area += seg if curve > 0 else -seg
+    return area
+
+
+def offset_contour(vertices, r):
+    """Closed contour [(x_um, y_um, curve_deg_to_next), ...] offset OUTWARD
+    by r (µm), round joins — the pen model's copper boundary. Returns edges
+    [('line', x1, y1, x2, y2, 0) | ('arc', x1, y1, x2, y2, curve)], CCW.
+    Raises ValueError on degenerate results (collapsed concave arc, failed
+    concave trim, self-intersecting outcome) — hard reject, never a guess."""
+    if len(vertices) < 3:
+        raise ValueError('contour offset: fewer than 3 vertices')
+    if contour_area(vertices) < 0:
+        n = len(vertices)
+        vertices = [(vertices[(i + 1) % n][0], vertices[(i + 1) % n][1],
+                     -vertices[i][2] if vertices[i][2] else 0.0)
+                    for i in range(n - 1, -1, -1)]
+    edges = []
+    n = len(vertices)
+    for i, (x1, y1, curve) in enumerate(vertices):
+        x2, y2, _ = vertices[(i + 1) % n]
+        if math.hypot(x2 - x1, y2 - y1) < _OFF_EPS:
+            continue
+        edges.append(('arc' if curve else 'line', x1, y1, x2, y2,
+                      float(curve or 0.0)))
+    off = []
+    for e in edges:
+        oe = _offset_edge(e, r)
+        if oe is not None:
+            off.append((e, oe))
+    out = []
+    m = len(off)
+    for i in range(m):
+        (e1, o1), (e2, o2) = off[i], off[(i + 1) % m]
+        out.append(i)
+        p_end = (o1[3], o1[4])
+        p_start = (o2[1], o2[2])
+        gap = math.hypot(p_start[0] - p_end[0], p_start[1] - p_end[1])
+        if gap < 1e-3:
+            continue
+        t1 = _edge_tangents(e1)[1]
+        t2 = _edge_tangents(e2)[0]
+        cross = t1[0] * t2[1] - t1[1] * t2[0]
+        vx, vy = e1[3], e1[4]           # the original corner
+        if cross > 1e-9:
+            # convex (left turn on a CCW contour): round pen join around V
+            a1 = math.degrees(math.atan2(p_end[1] - vy, p_end[0] - vx))
+            a2 = math.degrees(math.atan2(p_start[1] - vy, p_start[0] - vx))
+            sweep = (a2 - a1) % 360
+            off[i] = (e1, o1)
+            out.append(('join', p_end, p_start, sweep))
+        else:
+            # concave: offset edges overlap — trim both to their intersection
+            xs = _edge_intersections(o1, o2)
+            if not xs:
+                raise ValueError(
+                    'contour offset: concave corner failed to trim — '
+                    'self-intersecting offset (pen wider than the feature?)')
+            px, py = min(xs, key=lambda p: math.hypot(p[0] - vx, p[1] - vy))
+            off[i] = (e1, _trim_edge(o1, px, py, at_end=True))
+            off[(i + 1) % m] = (e2, _trim_edge(o2, px, py, at_end=False))
+    result = []
+    for item in out:
+        if isinstance(item, tuple):
+            _, (px1, py1), (px2, py2), sweep = item
+            if sweep > 1e-6:
+                result.append(('arc', px1, py1, px2, py2, sweep))
+        else:
+            kind, x1, y1, x2, y2, curve = off[item][1]
+            if math.hypot(x2 - x1, y2 - y1) > 1e-3 or abs(curve) > 1e-6:
+                result.append((kind, x1, y1, x2, y2, curve))
+    # global self-intersection: any two non-adjacent edges crossing = reject
+    k = len(result)
+    for i in range(k):
+        for j in range(i + 2, k):
+            if i == 0 and j == k - 1:
+                continue
+            if _edge_intersections(result[i], result[j]):
+                raise ValueError(
+                    'contour offset: result self-intersects (narrow neck '
+                    'thinner than the pen) — hard reject')
+    return result
+
+
+DEFAULT_STACK = '35[1530]35'
+
+
+def parse_stack(s):
+    """IR <layout stack=...> formula (ir_schema.md "Формула стека") ->
+    (coppers, dielectrics). coppers = [µm, ...] top-down (index 0 = layer 1,
+    last = layer -1, inner = 2..N-1); dielectrics = [(µm, ε|None, tanδ|None),
+    ...] between them, len(coppers)-1 items. ε/tanδ are dimensionless
+    decimals — the sanctioned exception to the integer-µm canon (not
+    lengths). Grammar violations hard-reject: the sandwich must alternate
+    copper[dielectric]copper..., ≥2 coppers (single-sided boards rejected
+    until a real need — same door as via spans)."""
+    s = (s or DEFAULT_STACK).strip()
+    parts = re.split(r'\[([^\[\]]*)\]', s)
+    coppers, dielectrics = [], []
+    if len(parts) < 3 or len(parts) % 2 == 0:
+        raise ValueError(f'stack {s!r}: expected copper[dielectric]copper...,'
+                         f' >= 2 copper layers')
+    for i, tok in enumerate(parts):
+        tok = tok.strip()
+        if i % 2 == 0:
+            if not re.fullmatch(r'[1-9]\d*', tok):
+                raise ValueError(
+                    f'stack {s!r}: copper thickness {tok!r} must be a '
+                    f'positive integer (µm)')
+            coppers.append(int(tok))
+        else:
+            fields = [f.strip() for f in tok.split(':')]
+            if not 1 <= len(fields) <= 3 or \
+                    not re.fullmatch(r'[1-9]\d*', fields[0]):
+                raise ValueError(
+                    f'stack {s!r}: dielectric {tok!r} must be '
+                    f'thickness_um[:eps[:tand]], thickness a positive '
+                    f'integer (µm)')
+            try:
+                eps = float(fields[1]) if len(fields) > 1 else None
+                tand = float(fields[2]) if len(fields) > 2 else None
+            except ValueError:
+                raise ValueError(f'stack {s!r}: dielectric {tok!r}: '
+                                 f'eps/tand must be decimal numbers')
+            dielectrics.append((int(fields[0]), eps, tand))
+    return coppers, dielectrics
+
+
+def format_stack(coppers, dielectrics):
+    """Inverse of parse_stack."""
+    if len(coppers) != len(dielectrics) + 1:
+        raise ValueError(f'stack: {len(coppers)} coppers need '
+                         f'{len(coppers) - 1} dielectrics, '
+                         f'got {len(dielectrics)}')
+    out = [str(coppers[0])]
+    for (d_um, eps, tand), cu in zip(dielectrics, coppers[1:]):
+        fields = [str(d_um)]
+        if tand is not None and eps is None:
+            raise ValueError('stack: tand without eps')
+        if eps is not None:
+            fields.append(f'{eps:g}')
+        if tand is not None:
+            fields.append(f'{tand:g}')
+        out.append('[' + ':'.join(fields) + ']' + str(cu))
+    return ''.join(out)
+
+
 def sanitize_filename(name):
     """Replace characters illegal in filenames (Windows-illegal set, the
     strictest of the formats we touch) with '_'.
@@ -288,6 +599,28 @@ def clean_attr_name(s):
     """
     s = re.sub(r'([A-Za-z0-9]) ([A-Za-z0-9])', r'\1_\2', s or '')
     return s.replace(' ', '')
+
+
+def instance_designator(canonical, minst_name, offset):
+    """Real per-instance designator of a module part, given the module's
+    CANONICAL designator (`R4`, `#GND1`), the module INSTANCE name (`TM1`)
+    and its Eagle `offset=` (or None/'' /'0' when absent).
+
+    Two standard Eagle namespacing schemes, one function so every exporter
+    derives it identically (single source of truth — the board path's
+    `eagle_board_exporter._resolve_instance` documents the same two spellings):
+
+    - offset present → NUMERIC flatten: split the trailing number off the
+      canonical designator and add the offset (`R4` @ 100 → `R104`,
+      `#GND1` @ 200 → `#GND201`).
+    - offset absent → COLON composite `INST:REFDES` (`TM1:R4`), the exact IR
+      element-address canon (ir_schema.md "<element>").
+    """
+    if offset and offset != '0':
+        m = re.match(r'^(.*?)(\d+)$', canonical)
+        if m:
+            return f'{m.group(1)}{int(m.group(2)) + int(offset)}'
+    return f'{minst_name}:{canonical}'
 
 
 def symbol_pool(root):

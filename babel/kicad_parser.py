@@ -18,6 +18,7 @@ from kiutils.items.common import Effects, Position
 from kiutils.utils import sexpr as _kiutils_sexpr
 
 from babel.ir_util import sanitize_filename, clean_attr_name
+from babel.kicad_layers import kicad_to_ir
 from babel import import_log
 
 _MM_TO_UM = 1000
@@ -65,26 +66,10 @@ _PAD_SHAPE_FALLBACK = {
     'trapezoid': 'square', 'rect': 'square', 'custom': 'square',
 }
 
-# KiCad footprint layer name -> IR signed layer NUMBER (ir_schema.md "Плата
-# (Board IR)"; ir_util.py has the canonical constants). Sign is side-relative
-# in footprint space: + = mount side, - = far side.
-_FP_LAYER_TO_IR = {
-    'F.Cu':    1,    'B.Cu':    -1,
-    'F.SilkS': 121,  'B.SilkS': -121,
-    'F.Mask':  129,  'B.Mask':  -129,
-    'F.Paste': 131,  'B.Paste': -131,
-    'F.CrtYd': 139,  'B.CrtYd': -139,
-    'F.Fab':   151,  'B.Fab':   -151,
-    'Edge.Cuts': 120,
-    # KiCad's generic (not top/bottom-specific) designer-notes layers — the
-    # side-less Document layer (148) is the exact semantic match (they have
-    # no side in KiCad either). Confirmed real content silently dropped
-    # before this mapping existed (testData/kicad9-ti-mspm0-tutorial:
-    # Tag-Connect footprint's "KEEPOUT" on Cmts.User, USB-C receptacle's
-    # "PCB Edge" on Dwgs.User — found via Footprint Editor showing more
-    # text than reached Eagle).
-    'Dwgs.User': 148, 'Cmts.User': 148,
-}
+# KiCad<->IR layer projection now lives in the user-editable table
+# babel/kicad_layers.py (working + reference .tsv). It was silently dropping
+# real content before a mapping existed (testData/kicad9-ti-mspm0-tutorial:
+# Tag-Connect "KEEPOUT" on Cmts.User, USB-C "PCB Edge" on Dwgs.User).
 
 
 def _um(mm):
@@ -1077,7 +1062,7 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
         Geometry is a DIRECT child of <footprint> carrying layer="N" — no
         per-layer container tags (unified with the board layer model,
         ir_schema.md "Плата (Board IR)")."""
-        n = _FP_LAYER_TO_IR.get(kicad_layer)
+        n = kicad_to_ir(kicad_layer)
         return None if n is None else str(n)
 
     for item in fp.graphicItems:
