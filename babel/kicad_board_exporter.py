@@ -1,9 +1,12 @@
 """IR <layout> -> KiCad 10 .kicad_pcb (topology milestone).
 
 Carries: board outline / free geometry, placed footprints with pads bound
-to nets, tracks (line/arc), through vias, layout-level mounting holes.
+to nets, tracks (line/arc), through vias, layout-level mounting holes,
+3D models (embedded into the .kicad_pcb, KiCad's "embed file" feature —
+the same form kicad_project_parser requires on import, so our own output
+round-trips; sidecar STEP files come from <ir_stem>/ next to the IR).
 Deferred, NEVER silently: pours -> zones, anti-copper -> keepouts,
-element-level text overrides (smashed), 3D models.
+element-level text overrides (smashed).
 
 Skeleton and dialect are ground truth from KiCad 10 files (testData/Simple
 v10 header/layers/setup; testData/video v10 net-by-name on segments/pads —
@@ -21,18 +24,23 @@ model; verified pad-for-pad by verify_kicad_board.py against
 place_ir_element as the oracle.
 """
 import math
+import base64
 import re
+import struct
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import zstandard
+
 from babel import import_log
 from babel.eagle_board_exporter import _instance_footprint
 from babel.ir_util import (arc_mid, is_copper, offset_contour, parse_layer,
-                           parse_stack, place_ir_element, sanitize_filename)
+                           parse_stack, place_ir_element, sanitize_filename,
+                           instance_designator, resolve_model3d_file)
 from babel.kicad_layers import ir_to_kicad
 from babel.kicad_exporter import (_eagle_overbar_to_kicad, _f, _justify,
-                                  _mm, _q)
+                                  _mm, _q, model3d_kicad_xyz)
 
 _VERSION = 20260206          # KiCad 10 board dialect (testData/Simple)
 
@@ -262,6 +270,95 @@ def _merge_mirror(just):
     return just.replace(')', ' mirror)')
 
 
+def _kicad_mmh3(data, seed=0xABBA2345):
+    """KiCad's HASH_128 checksum string for an embedded file: incremental
+    MurmurHash3 x64_128 over the DECOMPRESSED bytes, seed EMBEDDED_FILES::
+    Seed() = 0xABBA2345, formatted h1||h2 as %016X (mmh3_hash.h /
+    embedded_files.cpp), with the "V1" tail: the last partial block is
+    zero-padded to 4-byte alignment and the PADDED length feeds both the
+    tail switch and the final mix (mmh3_hash.h addDataV1 — released
+    KiCad 10.0 both writes and VERIFIES this variant; a wrong checksum
+    makes pcbnew silently reject the whole board, proven by live pcbnew
+    bisect). KiCad master fixed the tail (canonical MurmurHash3) but
+    keeps V1 as an accepted legacy fallback on load — so V1 is the one
+    encoding valid for BOTH. Validated against all 23 embedded models in
+    testData/video/video.kicad_pcb + live pcbnew 10.0 load probes."""
+    M = (1 << 64) - 1
+    c1, c2 = 0x87c37b91114253d5, 0x4cf5ad432745937f
+
+    def rotl(x, r):
+        return ((x << r) | (x >> (64 - r))) & M
+
+    def fmix(k):
+        k ^= k >> 33
+        k = k * 0xff51afd7ed558ccd & M
+        k ^= k >> 33
+        k = k * 0xc4ceb9fe1a85ec53 & M
+        return k ^ (k >> 33)
+
+    h1 = h2 = seed
+    n = len(data) // 16
+    for (k1, k2) in struct.iter_unpack('<QQ', data[:n * 16]):
+        k1 = rotl(k1 * c1 & M, 31) * c2 & M
+        h1 ^= k1
+        h1 = (rotl(h1, 27) + h2) & M
+        h1 = (h1 * 5 + 0x52dce729) & M
+        k2 = rotl(k2 * c2 & M, 33) * c1 & M
+        h2 ^= k2
+        h2 = (rotl(h2, 31) + h1) & M
+        h2 = (h2 * 5 + 0x38495ab5) & M
+    tail = data[n * 16:]
+    total = n * 16
+    if tail:
+        pad = 4 - (len(tail) + 4) % 4
+        tail = tail + b'\0' * pad
+        total += len(tail)
+    tl = total & 15
+    tb = tail[:tl]
+    k1 = k2 = 0
+    for i in range(len(tb) - 1, 7, -1):
+        k2 |= tb[i] << (8 * (i - 8))
+    if tl >= 9:
+        k2 = rotl(k2 * c2 & M, 33) * c1 & M
+        h2 ^= k2
+    for i in range(min(len(tb), 8) - 1, -1, -1):
+        k1 |= tb[i] << (8 * i)
+    if tl >= 1:
+        k1 = rotl(k1 * c1 & M, 31) * c2 & M
+        h1 ^= k1
+    h1 ^= total
+    h2 ^= total
+    h1 = (h1 + h2) & M
+    h2 = (h2 + h1) & M
+    h1, h2 = fmix(h1), fmix(h2)
+    h1 = (h1 + h2) & M
+    h2 = (h2 + h1) & M
+    return f'{h1:016X}{h2:016X}'
+
+
+def _emit_embedded_files(out, embedded):
+    """(embedded_files ...) board-level block: each model's bytes zstd-
+    compressed then base64, wrapped at 76 chars (dialect ground truth:
+    testData/video/video.kicad_pcb), checksum over the raw bytes."""
+    out.append('\t(embedded_files')
+    for name in sorted(embedded):
+        data = embedded[name].read_bytes()
+        b64 = base64.b64encode(
+            zstandard.ZstdCompressor().compress(data)).decode('ascii')
+        chunks = [b64[i:i + 76] for i in range(0, len(b64), 76)] or ['']
+        out.append('\t\t(file')
+        out.append(f'\t\t\t(name {_q(name)})')
+        out.append('\t\t\t(type model)')
+        out.append(f'\t\t\t(data |{chunks[0]}' if len(chunks) == 1
+                   else f'\t\t\t(data |{chunks[0]}\n' +
+                        '\n'.join(f'\t\t\t\t{c}' for c in chunks[1:]))
+        out[-1] += '|'
+        out.append('\t\t\t)')
+        out.append(f'\t\t\t(checksum "{_kicad_mmh3(data)}")')
+        out.append('\t\t)')
+    out.append('\t)')
+
+
 def _placeholder(fp_el, name):
     for t in fp_el.findall('text'):
         if (t.text or '').strip() == '>' + name:
@@ -270,8 +367,14 @@ def _placeholder(fp_el, name):
 
 
 def _emit_footprint(out, e, fp, lib_name, value, frame, pad_nets, n_copper,
-                    sym_path=None):
+                    sym_path=None, net_code=None, refdes=None,
+                    net_display=None, model_name=None):
     des = e.get('name')
+    # des is the IR element ADDRESS (module parts: INST:REFDES colon form) —
+    # used for uuid/pad-net keys. The VISIBLE reference must match the
+    # schematic symbol (offset-flattened, e.g. TM8:R21 -> R821), so a caller
+    # passes the KiCad refdes explicitly; falls back to des for top parts.
+    refdes = refdes or des
     bottom = e.get('side') == 'bottom'
     theta = float(e.get('rot', '0') or '0')
     at_rot = (theta + 180) % 360 if bottom else theta % 360
@@ -303,7 +406,7 @@ def _emit_footprint(out, e, fp, lib_name, value, frame, pad_nets, n_copper,
 
     # Reference/Value properties anchored at the footprint's own >NAME/>VALUE
     # placeholders (their local frame), value hidden when placeholder absent
-    for prop, text in (('Reference', des), ('Value', value)):
+    for prop, text in (('Reference', refdes), ('Value', value)):
         ph = _placeholder(fp, 'NAME' if prop == 'Reference' else 'VALUE')
         if ph is not None:
             px, py = _mm(ph.get('x', '0')), _mm(ph.get('y', '0'))
@@ -344,10 +447,32 @@ def _emit_footprint(out, e, fp, lib_name, value, frame, pad_nets, n_copper,
             # texts do NOT get the +180 (same ground truth: 135)
             abs_rot = (theta - phi + 180) if bottom else (theta + phi)
             net = pad_nets.get((des, child.get('name')))
-            net_s = _q(net) if net else None
+            # pad carries BOTH code and name: (net <code> "<display name>")
+            code = (net_code or {}).get(net, 0)
+            disp = (net_display or {}).get(net, net)
+            net_s = f'{code} {_q(disp)}' if net else None
             out.extend(_pad_lines(child, bottom, net_s, abs_rot, log))
         else:
             out.extend(_fp_geometry_lines(child, bottom, theta, log))
+
+    m3 = fp.find('model3d')
+    if m3 is not None and model_name:
+        # Shared transform math (kicad_exporter.model3d_kicad_xyz — Euler
+        # order re-decomposition, offsets pass through). The block lives in
+        # the footprint's LOCAL frame — KiCad applies placement and the
+        # back-side flip itself.
+        tx, ty, tz, rx, ry, rz = (_f(v) for v in model3d_kicad_xyz(m3))
+        out += [f'\t\t(model "kicad-embed://{model_name}"',
+                f'\t\t\t(offset',
+                f'\t\t\t\t(xyz {tx} {ty} {tz})',
+                f'\t\t\t)',
+                f'\t\t\t(scale',
+                f'\t\t\t\t(xyz 1 1 1)',
+                f'\t\t\t)',
+                f'\t\t\t(rotate',
+                f'\t\t\t\t(xyz {rx} {ry} {rz})',
+                f'\t\t\t)',
+                f'\t\t)']
     out.append('\t)')
 
     # Footprint anti-copper (ir_schema.md "АНТИ-слои") -> board-level keepout
@@ -372,7 +497,8 @@ def _stroke_geo(tag, el, frame, log_ctx, net=None, width_key='width'):
         return []
     is_track = net is not None
     w = _f(_mm(el.get(width_key, '120')))
-    net_s = f'\n\t\t(net {_q(net)})' if is_track else ''
+    # a track/arc references its net by CODE only (no name field), unlike a pad
+    net_s = f'\n\t\t(net {net})' if is_track else ''
     if tag == 'line':
         x1, y1 = _f(frame.x(el.get('x1'))), _f(frame.y(el.get('y1')))
         x2, y2 = _f(frame.x(el.get('x2'))), _f(frame.y(el.get('y2')))
@@ -425,7 +551,8 @@ def _zone_pts(edges, frame):
     return lines
 
 
-def _emit_zone(out, poly, net_name, frame, uid_key, default_clearance_um):
+def _emit_zone(out, poly, net_name, frame, uid_key, default_clearance_um,
+               net_code=None, net_display=None):
     """IR pour <polygon> (pen-centerline contour, decisions.md "МОДЕЛЬ
     ПЕРА") -> KiCad zone: outline = contour offset OUTWARD by width/2
     (KiCad's outline is a hard copper boundary). Offset failure = the
@@ -458,7 +585,9 @@ def _emit_zone(out, poly, net_name, frame, uid_key, default_clearance_um):
     spoke_um = w                               # pen width = the spoke floor
 
     out.append(f'\t(zone')
-    out.append(f'\t\t(net {_q(net_name)})')
+    # zone splits the fact across TWO fields: net-code + separate net_name
+    out.append(f'\t\t(net {(net_code or {}).get(net_name, 0)})')
+    out.append(f'\t\t(net_name {_q((net_display or {}).get(net_name, net_name))})')
     out.append(f'\t\t(layer "{kl}")')
     out.append(f'\t\t(uuid "{_uuid("zone", uid_key)}")')
     out.append(f'\t\t(hatch edge 0.5)')
@@ -532,7 +661,8 @@ def _emit_keepout(out, el, frame, idx):
                        f'primitive -> keepout not expressible yet)')
         return
     out += [f'\t(zone',
-            f'\t\t(net "")',
+            f'\t\t(net 0)',
+            f'\t\t(net_name "")',
             f'\t\t(layer "{kl}")',
             f'\t\t(uuid "{_uuid("keepout", idx)}")',
             f'\t\t(hatch edge 0.5)',
@@ -552,7 +682,7 @@ def _emit_keepout(out, el, frame, idx):
 
 
 def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
-                       lib_nickname=None):
+                       lib_nickname=None, minst_page_name=None):
     """IR project -> one .kicad_pcb for the named (or single) <layout>.
 
     sym_paths: {designator -> '/uuid' schematic path} so each footprint
@@ -582,6 +712,42 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
             inst_by_des.setdefault(i.get('name'), i)
     module_by_name = {m.get('name'): m for m in root.findall('module')}
     local_fp = {f.get('name'): f for f in layout.findall('footprint')}
+
+    # 3D models: sidecar STEP dir next to the IR (ir_schema.md "Соглашение
+    # о расположении файлов моделей"); resolved once per footprint, bytes
+    # embedded into the board at the end. A <model3d> with no sidecar file
+    # is the documented degradation: model lost, logged, board still valid.
+    sidecar_dir = ir_path.parent / ir_path.stem
+    embedded = {}                 # file name -> Path
+    _model_cache = {}             # id(fp) -> name | None
+    def _model_for(fp):
+        key = id(fp)
+        if key not in _model_cache:
+            name = None
+            if fp.find('model3d') is not None:
+                src = resolve_model3d_file(fp, sidecar_dir)
+                if src is None:
+                    import_log.log('kicad_pcb', fp.get('name'),
+                                   'MODEL3D dropped',
+                                   f'no STEP file in {sidecar_dir.name}/')
+                else:
+                    name = src.name
+                    embedded[name] = src
+            _model_cache[key] = name
+        return _model_cache[key]
+
+    def _kicad_refdes(des):
+        """IR element address -> the reference KiCad shows, matching the
+        schematic symbol. Module part INST:REFDES is flattened by the module
+        instance's offset (TM8:R21 @ offset 800 -> R821); top parts unchanged.
+        (KiCad-targeted module instances always carry an offset — the schematic
+        exporter hard-rejects offset-less ones — so this never emits a colon.)"""
+        if ':' not in des:
+            return des
+        minst_name, part = des.split(':', 1)
+        minst = inst_by_des.get(minst_name)
+        off = minst.get('offset') if minst is not None else None
+        return instance_designator(part, minst_name, off)
 
     def resolve_instance(des):
         if ':' not in des:
@@ -616,6 +782,32 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
         net_names.append(sig.get('name'))
         for cr in sig.findall('contactref'):
             pad_nets[(cr.get('element'), cr.get('pad'))] = sig.get('name')
+
+    # --- net CODES: KiCad's canonical connectivity is by integer net-code
+    # (a name-only ref makes zones/vias DRC-orphan even when the board LOOKS
+    # right, because the editor heals the ratsnest by name). Code 0 is the
+    # reserved "no net"; every named signal gets a stable 1..N code, declared
+    # once in the (net ...) table below and referenced by number everywhere.
+    net_code = {'': 0}
+    for nm in net_names:
+        if nm not in net_code:
+            net_code[nm] = len(net_code)
+
+    # --- net NAMES as KiCad's netlist spells them, so board copper and
+    # schematic agree (mismatch -> F8 "unknown net" on every via/zone). A
+    # module-local net is Eagle's INST:LOCAL colon form -> KiCad's hierarchical
+    # path /{page}/{INST}/{LOCAL} (ground truth testData/t2: /PAGE2/MODULE1/9V,
+    # never a colon). Top-level nets are global labels in our schematic ->
+    # plain name, unchanged. `page` is the top-level SHEET NAME the module
+    # instance sits on (from top_level_sheets), passed in per instance.
+    minst_page_name = minst_page_name or {}
+    def _net_disp(ir_name):
+        if ':' not in ir_name:
+            return ir_name
+        minst, local = ir_name.split(':', 1)
+        page = minst_page_name.get(minst)
+        return f'/{page}/{minst}/{local}' if page else ir_name
+    net_display = {nm: _net_disp(nm) for nm in net_code}
 
     # thermal gap ≡ zone clearance (decisions.md 2026-07-12): a pour with no
     # explicit isolate uses the board-rule clearance as its relief gap
@@ -655,6 +847,10 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
     out.append('\t\t(allow_soldermask_bridges_in_footprints no)')
     out.append('\t)')
 
+    # --- net table (code -> name), declared before any copper references it
+    for nm, code in sorted(net_code.items(), key=lambda kv: kv[1]):
+        out.append(f'\t(net {code} {_q(net_display[nm])})')
+
     # --- elements
     for e in layout.findall('element'):
         des = e.get('name')
@@ -666,7 +862,8 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
                                f'local footprint {e.get("footprint")!r} missing')
                 continue
             _emit_footprint(out, e, fp, lib_nickname or lib, value, frame,
-                            pad_nets, n_copper)
+                            pad_nets, n_copper, net_code=net_code,
+                            net_display=net_display, model_name=_model_for(fp))
             continue
         inst = resolve_instance(des)
         comp = comp_by_name.get(inst.get('component')) if inst is not None else None
@@ -678,7 +875,9 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
         value = inst.get('value') or comp.get('name') or ''
         _emit_footprint(out, e, fp, lib_nickname or comp.get('library', 'babel'),
                         value, frame, pad_nets, n_copper,
-                        sym_path=sym_paths.get(des))
+                        sym_path=sym_paths.get(des), net_code=net_code,
+                        refdes=_kicad_refdes(des), net_display=net_display,
+                        model_name=_model_for(fp))
 
     # --- layout-level mounting holes: KiCad has no bare-board NPTH
     # primitive — each becomes a one-pad synthetic footprint
@@ -780,7 +979,8 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
         name = sig.get('name')
         for c in sig:
             if c.tag in ('line', 'arc'):
-                out.extend(_stroke_geo(c.tag, c, frame, name, net=name))
+                out.extend(_stroke_geo(c.tag, c, frame, name,
+                                       net=net_code[name]))
             elif c.tag == 'via':
                 if c.get('diameter'):
                     d = _mm(c.get('diameter'))
@@ -792,17 +992,22 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
                     f'\t(via\n\t\t(at {_f(frame.x(c.get("x")))} '
                     f'{_f(frame.y(c.get("y")))})'
                     f'\n\t\t(size {_f(d)})\n\t\t(drill {_f(_mm(c.get("drill")))})'
-                    f'\n\t\t(layers "F.Cu" "B.Cu")\n\t\t(net {_q(name)})'
+                    f'\n\t\t(layers "F.Cu" "B.Cu")\n\t\t(net {net_code[name]})'
                     f'\n\t\t(uuid "{_uuid("via", name, c.get("x"), c.get("y"))}")\n\t)')
             elif c.tag == 'polygon':
                 zone_seq += 1
                 _emit_zone(out, c, name, frame, f'{name}:{zone_seq}',
-                           default_clearance_um)
+                           default_clearance_um, net_code=net_code,
+                           net_display=net_display)
 
+    out.append('\t(embedded_fonts no)')
+    if embedded:
+        _emit_embedded_files(out, embedded)
     out.append(')')
     output_path = Path(output_path)
     output_path.write_text('\n'.join(out) + '\n', encoding='utf-8')
     n_el = len(layout.findall('element'))
     print(f'Written: {output_path}  ({n_el} footprints, '
-          f'{len(net_names)} nets, {n_copper} copper layers)')
+          f'{len(net_names)} nets, {n_copper} copper layers, '
+          f'{len(embedded)} embedded 3D models)')
     return output_path

@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from babel.eagle_board_exporter import _instance_footprint
-from babel.ir_util import place_ir_element
+from babel.ir_util import place_ir_element, instance_designator
 from babel.kicad_board_exporter import export_board_kicad, _Frame
 
 TOL = 0.002   # mm
@@ -55,7 +55,7 @@ def _kicad_pads(text):
         c, s = math.cos(math.radians(rot)), math.sin(math.radians(rot))
         for pm in re.finditer(
                 r'\(pad "([^"]*)" (\w+) \w+\n\t\t\t\(at ([-0-9.]+) ([-0-9.]+)'
-                r'(?: ([-0-9.]+))?\)[\s\S]*?(?:\(net "((?:[^"\\]|\\.)*)"\)'
+                r'(?: ([-0-9.]+))?\)[\s\S]*?(?:\(net \d+ "((?:[^"\\]|\\.)*)"\)'
                 r'[\s\S]*?)?\n\t\t\)', b):
             name, kind = pm.group(1), pm.group(2)
             lx, ly = float(pm.group(3)), float(pm.group(4))
@@ -93,6 +93,16 @@ def _ir_pads(root, layout, frame):
         return next((i for i in mod.findall('instance')
                      if i.get('name') == part), None)
 
+    def flat_ref(des):
+        """IR element address -> board refdes (module parts flattened by the
+        instance offset, TM1:C1 @ 100 -> C101), matching what the board writes."""
+        if ':' not in des:
+            return des
+        minst_name, part = des.split(':', 1)
+        minst = inst_by_des.get(minst_name)
+        off = minst.get('offset') if minst is not None else None
+        return instance_designator(part, minst_name, off)
+
     pads = {}
     for e in layout.findall('element'):
         des = e.get('name')
@@ -115,7 +125,7 @@ def _ir_pads(root, layout, frame):
             ay = frame.y(placed.get('y'))
             name = child.get('name')
             net = pad_nets.get((des, name))
-            pads[(des, name or f'@{round(ax,2)},{round(ay,2)}')] = \
+            pads[(flat_ref(des), name or f'@{round(ax,2)},{round(ay,2)}')] = \
                 (ax, ay, net, child.tag)
     return pads
 

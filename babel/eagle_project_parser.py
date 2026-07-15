@@ -36,7 +36,7 @@ from pathlib import Path
 
 from babel.eagle_parser import (
     convert_symbol, convert_package, convert_deviceset, collect_attributes,
-    parse_rot, _um, LAYER_MAP,
+    parse_rot, _um, LAYER_MAP, _copy_step_files,
 )
 from babel.eagle_exporter import _rotate_vec, _SIDE_NORMAL, _port_geometry, _PORT_PIN_LEN_UM
 from babel.ir_util import component_gates, is_multi_gate
@@ -1099,6 +1099,11 @@ def convert_project_full(src, output_path):
             import_log.log('main', 'restring',
                            f'{baked} auto pad/via diameter(s) baked from',
                            'designrules restring (auto sizes do not exist in IR)')
+
+    # 3D sidecar: STEP files live in <src_stem>/ next to the source (same
+    # convention as the library path) -> copy to <out_stem>/ next to the
+    # .swprj for every project footprint that carries <model3d>.
+    _copy_step_files(proj_el, src, output_path)
 
     tree_str = ET.tostring(proj_el, encoding='unicode')
     from xml.dom import minidom

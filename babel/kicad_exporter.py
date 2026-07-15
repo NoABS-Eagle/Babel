@@ -59,6 +59,54 @@ def _ky(y):
     return -float(y) / 1000
 
 
+def model3d_kicad_xyz(m3):
+    """IR <model3d> -> the six numbers of a KiCad (model ...) block:
+    (tx, ty, tz) mm and (rx, ry, rz) degrees, ready to print.
+
+    Offset: µm -> mm, axes PASS THROUGH unchanged — the model offset lives
+    in the model's own MCAD frame (Y up), not the footprint's Y-down 2D
+    frame, so there is no Y mirror here (ground truth: maximus DD1 ty=+7
+    / XS1 ty=+9.5 visually confirmed in KiCad, 2026-07-15).
+
+    Rotation: IR composes intrinsic Rx*Ry*Rz (ir_schema.md "Соглашение о
+    размещении модели"); KiCad's file stores the NEGATED angles of a
+    Rz*Ry*Rx composition (the footprint-properties dialog shows them
+    un-negated). Pure-Z rotations coincide in both orders — which is why a
+    naive per-axis sign flip looked right on every flat part and only a
+    genuinely two-axis model (maximus DD1: IR (0,-90,-90) must become
+    dialog (90,0,-90)) exposed the difference. General case: build the IR
+    matrix, re-decompose in KiCad's order.
+    """
+    tx = float(m3.get('tx', 0)) / 1000
+    ty = float(m3.get('ty', 0)) / 1000
+    tz = float(m3.get('tz', 0)) / 1000
+    ex, ey, ez = (math.radians(float(m3.get(k, 0))) for k in ('rx', 'ry', 'rz'))
+    cx, sx = math.cos(ex), math.sin(ex)
+    cy, sy = math.cos(ey), math.sin(ey)
+    cz, sz = math.cos(ez), math.sin(ez)
+    # R = Rx(ex) @ Ry(ey) @ Rz(ez), row-major
+    r00 = cy * cz
+    r01 = -cy * sz
+    r10 = cx * sz + sx * sy * cz
+    r11 = cx * cz - sx * sy * sz
+    r20 = sx * sz - cx * sy * cz
+    r21 = sx * cz + cx * sy * sz
+    r22 = cx * cy
+    # decompose R = Rz(g) @ Ry(b) @ Rx(a):  R[2][0] = -sin b
+    if abs(r20) < 1 - 1e-9:
+        a = math.degrees(math.atan2(r21, r22))
+        b = math.degrees(math.asin(-r20))
+        g = math.degrees(math.atan2(r10, r00))
+    else:                        # gimbal lock: b = ±90, split a=0
+        a = 0.0
+        b = 90.0 if r20 < 0 else -90.0
+        g = math.degrees(math.atan2(-r01, r11))
+    def _n(v):                   # negate for the file, normalize -180..180
+        v = -v % 360
+        return v - 360 if v > 180 else v
+    return tx, ty, tz, _n(a), _n(b), _n(g)
+
+
 def _q(s):
     return '"' + str(s).replace('\\', '\\\\').replace('"', '\\"') + '"'
 
@@ -297,6 +345,7 @@ def export_symbol(comp_el, root, lib_name):
     _def_style = lambda y: {'at': (0, y, 0), 'size': 1.27, 'align': 'bottom-left', 'ratio': 8}
     name_style        = _def_style(2.54)
     value_style       = _def_style(0)
+    has_name          = False   # source symbol carries a >NAME placeholder?
     placeholder_style = {}   # lowercase attr name → style dict
     for el in sym_el:
         if el.tag != 'text':
@@ -312,7 +361,7 @@ def export_symbol(comp_el, root, lib_name):
             'align': align,
             'ratio': int(el.get('ratio', '8')),
         }
-        if txt == '>NAME':    name_style  = info
+        if txt == '>NAME':    name_style, has_name = info, True
         elif txt == '>VALUE': value_style = info
         else:                 placeholder_style[txt[1:].lower()] = info
 
@@ -384,7 +433,24 @@ def export_symbol(comp_el, root, lib_name):
              f'    (in_pos_files yes)',
              f'    (duplicate_pin_numbers_are_jumpers no)']
 
-    lines.extend(_prop('Reference', prefix,    _at(name_style),  _effects(name_style)))
+    # Power/supply lib symbol: Reference is the KiCad `#`-prefixed hidden
+    # field (ground truth: KiCad's own GND carries `#PWR`, hidden — the VALUE
+    # is what shows). Without the `#` and the hide, dropping the symbol from
+    # the library paints a stray, offset "GND" over the graphic, and the lib
+    # Reference disagrees with the schematic instance (which prefixes `#`).
+    ref_val = ('#' + prefix if is_power and not prefix.startswith('#')
+               else prefix)
+    # hide when power (#-ref) OR the source had no >NAME (pin-less parts:
+    # fiducials, screws — Eagle never showed a reference for them). Same
+    # "no placeholder = not displayed" rule the schematic instance uses.
+    lines.extend(_prop('Reference', ref_val, _at(name_style),
+                       _effects(name_style), hide=is_power or not has_name))
+    # A power symbol's Value IS the net name it drives (KiCad reads it to name
+    # the net). The generic supply part carries no `value` attr, so fall back
+    # to the symbol name (`GND`, `+3V3`) — otherwise a freshly placed symbol
+    # drives an unnamed net.
+    if is_power and not value_val:
+        value_val = comp_id
     lines.extend(_prop('Value',     _eagle_overbar_to_kicad(value_val),
                        _at(value_style), _effects(value_style)))
     lines.extend(_prop('Footprint', fp_ref,    '0 -2.54 0',      _effects(_hidden), hide=True))
@@ -592,21 +658,12 @@ def export_footprint(fp_el, model_path=None):
 
     m3 = fp_el.find('model3d')
     if m3 is not None and model_path:
-        tx = _f(_mm(m3.get('tx', 0)))
-        ty = _f(_ky(m3.get('ty', 0)))
-        tz = _f(_mm(m3.get('tz', 0)))
-        # Footprint space mirrors Y relative to the IR's Y-up frame. Conjugating
-        # the MCAD-XYZ intrinsic rotation (Rx*Ry*Rz, see ir_schema.md) by that
-        # mirror negates the X and Z components and leaves Y unchanged — same
-        # sign flip already used for in-plane (Z-axis) rotation elsewhere here.
-        rx = _f(-float(m3.get('rx', 0)))
-        ry = _f(float(m3.get('ry', 0)))
-        rz = _f(-float(m3.get('rz', 0)))
+        tx, ty, tz, rx, ry, rz = model3d_kicad_xyz(m3)
         lines += [
             f'  (model {_q(model_path)}',
-            f'    (offset (xyz {tx} {ty} {tz}))',
+            f'    (offset (xyz {_f(tx)} {_f(ty)} {_f(tz)}))',
             f'    (scale (xyz 1 1 1))',
-            f'    (rotate (xyz {rx} {ry} {rz}))',
+            f'    (rotate (xyz {_f(rx)} {_f(ry)} {_f(rz)}))',
             f'  )',
         ]
 

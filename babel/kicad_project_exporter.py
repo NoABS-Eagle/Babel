@@ -223,6 +223,14 @@ class _Page:
         self.height_mm = height_mm
         self.title_attrs = title_attrs   # {'title':..,'date':..,'rev':..,'company':..}
         self.uuid = page_uuid
+        # HIERARCHY-INSTANCE uuid = first path segment of every symbol on this
+        # page (and of module sheets under it). For the PRIMARY root and for
+        # module files it equals the file uuid; a SECONDARY top-level page
+        # (KiCad 10 flat multi-root, ground truth testData/t2) gets a DISTINCT
+        # instance uuid, registered in .kicad_pro "sheets". Overridden in
+        # export_project; defaults to the file uuid so single-root paths are
+        # unaffected.
+        self.path_uuid = page_uuid
         self.page_num = None             # assigned at write time
         self.body = []                   # emitted s-expr chunks (wires, symbols, ...)
         self.lib_ids = set()             # lib_ids used -> lib_symbols cache
@@ -367,8 +375,11 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
               f'\t\t(uuid "{u}")']
 
     ax, ay, arot, asize, aalign = _abs_style('NAME', -2.54)
+    # No >NAME placeholder in the source symbol => Eagle never showed the
+    # reference (pin-less parts: fiducials, screws). Hide it, exactly as Value
+    # is hidden without >VALUE — "no placeholder = not displayed".
     _emit_property(lines, 'Reference', ref, ax, ay, arot, asize, aalign,
-                   hide=ref.startswith('#'))
+                   hide=ref.startswith('#') or 'NAME' not in styles)
     ax, ay, arot, asize, aalign = _abs_style('VALUE', 2.54)
     # Show Value only if the symbol actually has a >VALUE placeholder — an IC
     # with no value (and no >VALUE, e.g. it displays >MANF# instead) must NOT
@@ -400,7 +411,7 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
                       f'\t\t\t\t\t(unit {unit_n})',
                       '\t\t\t\t)']
     else:
-        lines += [f'\t\t\t\t(path "/{page.uuid}"',
+        lines += [f'\t\t\t\t(path "/{page.path_uuid}"',
                   f'\t\t\t\t\t(reference {_q(ref)})',
                   f'\t\t\t\t\t(unit {unit_n})',
                   '\t\t\t\t)']
@@ -803,7 +814,7 @@ def _port_pin_pos(x0_mm, y0_mm, w_mm, h_mm, side, coord_um):
     return cx + coord, y0_mm + h_mm
 
 
-def _emit_sheet(page, inst_el, mod_el, mod_page, proj_name, ns):
+def _emit_sheet(page, inst_el, mod_el, mod_page, proj_name, ns, page_num):
     """One <instance module=...> -> one (sheet ...) block. The instance's
     own rot/mirror is BAKED into this occurrence's layout (KiCad sheets
     carry no angle/mirror of their own — see ir_util.rotate_port_side):
@@ -836,7 +847,10 @@ def _emit_sheet(page, inst_el, mod_el, mod_page, proj_name, ns):
              f'\t\t(uuid "{u}")']
     _emit_property(lines, 'Sheetname', inst_name, x0, y0 - 0.7, 0, 1.27,
                    'bottom-left', hide=False)
-    _emit_property(lines, 'Sheetfile', f'{sanitize_filename(stem)}.kicad_sch',
+    # Sheetfile MUST be the module page's real (collision-resolved) filename,
+    # not a fresh sanitize(stem) — when the module name equals the project (or
+    # a top page) name the module file was renamed to avoid clobbering it.
+    _emit_property(lines, 'Sheetfile', mod_page.fname,
                    x0, y0 + h_mm + 0.6, 0, 1.27, 'top-left', hide=False)
     for p in mod_el.findall('port'):
         side, coord_um = rotate_port_side(
@@ -855,8 +869,8 @@ def _emit_sheet(page, inst_el, mod_el, mod_page, proj_name, ns):
                   '\t\t)']
     lines += ['\t\t(instances',
               f'\t\t\t(project {_q(proj_name)}',
-              f'\t\t\t\t(path "/{page.uuid}"',
-              f'\t\t\t\t\t(page "{mod_page.page_num}")',
+              f'\t\t\t\t(path "/{page.path_uuid}"',
+              f'\t\t\t\t\t(page "{page_num}")',
               '\t\t\t\t)',
               '\t\t\t)',
               '\t\t)',
@@ -1036,7 +1050,8 @@ def _write_page(page, out_dir, comp_by_name, ir_root, lib_name,
     (out_dir / page.fname).write_text('\n'.join(parts) + '\n', encoding='utf-8')
 
 
-def _write_kicad_pro(out_dir, proj_name, ir_root, top_pages, class_patterns):
+def _write_kicad_pro(out_dir, proj_name, ir_root, top_pages, class_patterns,
+                     sheet_registry=None):
     # Schematic wire/bus default for every net class. UNITS TRAP (ground
     # truth freq/multigate .kicad_pro): net-class SCHEMATIC widths are in
     # MILS (wire_width 6, bus_width 12) while the PCB widths in the same JSON
@@ -1111,10 +1126,21 @@ def _write_kicad_pro(out_dir, proj_name, ir_root, top_pages, class_patterns):
         if rules_el.get('min_drill') and rules_el.get('min_annular'):
             rules['min_via_diameter'] = mm('min_drill') + 2 * mm('min_annular')
         pro['board'] = {'design_settings': {'rules': rules}}
+    # KiCad 10 flat multi-root (ground truth testData/t2) uses BOTH fields:
+    #  - top_level_sheets: [{filename, name, uuid}] — one per top-level page;
+    #    its `uuid` is the page's HIERARCHY-INSTANCE uuid (file uuid for the
+    #    primary root, the distinct instance uuid for a secondary top). This
+    #    is what makes KiCad DISCOVER and LOAD the p2/p3 files at all.
+    #  - sheets: [[instance_uuid, name]] — the flat inventory of EVERY sheet
+    #    instance (top pages + every module instance), how KiCad numbers/
+    #    navigates the whole hierarchy.
+    # Emitting only one leaves pages invisible (sheets alone) or the module
+    # instances unregistered (top_level_sheets alone). Both, or neither for a
+    # lone flat page (KiCad fills the single-root form on open).
     if len(top_pages) > 1:
-        pro['schematic'] = {'top_level_sheets': [
-            {'filename': p.fname, 'name': p.name, 'uuid': p.uuid}
-            for p in top_pages]}
+        pro['schematic']['top_level_sheets'] = [
+            {'filename': p.fname, 'name': p.name, 'uuid': p.path_uuid}
+            for p in top_pages]
     (out_dir / f'{proj_name}.kicad_pro').write_text(
         json.dumps(pro, indent=2), encoding='utf-8')
 
@@ -1181,14 +1207,24 @@ def export_project(ir_path, output_dir):
                                    _top_name, ns)
     for i, p in enumerate(top_pages):
         p.page_num = i + 1
+        # KiCad 10 flat multi-root (ground truth testData/t2): the primary
+        # root's hierarchy-instance uuid IS its file uuid; every SECONDARY
+        # top-level page gets a distinct instance uuid (registered in
+        # .kicad_pro "sheets"), used as the first path segment of its symbols
+        # and of the module sheets placed on it. Single-page projects keep
+        # the file uuid (i == 0), so nothing changes for them.
+        if i > 0:
+            p.path_uuid = _quuid(ns, 'topinst', p.name)
 
     # --- Pre-pass: place every module instance on its parent page BEFORE the
     # subsheet symbols are emitted, so each symbol can carry one (instances)
     # path per instantiation (parent page uuid + this instance's sheet uuid +
     # its real designator). Placement/validation only touches top_pages, not
     # the module pages built below — no ordering cycle.
-    modinst_table = {}   # stem -> [(parent_page_uuid, minst_name, offset), ...]
+    modinst_table = {}   # stem -> [(parent_page_path_uuid, minst_name, offset), ...]
     modinst_page = {}    # minst_name -> parent _Page (reused by the sheet loop)
+    modinst_pagenum = {} # minst_name -> global page number (each instance distinct)
+    next_pn = len(top_pages) + 1
     for inst_el in module_insts:
         stem = inst_el.get('module')
         if stem not in {m.get('name') for m in module_els}:
@@ -1199,15 +1235,26 @@ def export_project(ir_path, output_dir):
                               f'{inst_el.get("rot")} is not a multiple of 90 '
                               f'— KiCad sheets only support axis-aligned '
                               f'rotation.')
+        # offset-less module instance -> its designators keep the Eagle
+        # INST:REFDES colon form (TM1:R6). KiCad accepts a colon in a refdes
+        # (verified in real KiCad 10 — the earlier "needs annotation" symptom
+        # was the empty top_level_sheets, not the colon), so the prefix model
+        # works as-is; no reject.
         page = _page_for_point(top_pages, inst_el.get('x'), inst_el.get('y'),
                                inst_el.get('name'))
         modinst_page[inst_el.get('name')] = page
+        modinst_pagenum[inst_el.get('name')] = next_pn
+        next_pn += 1
+        # parent uuid = the page's HIERARCHY-INSTANCE uuid (file uuid for the
+        # primary root, the distinct instance uuid for a secondary top page)
         modinst_table.setdefault(stem, []).append(
-            (page.uuid, inst_el.get('name'), inst_el.get('offset')))
+            (page.path_uuid, inst_el.get('name'), inst_el.get('offset')))
 
     # --- Module pages (one file per module definition).
     mod_page_by_stem = {}
     mod_el_by_stem = {}
+    mod_sym_uuids = {}   # stem -> {canonical designator -> module symbol uuid}
+    used_fnames = {p.fname for p in top_pages}   # reserve top-page filenames
     next_page_num = len(top_pages) + 1
     for mod_el in module_els:
         stem = mod_el.get('name')
@@ -1219,8 +1266,22 @@ def export_project(ir_path, output_dir):
                               f'depth >= 2 is a hard reject (ir_schema.md '
                               f'"Модуль": глубина ровно 1).')
 
-        def _mod_name(idx, _stem=stem):
-            return _stem, f'{sanitize_filename(_stem)}.kicad_sch'
+        # Module file name must not collide with a top-level page file (or
+        # another module) — happens when the module is named after the project
+        # (project NAMUR + module NAMUR would both want NAMUR.kicad_sch, and
+        # the module, written last, would clobber top page 1). Keep the
+        # Sheetname = stem; only the FILE gets a suffix.
+        _base = sanitize_filename(stem)
+        _fn = f'{_base}.kicad_sch'
+        if _fn in used_fnames:
+            _n = 1
+            while f'{_base}_mod{_n}.kicad_sch' in used_fnames:
+                _n += 1
+            _fn = f'{_base}_mod{_n}.kicad_sch'
+        used_fnames.add(_fn)
+
+        def _mod_name(idx, _stem=stem, _f=_fn):
+            return _stem, _f
 
         m_pages = _pages_from_frames(mod_el, m_frames, comp_by_name, pool,
                                      _mod_name, ns)
@@ -1234,10 +1295,14 @@ def export_project(ir_path, output_dir):
 
         hier_ports = {p.get('name'): (p.get('direction', 'io'), None)
                       for p in mod_el.findall('port')}
+        # capture {canonical designator -> module symbol uuid} so the board
+        # can link each module-instance footprint (below)
+        mod_sym_uuids[stem] = {}
         part_page, comp_by_desig = _emit_canvas(
             m_pages, mod_el, m_parts, comp_by_name, pool, lib_name,
             proj_name, ns, hier_ports=hier_ports,
-            module_placements=modinst_table.get(stem, []))
+            module_placements=modinst_table.get(stem, []),
+            sym_uuid_sink=mod_sym_uuids[stem])
         _emit_nets(m_pages, mod_el, part_page, comp_by_desig, pool, ns,
                    hier_ports=hier_ports)
 
@@ -1258,7 +1323,8 @@ def export_project(ir_path, output_dir):
         page = modinst_page[inst_el.get('name')]
         part_page[inst_el.get('name')] = page
         _emit_sheet(page, inst_el, mod_el_by_stem[stem],
-                    mod_page_by_stem[stem], proj_name, ns)
+                    mod_page_by_stem[stem], proj_name, ns,
+                    modinst_pagenum[inst_el.get('name')])
 
     _emit_nets(top_pages, schem_el, part_page, comp_by_desig, pool, ns)
 
@@ -1288,19 +1354,40 @@ def export_project(ir_path, output_dir):
     for stem, mpage in mod_page_by_stem.items():
         _write_page(mpage, out_dir, comp_by_name, ir_root, lib_name,
                     is_module=True)
-    _write_kicad_pro(out_dir, proj_name, ir_root, top_pages, class_patterns)
+    # Hierarchy registry for .kicad_pro "sheets" (ground truth testData/t2):
+    # every top-level page (by its instance uuid) then every module instance
+    # (by its sheet uuid), each paired with a display name — this is how KiCad
+    # 10 discovers all sheets of a flat multi-root design.
+    sheet_registry = [(p.path_uuid, p.name) for p in top_pages]
+    for inst_el in module_insts:
+        sheet_registry.append(
+            (_quuid(ns, 'sheet', inst_el.get('name')), inst_el.get('name')))
+    _write_kicad_pro(out_dir, proj_name, ir_root, top_pages, class_patterns,
+                     sheet_registry)
 
     # --- Board: KiCad's pcb editor only opens boards through a project,
     # so the layout (when present) is written as {proj}.kicad_pcb here.
-    # sym_paths ties each footprint to its schematic symbol (flat design:
-    # a single-segment /uuid path — ground truth). Module-instance parts
-    # (INST:REFDES, inside sub-sheets) would need the sheet-uuid prefix and
-    # are not linked yet (logged).
+    # sym_paths ties each footprint to its schematic symbol. Ground truth
+    # testData/t2: a top-level part is `/{symbol_uuid}` (its page contributes
+    # NO segment), a module-instance part is `/{module_sheet_uuid}/{symbol_uuid}`
+    # — the sheet-instance uuid of that module occurrence + the (shared)
+    # subsheet symbol uuid. Note the parent PAGE uuid is absent from the board
+    # path even though the schematic symbol path carries it.
     if ir_root.find('layout') is not None:
         from babel.kicad_board_exporter import export_board_kicad
         sym_paths = {d: f'/{u}' for d, u in sym_uuids.items()}
+        minst_page_name = {}
+        for inst_el in module_insts:
+            inst_name, stem = inst_el.get('name'), inst_el.get('module')
+            sheet_uuid = _quuid(ns, 'sheet', inst_name)
+            for canonical, symuuid in mod_sym_uuids.get(stem, {}).items():
+                sym_paths[f'{inst_name}:{canonical}'] = f'/{sheet_uuid}/{symuuid}'
+            # top-level page NAME this instance sits on — first segment of its
+            # module-local net paths /{page}/{inst}/{localnet} (ground truth t2)
+            minst_page_name[inst_name] = modinst_page[inst_name].name
         export_board_kicad(ir_path, out_dir / f'{proj_name}.kicad_pcb',
-                           sym_paths=sym_paths, lib_nickname=lib_name)
+                           sym_paths=sym_paths, lib_nickname=lib_name,
+                           minst_page_name=minst_page_name)
 
     pro_path = out_dir / f'{proj_name}.kicad_pro'
     print(f'Written: {pro_path}  ({len(top_pages)} page(s), '
