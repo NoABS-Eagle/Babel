@@ -474,7 +474,8 @@ def export_board(ir_path, output_path=None, layout_name=None):
     if output_path:
         Path(output_path).write_text(result, encoding='utf-8')
         print(f'Written: {output_path}  ({len(elements_ir)} element(s), '
-              f'{len(layout.findall("signal"))} signal(s), copper={len(stack)})')
+              f'{len(layout.findall("signal"))} signal(s), '
+              f'{len(stack)} copper layer(s))')
     return result
 
 

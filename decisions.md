@@ -2809,3 +2809,33 @@ bottom) — визуальный ground truth: все модели на мест
 `eagle_project_parser` → `_copy_step_files`); `<model3d>` в board-путь
 протекал и раньше через общий `convert_package`. Модель без sidecar-файла =
 документированная деградация (лог, плата валидна).
+
+## Стек → KiCad (stackup): эмиссия сделана, правила импорта зафиксированы (2026-07-15)
+
+`(stackup ...)` — опциональный блок ПЕРВЫМ в `(setup)` .kicad_pcb (KiCad пишет
+его только после захода в Board Setup → Physical Stackup; без него KiCad
+показывает дефолты 35µm/FR4). Экспорт (`kicad_board_exporter._emit_stackup`)
+эмитит его всегда, из формулы стека:
+
+- медь `(layer "*.Cu" (type "copper") (thickness мм))` — поячеечно из формулы;
+- зазор `(layer "dielectric N" (type core|prepreg) (thickness мм)
+  [(epsilon_r)] [(loss_tangent)])` — ε/tanδ ТОЛЬКО если есть в формуле;
+  отсутствуют → поля не пишем, `material "FR4"` НЕ пишем никогда (не выдумывать
+  SI-факты; pcbnew грузит без них — проверено оракулом в обеих ветках);
+- core/prepreg НЕ моделируем (решение фабрики): метки по дефолтному генератору
+  самого KiCad — один зазор = core, несколько = крайние prepreg, внутренние
+  core; НА ИМПОРТЕ type игнорируется (в формулу не попадает);
+- маски/пасты/шелк — константный шаблон KiCad (Mask 0.01), copper_finish
+  "None"; внешность (FINISH/MASK_COLOR/SILK_COLOR) НЕ связана со stackup —
+  решение пользователя 2026-07-15 (v1 = только толщины/ε/tanδ), цвета/finish
+  на импорте — дроп с логом;
+- сумма stackup ≡ `(general thickness)` автоматически (одна формула).
+
+ПРАВИЛО ИМПОРТА (код будет в board-импортёре): stackup есть → толщины меди +
+[thickness:ε:tanδ] → формула; stackup НЕТ — НЕ hard reject (штатное состояние
+KiCad-платы): синтез формулы из числа слоёв + дефолтов KiCad (35µm медь,
+диэлектрик добивается до general thickness) с записью в import log.
+
+Верификация: verify_kicad_board.py сверяет каждую ячейку эмитированного
+stackup с формулой IR (maximus 31[100]35[1000]39[200]40 — зелёный).
+Попутно: последний след `copper=` убран из print eagle_board_exporter.

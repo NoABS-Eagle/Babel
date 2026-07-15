@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from babel.eagle_board_exporter import _instance_footprint
-from babel.ir_util import place_ir_element, instance_designator
+from babel.ir_util import place_ir_element, instance_designator, parse_stack
 from babel.kicad_board_exporter import export_board_kicad, _Frame
 
 TOL = 0.002   # mm
@@ -175,6 +175,25 @@ def check(swprj):
     else:
         nets = sum(1 for v in ip.values() if v[2])
         print(f'  ok  {len(ip)} pads position+net (of them {nets} netted)')
+
+    # stackup: every copper/dielectric cell of the emitted (stackup ...)
+    # against the IR stack formula, in order
+    coppers, dielectrics = parse_stack(layout.get('stack'))
+    want = [c / 1000 for c in coppers]
+    want_d = [d[0] / 1000 for d in dielectrics]
+    got = [float(m) for m in re.findall(
+        r'\(layer "[^"]*\.Cu"\n\t\t\t\t\(type "copper"\)'
+        r'\n\t\t\t\t\(thickness ([-0-9.]+)\)', text)]
+    got_d = [float(m) for m in re.findall(
+        r'\(layer "dielectric \d+"\n\t\t\t\t\(type "[^"]*"\)'
+        r'\n\t\t\t\t\(thickness ([-0-9.]+)\)', text)]
+    if got == want and got_d == want_d:
+        print(f'  ok  stackup {len(got)} copper + {len(got_d)} dielectric '
+              f'cells match the IR formula')
+    else:
+        ok = False
+        print(f'  FAIL stackup: kicad cu={got} diel={got_d} '
+              f'ir cu={want} diel={want_d}')
 
     # coarse counts
     for pat, label in ((r'\n\t\(segment', 'segments'),

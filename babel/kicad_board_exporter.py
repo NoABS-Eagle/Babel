@@ -359,6 +359,50 @@ def _emit_embedded_files(out, embedded):
     out.append('\t)')
 
 
+def _emit_stackup(out, coppers, dielectrics):
+    """(stackup ...) inside (setup) from the IR stack formula (plan
+    sharded-chasing-ritchie / decisions.md). Copper + dielectric thickness,
+    ε/tanδ only when the formula carries them — no invented SI facts (no
+    "FR4", no default 4.5/0.02). core/prepreg is the fab's decision, not
+    modelled: labels follow KiCad's own default generator (single gap ->
+    core, else outer gaps prepreg, inner core); import ignores them.
+    Silk/paste/mask boilerplate and copper_finish "None" as KiCad 10 writes
+    them (ground truth Pocket-Lab-Bench-Power). Appearance attrs
+    (FINISH/MASK_COLOR/SILK_COLOR) deliberately NOT wired (user decision
+    2026-07-15: v1 carries thickness/ε/tanδ only)."""
+    n = len(coppers)
+    names = ['F.Cu'] + [f'In{k}.Cu' for k in range(1, n - 1)] + ['B.Cu']
+    out += ['\t\t(stackup',
+            '\t\t\t(layer "F.SilkS"\n\t\t\t\t(type "Top Silk Screen")\n\t\t\t)',
+            '\t\t\t(layer "F.Paste"\n\t\t\t\t(type "Top Solder Paste")\n\t\t\t)',
+            '\t\t\t(layer "F.Mask"\n\t\t\t\t(type "Top Solder Mask")'
+            '\n\t\t\t\t(thickness 0.01)\n\t\t\t)']
+    for i, cu in enumerate(coppers):
+        out += [f'\t\t\t(layer "{names[i]}"',
+                f'\t\t\t\t(type "copper")',
+                f'\t\t\t\t(thickness {_f(cu / 1000)})',
+                f'\t\t\t)']
+        if i < len(dielectrics):
+            d_um, eps, tand = dielectrics[i]
+            kind = 'core' if len(dielectrics) == 1 else \
+                   ('prepreg' if i in (0, len(dielectrics) - 1) else 'core')
+            out += [f'\t\t\t(layer "dielectric {i + 1}"',
+                    f'\t\t\t\t(type "{kind}")',
+                    f'\t\t\t\t(thickness {_f(d_um / 1000)})']
+            if eps is not None:
+                out.append(f'\t\t\t\t(epsilon_r {_f(eps)})')
+            if tand is not None:
+                out.append(f'\t\t\t\t(loss_tangent {_f(tand)})')
+            out.append('\t\t\t)')
+    out += ['\t\t\t(layer "B.Mask"\n\t\t\t\t(type "Bottom Solder Mask")'
+            '\n\t\t\t\t(thickness 0.01)\n\t\t\t)',
+            '\t\t\t(layer "B.Paste"\n\t\t\t\t(type "Bottom Solder Paste")\n\t\t\t)',
+            '\t\t\t(layer "B.SilkS"\n\t\t\t\t(type "Bottom Silk Screen")\n\t\t\t)',
+            '\t\t\t(copper_finish "None")',
+            '\t\t\t(dielectric_constraints no)',
+            '\t\t)']
+
+
 def _placeholder(fp_el, name):
     for t in fp_el.findall('text'):
         if (t.text or '').strip() == '>' + name:
@@ -836,6 +880,8 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
         out.append(f'\t\t({lid} "{name}" {kind}{alias_s})')
     out.append('\t)')
     out.append('\t(setup')
+    # stackup first in setup (node order ground truth: Pocket-Lab v10)
+    _emit_stackup(out, coppers, dielectrics)
     # The page-frame offset parks the board in positive page coords; the IR
     # origin itself is marked with KiCad's own user-origin concept so a
     # future KiCad->IR import restores the source coordinate system exactly
