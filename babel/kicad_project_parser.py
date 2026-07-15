@@ -362,9 +362,12 @@ def _paper_dims_mm(paper):
     edge (297mm) being the width, i.e. landscape-by-default.
     """
     if paper.paperSize == 'User' and paper.width and paper.height:
-        w, h = paper.width, paper.height
-    else:
-        w, h = _ISO_PAPER_MM.get(paper.paperSize, _ISO_PAPER_MM['A4'])
+        # "User" stores the LITERAL (width height) — orientation is baked
+        # into the numbers, the portrait flag applies to named sizes only
+        # (ground truth: our own exporter writes (paper "User" 260.35
+        # 179.07) for a landscape page, and KiCad renders it 260-wide).
+        return (paper.width, paper.height)
+    w, h = _ISO_PAPER_MM.get(paper.paperSize, _ISO_PAPER_MM['A4'])
     return (h, w) if not paper.portrait else (w, h)
 
 
@@ -2204,6 +2207,21 @@ def convert_project_full(src, output_path):
             import_log.log('netclass_patterns', p, 'NETCLASS pattern matched no net, ignored')
 
     _write_canvas(schem_el, cv_top, nets, wire_default_um, wire_um_by_class)
+
+    # --- board: .kicad_pcb -> <layout> (kicad_board_parser, raw s-expr).
+    # A project with no board is a legitimate schematic-only project.
+    if pcb_path.exists():
+        if modules:
+            # module boards carry flattened refdes (TM1:C1 -> C101) and
+            # hierarchical net names — the reverse mapping isn't built yet
+            # (flat projects first, simple -> complex)
+            import_log.log('kicad_pcb', pro_path.stem, 'BOARD deferred',
+                           f'hierarchical project ({len(modules)} module(s)) '
+                           f'— module board import not supported yet')
+        else:
+            from babel.kicad_board_parser import convert_board
+            known_refdes = {i.get('name') for i in schem_el.iter('instance')}
+            convert_board(pcb_path, proj_el, known_refdes)
 
     raw = minidom.parseString(ET.tostring(proj_el, encoding='unicode')).toprettyxml(indent='  ')
     output_path.write_text(raw, encoding='utf-8')
