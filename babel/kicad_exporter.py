@@ -346,6 +346,7 @@ def export_symbol(comp_el, root, lib_name):
     name_style        = _def_style(2.54)
     value_style       = _def_style(0)
     has_name          = False   # source symbol carries a >NAME placeholder?
+    has_value         = False   # ...a >VALUE placeholder?
     placeholder_style = {}   # lowercase attr name → style dict
     for el in sym_el:
         if el.tag != 'text':
@@ -362,7 +363,7 @@ def export_symbol(comp_el, root, lib_name):
             'ratio': int(el.get('ratio', '8')),
         }
         if txt == '>NAME':    name_style, has_name = info, True
-        elif txt == '>VALUE': value_style = info
+        elif txt == '>VALUE': value_style, has_value = info, True
         else:                 placeholder_style[txt[1:].lower()] = info
 
     def _effects(style):
@@ -460,8 +461,15 @@ def export_symbol(comp_el, root, lib_name):
             value_val = next(iter(sup_names))
         elif not value_val:
             value_val = comp_id
+    # Value visible only when the source symbol SHOWS it (>VALUE
+    # placeholder) — no placeholder = not displayed, same rule the
+    # schematic-instance emitter already follows; power symbols keep it
+    # visible always (Value IS the rail label KiCad renders). Found by the
+    # closed-loop linter: an always-visible Value came back to IR as a
+    # >VALUE placeholder the original never had.
     lines.extend(_prop('Value',     _eagle_overbar_to_kicad(value_val),
-                       _at(value_style), _effects(value_style)))
+                       _at(value_style), _effects(value_style),
+                       hide=not has_value and not is_power))
     lines.extend(_prop('Footprint', fp_ref,    '0 -2.54 0',      _effects(_hidden), hide=True))
     lines.extend(_prop('Datasheet', datasheet, '0 -5.08 0',      _effects(_hidden), hide=True))
     # Attrs: visible if Eagle had a >ATTRNAME placeholder, hidden otherwise

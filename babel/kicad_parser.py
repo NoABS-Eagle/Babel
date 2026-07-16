@@ -929,7 +929,11 @@ def _convert_symbol(symbol, pool, symbols_el):
             elif p.key == 'Value':
                 placeholder = 'VALUE'
             else:
-                placeholder = clean_attr_name(p.key)
+                # Eagle recognizes ONLY uppercase >PLACEHOLDER text;
+                # attr keys keep their own case (matching is case-
+                # insensitive everywhere: Eagle itself, svg_renderer,
+                # kicad_exporter's attrs_lower)
+                placeholder = clean_attr_name(p.key).upper()
             if placeholder:
                 _emit_property_placeholder(sym_el, placeholder, p)
 
