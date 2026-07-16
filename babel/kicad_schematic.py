@@ -145,18 +145,22 @@ def field_to_kicad(inst_x_um, inst_y_um, ir_rot, ir_mirror,
       - position: flip local X when mirrored, rotate by −θ when mirrored
         else +θ (six hand-placed IRLML9301 in real KiCad, rot 0/90/180/270
         x mirror none/x/y — decisions.md «Баг 1»);
-      - angle: the field ROTATES WITH the symbol — abs = θ − lrot when
-        mirrored else θ + lrot (user-verified on RC: coordinates landed
-        right, angles didn't, manually fixing ONLY the angle made KiCad
-        match Eagle), folded to [0,180) with justify PRESERVED
-        (kicad_exporter._norm_text_angle ground truth).
+      - angle: emit the field's LOCAL angle only — KiCad STORES the field
+        angle relative to the symbol body and adds the symbol's own
+        rotation/mirror at render time (NOT us). Proven decisively by
+        rendering RC through kicad-cli: a rot-90 C's fields land VERTICAL
+        (correct, matches Eagle) only when the property angle is the local
+        0 — property angle 90 renders them horizontal (90+90=180). The
+        earlier "field rotates with the symbol" reading double-counted the
+        rotation. Cross-checked against a KiCad-owned resave (step4): KiCad
+        itself writes property angle 0 for every rot-90 symbol. Folded to
+        [0,180), justify preserved (kicad_exporter._norm_text_angle).
     """
     fx = -float(lx_um) if ir_mirror else float(lx_um)
     th = math.radians(-ir_rot if ir_mirror else ir_rot)
     ax = inst_x_um + fx * math.cos(th) - float(ly_um) * math.sin(th)
     ay = inst_y_um + fx * math.sin(th) + float(ly_um) * math.cos(th)
-    arot = (ir_rot - lrot) if ir_mirror else (ir_rot + lrot)
-    return ax, ay, arot % 180
+    return ax, ay, lrot % 180
 
 
 def field_from_kicad(inst_x_um, inst_y_um, ir_rot, ir_mirror,
@@ -171,8 +175,9 @@ def field_from_kicad(inst_x_um, inst_y_um, ir_rot, ir_mirror,
     ly = ddx * math.sin(th) + ddy * math.cos(th)
     if ir_mirror:
         lx = -lx
-    lrot = ((ir_rot - arot) if ir_mirror else (arot - ir_rot)) % 180
-    return lx, ly, lrot
+    # KiCad's stored field angle IS already the local (symbol-relative)
+    # angle — pass it straight through (see field_to_kicad).
+    return lx, ly, arot % 180
 
 
 def _abs_pin_pos_mm(pin_x_mm, pin_y_mm, inst_x_mm, inst_y_mm, eff_angle, flip_x):
