@@ -129,6 +129,52 @@ def _mirror_and_angle(angle, mirror):
     return eff_angle, flip_x, ir_rot, ir_mirror
 
 
+def field_to_kicad(inst_x_um, inst_y_um, ir_rot, ir_mirror,
+                   lx_um, ly_um, lrot):
+    """THE field transform, forward: an instance-local field record (IR Y-up
+    µm anchor + local angle — a library placeholder anchor or a smashed
+    <instance><text> override, same thing) -> absolute IR-canvas anchor +
+    the folded absolute angle KiCad displays.
+
+    Single source of truth — the exporter's default and override branches
+    and the importer's inverse all call this pair; the transform used to
+    live in three places and every fix in one broke another (user: «починим
+    раз и навсегда»).
+
+    Rules (each one empirically pinned):
+      - position: flip local X when mirrored, rotate by −θ when mirrored
+        else +θ (six hand-placed IRLML9301 in real KiCad, rot 0/90/180/270
+        x mirror none/x/y — decisions.md «Баг 1»);
+      - angle: the field ROTATES WITH the symbol — abs = θ − lrot when
+        mirrored else θ + lrot (user-verified on RC: coordinates landed
+        right, angles didn't, manually fixing ONLY the angle made KiCad
+        match Eagle), folded to [0,180) with justify PRESERVED
+        (kicad_exporter._norm_text_angle ground truth).
+    """
+    fx = -float(lx_um) if ir_mirror else float(lx_um)
+    th = math.radians(-ir_rot if ir_mirror else ir_rot)
+    ax = inst_x_um + fx * math.cos(th) - float(ly_um) * math.sin(th)
+    ay = inst_y_um + fx * math.sin(th) + float(ly_um) * math.cos(th)
+    arot = (ir_rot - lrot) if ir_mirror else (ir_rot + lrot)
+    return ax, ay, arot % 180
+
+
+def field_from_kicad(inst_x_um, inst_y_um, ir_rot, ir_mirror,
+                     ax_um, ay_um, arot):
+    """THE field transform, inverse of field_to_kicad: absolute KiCad
+    anchor/angle -> instance-local record. field_from_kicad(field_to_kicad)
+    is the identity modulo the [0,180) angle fold (which both formats
+    render identically, justify preserved)."""
+    ddx, ddy = ax_um - inst_x_um, ay_um - inst_y_um
+    th = math.radians(ir_rot if ir_mirror else -ir_rot)
+    lx = ddx * math.cos(th) - ddy * math.sin(th)
+    ly = ddx * math.sin(th) + ddy * math.cos(th)
+    if ir_mirror:
+        lx = -lx
+    lrot = ((ir_rot - arot) if ir_mirror else (arot - ir_rot)) % 180
+    return lx, ly, lrot
+
+
 def _abs_pin_pos_mm(pin_x_mm, pin_y_mm, inst_x_mm, inst_y_mm, eff_angle, flip_x):
     """Pin local position (mm, Y-up library convention) + this instance's
     ALREADY-Y-flipped IR-canvas position (inst_x_mm, inst_y_mm — i.e. the

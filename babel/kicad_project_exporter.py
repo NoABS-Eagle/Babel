@@ -41,7 +41,7 @@ from pathlib import Path
 from babel import import_log
 from babel.ir_util import (symbol_pool, component_gates, sanitize_filename,
                             rotate_port_side, arc_mid, instance_designator)
-from babel.kicad_schematic import _collinear_between
+from babel.kicad_schematic import _collinear_between, field_to_kicad
 from babel.kicad_exporter import (
     export as export_library, export_symbol,
     _f, _mm, _q, _justify, _build_pin_map, _eagle_overbar_to_kicad,
@@ -177,32 +177,9 @@ def _placeholder_styles(sym_el):
     return styles
 
 
-def _inst_point(lx_um, ly_um, inst_el):
-    """Symbol-local point (µm, Y-up) -> absolute IR canvas point (µm, Y-up)
-    for FIELD/placeholder placement under the instance transform.
-
-    Mirror negates local X (mirror-Y convention, matching the `(mirror y)` we
-    emit) AND reverses the rotation sense. That theta flip is what makes this
-    DIVERGE, deliberately, from the body/pin transform (svg_renderer._inst_point
-    / _abs_pin_pos_mm use plain mirror-then-rotate-CCW): KiCad applies a
-    DIFFERENT rule to a mirrored symbol's field anchors than to its body —
-    their own field-mirror vs body-mirror inconsistency. Without the flip the
-    fields of a mirrored, rotated symbol land 180° off (Bug 1). Ground-truthed
-    against six hand-placed IRLML9301 instances in real KiCad 10 (rot 0/90/180/
-    270 × mirror none/x/y): the negate-theta form reproduces all six field
-    offsets exactly; the old CCW form matched only the unmirrored + mirror@rot0
-    cases and inverted mirror@rot90/270. Pin connectivity is untouched (KiCad
-    recomputes pins itself from `(mirror y)`+angle — this function never moves
-    them)."""
-    x, y = lx_um, ly_um
-    theta = math.radians(float(inst_el.get('rot', '0')))
-    if inst_el.get('mirror') == '1':
-        x = -x
-        theta = -theta          # mirror reverses rotation handedness for fields
-    xr = x * math.cos(theta) - y * math.sin(theta)
-    yr = x * math.sin(theta) + y * math.cos(theta)
-    return float(inst_el.get('x')) + xr, float(inst_el.get('y')) + yr
-
+# _inst_point (mirrored-field theta negation) moved into
+# kicad_schematic.field_to_kicad — THE single field transform shared
+# by export (default + override branches) and import (see its doc).
 
 # ---------------------------------------------------------------------------
 # Page model
@@ -377,38 +354,26 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
         t = overrides.get(key.lower())
         return t is not None and t.get('hidden') == 'yes' and t.get('x') is None
 
+    ix_um, iy_um = float(inst_el.get('x')), float(inst_el.get('y'))
+
     def _abs_style(key, default_dy_mm):
+        # Library placeholder and smashed override are the same kind of
+        # record — both go through THE single field transform
+        # (kicad_schematic.field_to_kicad); only the record source differs.
         t = overrides.get(key.lower())
         if t is not None and t.get('x') is not None:
-            # instance-local Y-up µm -> absolute, IR canonical body
-            # transform (flip local X, then rotate CCW — svg canon);
-            # the record's angle is instance-relative, display angle is
-            # absolute (Eagle smashed records store absolute angles,
-            # eagle_parser localized them with this exact inverse)
             lx, ly = float(t.get('x', 0)), float(t.get('y', 0))
             lrot = float(t.get('rot', 0) or 0)
-            if inst_mirror:
-                lx = -lx
-            r = math.radians(inst_rot)
-            axu = float(inst_el.get('x')) + lx * math.cos(r) - ly * math.sin(r)
-            ayu = float(inst_el.get('y')) + lx * math.sin(r) + ly * math.cos(r)
-            ax, ay = page.pt(axu, ayu)
-            arot = (inst_rot - lrot) % 360 if inst_mirror \
-                else (inst_rot + lrot) % 360
-            return (ax, ay, arot % 360,
-                    float(t.get('size', 1778)) / 1000,
-                    t.get('align', 'bottom-left'))
-        if key in styles:
+            lsize = float(t.get('size', 1778))
+            lalign = t.get('align', 'bottom-left')
+        elif key in styles:
             lx, ly, lrot, lsize, lalign = styles[key]
-            axu, ayu = _inst_point(lx, ly, inst_el)
-            ax, ay = page.pt(axu, ayu)
-            # Field ANGLE is the library placeholder's own angle, NOT
-            # lrot + symbol rotation: KiCad does not spin field text with the
-            # symbol — it keeps the text readable (library angle) and only
-            # moves its position. Ground truth: a C symbol placed by KiCad at
-            # rot=90 keeps Reference/Value at angle 0, position rotated.
-            return ax, ay, lrot, lsize / 1000, lalign
-        return kx, ky + default_dy_mm, 0, 1.27, 'center'
+        else:
+            return kx, ky + default_dy_mm, 0, 1.27, 'center'
+        axu, ayu, arot = field_to_kicad(ix_um, iy_um, inst_rot, inst_mirror,
+                                        lx, ly, lrot)
+        ax, ay = page.pt(axu, ayu)
+        return ax, ay, arot, lsize / 1000, lalign
 
     u = _quuid(ns, 'sym', page.name, designator, unit_n)
     # The board footprint links to the PRIMARY unit's symbol (unit 1); record

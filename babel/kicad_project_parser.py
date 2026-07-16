@@ -104,7 +104,9 @@ from babel.kicad_parser import (
     _unit_id_to_gate_letter, _KICAD_RESERVED_PROP_KEYS, _align,
     _is_erc_power_source, _contains_hide_yes,
 )
-from babel.kicad_schematic import _pt, _mirror_and_angle, _abs_pin_pos_mm, _build_nets
+from babel.kicad_schematic import (_pt, _mirror_and_angle, _abs_pin_pos_mm,
+                                   _build_nets, field_to_kicad,
+                                   field_from_kicad)
 from babel.svg_renderer import _bounds
 
 _EMBED_PREFIX = 'kicad-embed://'
@@ -1070,25 +1072,14 @@ def _field_overrides(sym, sym_el, inst_x_um, inst_y_um, ir_rot, ir_mirror, dx,
         aalign = _align(p.effects.justify if p.effects else None)
         if lib is not None:
             lx, ly, lrot, lsize, lalign = lib
-            fx = -lx if ir_mirror else lx
-            th = math.radians(-ir_rot if ir_mirror else ir_rot)
-            ex = inst_x_um + fx * math.cos(th) - ly * math.sin(th)
-            ey = inst_y_um + fx * math.sin(th) + ly * math.cos(th)
+            ex, ey, erot = field_to_kicad(inst_x_um, inst_y_um,
+                                          ir_rot, ir_mirror, lx, ly, lrot)
             if (abs(ex - ax) < 5 and abs(ey - ay) < 5
-                    and (aang - lrot) % 180 == 0
+                    and (aang - erot) % 180 == 0
                     and abs(asize - lsize) <= 1 and aalign == lalign):
                 continue
-        ddx, ddy = ax - inst_x_um, ay - inst_y_um
-        r = math.radians(-ir_rot)
-        lx = ddx * math.cos(r) - ddy * math.sin(r)
-        ly = ddx * math.sin(r) + ddy * math.cos(r)
-        if ir_mirror:
-            lx = -lx
-        # Text angles fold to [0,180) with justify PRESERVED — both KiCad
-        # and Eagle render upside-down text right-side up around the same
-        # anchor (ground truth: kicad_exporter._norm_text_angle), so the
-        # +180 representative is the same record.
-        lrot = ((ir_rot - aang) if ir_mirror else (aang - ir_rot)) % 180
+        lx, ly, lrot = field_from_kicad(inst_x_um, inst_y_um,
+                                        ir_rot, ir_mirror, ax, ay, aang)
         rec = {'_text': f'>{key}', 'x': str(round(lx)), 'y': str(round(ly)),
                'size': str(asize), 'align': aalign, 'font': 'vector'}
         if lrot:
