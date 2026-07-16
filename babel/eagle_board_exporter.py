@@ -129,9 +129,15 @@ def _element_rot(e):
     return f'R{rot:g}' if rot else None
 
 
-def _emit_element_attribute(el_out, t, e):
-    """IR <text> placeholder override -> Eagle <attribute> (absolute board
-    coords/angle — the exact inverse of _convert_element's localization)."""
+_EAGLE_SILK = {21, 22, 25, 26, 27, 28}   # tPlace/bPlace, tNames/…, tValues/…
+
+
+def _emit_element_attribute(el_out, t, e, force_layer=None):
+    """IR <text> placeholder (footprint default OR element override) ->
+    Eagle <attribute> (absolute board coords/angle — the exact inverse of
+    _convert_element's localization). `force_layer` overrides the mapped
+    layer (NAME/VALUE go on their canonical tNames/tValues, not the
+    footprint placeholder's own silk layer)."""
     import math
     a = ET.SubElement(el_out, 'attribute')
     a.set('name', (t.text or '').strip().lstrip('>'))
@@ -156,8 +162,11 @@ def _emit_element_attribute(el_out, t, e):
     a.set('x', _tomm(str(round(ax)))); a.set('y', _tomm(str(round(ay))))
     amirror = (t.get('mirror') == '1') != mirror
     a.set('size', _tomm(t.get('size', '1778')))
-    eagle_layer = _pkg_eagle_layer(t.get('layer') or '125')
-    a.set('layer', str(eagle_layer if eagle_layer is not None else 25))
+    if force_layer is not None:
+        a.set('layer', str(force_layer))
+    else:
+        eagle_layer = _pkg_eagle_layer(t.get('layer') or '125')
+        a.set('layer', str(eagle_layer if eagle_layer is not None else 25))
     if amirror:
         # arot is the IR-absolute placed angle; Eagle MR wants its own
         # rotate-then-mirror reading — the −α inverse, as everywhere
@@ -390,15 +399,38 @@ def export_board(ir_path, output_path=None, layout_name=None):
         el_out.set('value', value)
         el_out.set('x', _tomm(e.get('x'))); el_out.set('y', _tomm(e.get('y')))
         rot = _element_rot(e)
-        texts = e.findall('text')
-        if texts:
+        # Visible silk text on a board element = the FOOTPRINT's >NAME/
+        # >VALUE placeholders (источник истины — библиотека), NOT whatever
+        # the element instance happens to carry: an Eagle element shows text
+        # only via <attribute> records, and Eagle's own "Restore Position"
+        # materializes one per package placeholder. The KiCad round-trip
+        # gives the element ZERO overrides (nothing moved) — driving the set
+        # from the footprint is what keeps >NAME from vanishing (RC board:
+        # R1 came back with no refdes text). A placeholder on a non-silk
+        # layer (a KiCad Value fp_text on F.Fab) is NOT shown.
+        overrides = {(t.text or '').strip().lstrip('>').upper(): t
+                     for t in e.findall('text')}
+        fp_texts = {(t.text or '').strip().lstrip('>').upper(): t
+                    for t in fp.findall('text')
+                    if (t.text or '').strip().startswith('>')}
+        if fp_texts:
             el_out.set('smashed', 'yes')
         if rot:
             el_out.set('rot', rot)
         emitted = set()
-        for t in texts:
-            _emit_element_attribute(el_out, t, e)
-            emitted.add((t.text or '').strip().lstrip('>'))
+        for nm, fpt in fp_texts.items():
+            ov = overrides.get(nm)
+            src = ov if (ov is not None and (ov.get('x') is not None
+                         or ov.get('hidden') == 'yes')) else fpt
+            eagle_layer = _pkg_eagle_layer(fpt.get('layer') or '121')
+            if nm == 'NAME':
+                _emit_element_attribute(el_out, src, e, force_layer=25)
+            elif eagle_layer in _EAGLE_SILK:
+                _emit_element_attribute(el_out, src, e,
+                                        force_layer=27 if nm == 'VALUE' else None)
+            else:
+                continue           # non-silk placeholder (fab value) — not shown
+            emitted.add(nm)
         if inst is not None and comp is not None:
             # Eagle keeps a value copy of every part attribute ON the board
             # element (editable from the board editor; can even exist only
