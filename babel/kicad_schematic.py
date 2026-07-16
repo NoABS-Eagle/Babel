@@ -142,9 +142,16 @@ def field_to_kicad(inst_x_um, inst_y_um, ir_rot, ir_mirror,
     раз и навсегда»).
 
     Rules (each one empirically pinned):
-      - position: flip local X when mirrored, rotate by −θ when mirrored
-        else +θ (six hand-placed IRLML9301 in real KiCad, rot 0/90/180/270
-        x mirror none/x/y — decisions.md «Баг 1»);
+      - position: flip local X when mirrored (My), then ALWAYS rotate by
+        +θ — same mirror-then-rotate composition IR uses everywhere
+        (svg_renderer._inst_point). Ground truth: KiCad-native mirrored
+        copies Q9/Q10 in RC (same orientation as our Q3/Q7 but fields
+        placed by KiCad itself) — for mirror+rot90/270 our old −θ put the
+        field offset exactly 180° off (Q3 gave (+3.81,+0.25), correct Q9
+        is (−3.81,−0.25)); +θ reproduces Q9/Q10 exactly and leaves the
+        mirror+rot0/180 cases (which already matched) untouched. The
+        earlier −θ «Баг 1» reading was compensating for something since
+        refactored away;
       - angle: emit the field's LOCAL angle only — KiCad STORES the field
         angle relative to the symbol body and adds the symbol's own
         rotation/mirror at render time (NOT us). Proven decisively by
@@ -157,7 +164,7 @@ def field_to_kicad(inst_x_um, inst_y_um, ir_rot, ir_mirror,
         [0,180), justify preserved (kicad_exporter._norm_text_angle).
     """
     fx = -float(lx_um) if ir_mirror else float(lx_um)
-    th = math.radians(-ir_rot if ir_mirror else ir_rot)
+    th = math.radians(ir_rot)
     ax = inst_x_um + fx * math.cos(th) - float(ly_um) * math.sin(th)
     ay = inst_y_um + fx * math.sin(th) + float(ly_um) * math.cos(th)
     return ax, ay, lrot % 180
@@ -170,7 +177,7 @@ def field_from_kicad(inst_x_um, inst_y_um, ir_rot, ir_mirror,
     is the identity modulo the [0,180) angle fold (which both formats
     render identically, justify preserved)."""
     ddx, ddy = ax_um - inst_x_um, ay_um - inst_y_um
-    th = math.radians(ir_rot if ir_mirror else -ir_rot)
+    th = math.radians(-ir_rot)
     lx = ddx * math.cos(th) - ddy * math.sin(th)
     ly = ddx * math.sin(th) + ddy * math.cos(th)
     if ir_mirror:
