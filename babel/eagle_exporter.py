@@ -973,7 +973,34 @@ def _emit_part(parts_el, inst_el, comp_el, lib_name, dev_name_by_fp):
                         'base design, dropped')
 
 
-def _emit_instance(instances_el, inst_el):
+def _gate_placeholders(comp_el, gate, pool):
+    """The LIBRARY symbol's >PLACEHOLDER texts for this instance's gate —
+    {NAME: {x,y,rot,size,align,layer}}. The set of visible fields is a fact
+    of the SYMBOL, not the instance (decisions.md «источник истины —
+    библиотечный символ»): a smashed Eagle instance must carry one
+    <attribute> per library placeholder or the missing ones vanish."""
+    gates = component_gates(comp_el)
+    sym_name = next((sn for gn, sn in gates if gn == gate), None) \
+        if gate else None
+    if sym_name is None:
+        sym_name = gates[0][1] if gates else None
+    out = {}
+    sym = pool.get(sym_name) if sym_name else None
+    if sym is not None:
+        for t in sym.findall('text'):
+            s = (t.text or '').strip()
+            if s.startswith('>'):
+                out[s[1:].upper()] = {
+                    'x': float(t.get('x', 0)), 'y': float(t.get('y', 0)),
+                    'rot': float(t.get('rot', 0) or 0),
+                    'size': t.get('size', '1778'),
+                    'align': t.get('align', 'bottom-left'),
+                    'layer': t.get('layer', 'VALUES'),
+                }
+    return out
+
+
+def _emit_instance(instances_el, inst_el, placeholders):
     """One Eagle <instance> from one IR component <instance> — shared by
     the top-level sheets and module sheets.
 
@@ -983,60 +1010,69 @@ def _emit_instance(instances_el, inst_el):
     <instance gate="..."> means the same thing, just always required
     (no implicit single-gate default the way IR omits it for
     single-mode components), hence the 'G$1' fallback for those.
-    """
+
+    Eagle smash model: an UN-smashed instance carries NO <attribute> records
+    and Eagle auto-places every library placeholder; a SMASHED instance
+    carries one <attribute> per library placeholder (moved ones at their
+    IR-override position, the rest at the library default). Driving the set
+    from `placeholders` (the SYMBOL), not the instance override list, is
+    what stops un-moved fields from disappearing on the KiCad round-trip
+    (RC: R1 came back with only a spurious DESCRIPTION and lost NAME/VALUE/
+    PACKAGE/TOLERANCE/ALLOCATED — the instance carried a minimal override
+    set, one fact one place)."""
     kwargs = {'part': inst_el.get('name'), 'gate': inst_el.get('gate') or 'G$1',
               'x': _tomm(inst_el.get('x')), 'y': _tomm(inst_el.get('y'))}
     rot = _instance_rot_attr(inst_el)
     if rot:
         kwargs['rot'] = rot
-    texts = inst_el.findall('text')
-    if texts:
+    overrides = {(t.text or '').strip().lstrip('>').upper(): t
+                 for t in inst_el.findall('text')}
+    if overrides:
         kwargs['smashed'] = 'yes'
     out = ET.SubElement(instances_el, 'instance', **kwargs)
-    # placeholder records back to ABSOLUTE coords/angles — Eagle 9 treats a
-    # missing record on a smashed instance as hidden (exact inverse of the
-    # import-side localization; same mechanism as the board <element>)
+    if not overrides:
+        return                     # Eagle auto-positions every placeholder
+
+    # Emit ONE <attribute> per library placeholder, absolute coords/angles.
     inst_rot = float(inst_el.get('rot', 0))
     inst_mirror = inst_el.get('mirror') == '1'
     ex_um, ey_um = float(inst_el.get('x')), float(inst_el.get('y'))
-    for t in texts:
+    for name, ph in placeholders.items():
+        t = overrides.get(name)
         a = ET.SubElement(out, 'attribute')
-        a.set('name', (t.text or '').strip().lstrip('>'))
-        if t.get('hidden') == 'yes' and t.get('x') is None:
+        a.set('name', name)
+        if t is not None and t.get('hidden') == 'yes' and t.get('x') is None:
             # suppression-only override (no user-placed geometry)
             a.set('x', _tomm(inst_el.get('x'))); a.set('y', _tomm(inst_el.get('y')))
-            a.set('size', '1.778'); a.set('layer', '96')
-            a.set('display', 'off')
+            a.set('size', _tomm(ph['size'])); a.set('display', 'off')
+            a.set('layer', _SYM_TEXT_LAYER.get(ph['layer'], '96'))
             continue
-        lx, ly = float(t.get('x', 0)), float(t.get('y', 0))
-        lrot = float(t.get('rot', 0))
+        # position/angle from the override when the field was MOVED, else
+        # the library default; style (size/align/layer) is ALWAYS the
+        # library's (источник истины — символ)
+        if t is not None and t.get('x') is not None:
+            lx, ly = float(t.get('x', 0)), float(t.get('y', 0))
+            lrot = float(t.get('rot', 0) or 0)
+        else:
+            lx, ly, lrot = ph['x'], ph['y'], ph['rot']
         if inst_mirror:
             lx = -lx
-            # NOTE: lrot is NOT pre-negated — the mirror branch of the
-            # arot formula below is the whole inverse (negating here too
-            # applied the flip twice: C48 ELITAN came back R180 for R0)
         r = math.radians(inst_rot)
         ax = ex_um + lx * math.cos(r) - ly * math.sin(r)
         ay = ey_um + lx * math.sin(r) + ly * math.cos(r)
-        arot = (inst_rot + lrot) % 360 if not inst_mirror else (inst_rot - lrot) % 360
-        amirror = (t.get('mirror') == '1') != inst_mirror
+        arot = (inst_rot - lrot) % 360 if inst_mirror else (inst_rot + lrot) % 360
         a.set('x', _tomm(str(round(ax)))); a.set('y', _tomm(str(round(ay))))
-        a.set('size', _tomm(t.get('size', '1778')))
-        a.set('layer', _SYM_TEXT_LAYER.get(t.get('layer', 'VALUES'),
-                                           t.get('layer', '96')))
-        if t.get('font') == 'vector':
-            a.set('font', 'vector')
-        if t.get('ratio'):
-            a.set('ratio', t.get('ratio'))
+        a.set('size', _tomm(ph['size']))
+        a.set('layer', _SYM_TEXT_LAYER.get(ph['layer'], '96'))
+        a.set('font', 'vector')
         rs = f'{arot:g}'
-        if amirror:
+        if inst_mirror:
             a.set('rot', f'MR{rs}')
         elif arot:
             a.set('rot', f'R{rs}')
-        align = t.get('align', 'bottom-left')
-        if align != 'bottom-left':
-            a.set('align', align)
-        if t.get('hidden') == 'yes':
+        if ph['align'] != 'bottom-left':
+            a.set('align', ph['align'])
+        if t is not None and t.get('hidden') == 'yes':
             a.set('display', 'off')
 
 
@@ -1402,7 +1438,9 @@ def _export_module(modules_el, mod_el, lib_name, comp_by_name, dev_name_by_fp, p
         if comp_el.get('synth') == 'frame':
             _emit_frame(plain_el, _frame_bbox(inst_el, comp_el, pool), inst_el, comp_el, pool)
     for inst_el in insts:
-        _emit_instance(instances_el, inst_el)
+        comp_el = comp_by_name.get(inst_el.get('component'))
+        ph = _gate_placeholders(comp_el, inst_el.get('gate'), pool) if comp_el is not None else {}
+        _emit_instance(instances_el, inst_el, ph)
     for el in mod_el:
         if el.tag in ('line', 'arc', 'shape'):
             _emit_deco(plain_el, el)
@@ -1695,7 +1733,9 @@ def export_schematic(ir_path, output_path=None):
                    if i.get('component') in comp_by_name
                    and is_multi_gate(comp_by_name[i.get('component')])}
     for inst_el in part_insts:
-        _emit_instance(instances_els[part_sheet[inst_el.get('name')]], inst_el)
+        comp_el = comp_by_name.get(inst_el.get('component'))
+        ph = _gate_placeholders(comp_el, inst_el.get('gate'), pool) if comp_el is not None else {}
+        _emit_instance(instances_els[part_sheet[inst_el.get('name')]], inst_el, ph)
 
     # Decorative canvas geometry (ir_schema.md "Декоративная геометрия
     # схемы") — direct <line>/<shape>/<arc> children of <schematic>, not

@@ -1065,6 +1065,16 @@ def _field_overrides(sym, sym_el, inst_x_um, inst_y_um, ir_rot, ir_mirror, dx,
             if lib is not None:
                 out.append({'_text': f'>{key}', 'hidden': 'yes'})
             continue
+        # A field is a VISIBLE placeholder only if the LIBRARY symbol
+        # defines it (principle: источник истины — символ, не инстанс). A
+        # shown KiCad property with no matching >PLACEHOLDER (e.g. KiCad's
+        # auto-added empty "Description") is a device attribute, collected
+        # by value elsewhere — never a smashed text record. Without this it
+        # sprouted a spurious >DESCRIPTION that, on Eagle export, smashed
+        # the instance and hid every real placeholder (RC round-trip: R1
+        # came back with only DESCRIPTION).
+        if lib is None:
+            continue
         ax = (p.position.X + dx) * 1000
         ay = -p.position.Y * 1000
         aang = float(p.position.angle or 0) % 360
