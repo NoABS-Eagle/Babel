@@ -108,21 +108,23 @@ def _mirror_and_angle(angle, mirror):
     ir_rot/ir_mirror — литеральное копирование, не формула" for the full
     history and the methodological lesson.
     """
-    eff_angle = (angle + 180) % 360 if mirror == 'x' else angle % 360
+    ir_rot = (angle + 180) % 360 if mirror == 'x' else angle % 360
     flip_x = mirror in ('x', 'y')
-    if flip_x:
-        # KiCad composes a mirrored placement as mirror-AFTER-rotate; IR's
-        # canon is mirror-then-rotate (svg_renderer._inst_point). The two
-        # differ by the rotation sense: M·R(θ) = R(−θ)·M — so a mirrored
-        # KiCad angle lands in IR negated. Perfectly symmetric to Eagle's
-        # MR{α} -> IR −α finding (decisions.md), and proven directly
-        # against KiCad itself: a 12-orientation truth table (4 angles x
-        # none/x/y, kicad-cli netlist as the oracle) — the un-negated form
-        # missed the pin entirely at every mirror+90/270 combo, the
-        # negated form hits all 12/12 (closed-loop catch: tolmach's
-        # mirrored R47/C48/Q1/ZD2 came back with swapped/lost pins).
-        eff_angle = (-eff_angle) % 360
-    ir_rot = eff_angle
+    # The STORED angle stays the literal copy (confirmed by the user against
+    # real KiCad + real Eagle side by side, U6 — see below). The angle fed
+    # into THIS module's own pin-position math, however, must be NEGATED for
+    # a mirrored placement: _abs_pin_pos_mm composes flip-then-rotate in its
+    # Y-mixed working convention, and KiCad's actual mirrored rendering
+    # corresponds to the OPPOSITE rotation sense there. Proven empirically
+    # twice over: (a) tolmach closed loop — un-negated eff swapped/lost pins
+    # on every mirrored rot-90/270 instance (R47/C48/Q1/ZD2), negated form
+    # reproduces all 32/32 source nets; (b) kicad-cli's own netlist of the
+    # SAME literal-angle file agrees with the source IR, so the file angle
+    # itself was never wrong — only this conversion. Negating the stored
+    # ir_rot as well (first fix attempt) broke the loop the other way:
+    # mirrored instances came back rot 90 -> 270 and every smashed-field
+    # record landed 180° off.
+    eff_angle = (-ir_rot) % 360 if flip_x else ir_rot
     ir_mirror = 1 if flip_x else 0
     return eff_angle, flip_x, ir_rot, ir_mirror
 

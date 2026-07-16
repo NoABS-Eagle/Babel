@@ -360,7 +360,44 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
 
     styles = _placeholder_styles(pool[gate_sym_name])
 
+    # Per-instance placeholder overrides (IR <instance><text> — Eagle's
+    # smashed records, localized on import): a placed record moves/restyles
+    # the field, a suppression-only record (hidden=yes, no geometry) hides
+    # it. Without honoring these, every smashed Eagle schematic lands in
+    # KiCad with fields at library-default spots (closed-loop catch:
+    # tolmach is smashed nearly everywhere).
+    overrides = {}
+    for t in inst_el.findall('text'):
+        overrides[(t.text or '').strip().lstrip('>').lower()] = t
+
+    inst_rot = float(inst_el.get('rot', 0) or 0)
+    inst_mirror = inst_el.get('mirror') == '1'
+
+    def _override_suppressed(key):
+        t = overrides.get(key.lower())
+        return t is not None and t.get('hidden') == 'yes' and t.get('x') is None
+
     def _abs_style(key, default_dy_mm):
+        t = overrides.get(key.lower())
+        if t is not None and t.get('x') is not None:
+            # instance-local Y-up µm -> absolute, IR canonical body
+            # transform (flip local X, then rotate CCW — svg canon);
+            # the record's angle is instance-relative, display angle is
+            # absolute (Eagle smashed records store absolute angles,
+            # eagle_parser localized them with this exact inverse)
+            lx, ly = float(t.get('x', 0)), float(t.get('y', 0))
+            lrot = float(t.get('rot', 0) or 0)
+            if inst_mirror:
+                lx = -lx
+            r = math.radians(inst_rot)
+            axu = float(inst_el.get('x')) + lx * math.cos(r) - ly * math.sin(r)
+            ayu = float(inst_el.get('y')) + lx * math.sin(r) + ly * math.cos(r)
+            ax, ay = page.pt(axu, ayu)
+            arot = (inst_rot - lrot) % 360 if inst_mirror \
+                else (inst_rot + lrot) % 360
+            return (ax, ay, arot % 360,
+                    float(t.get('size', 1778)) / 1000,
+                    t.get('align', 'bottom-left'))
         if key in styles:
             lx, ly, lrot, lsize, lalign = styles[key]
             axu, ayu = _inst_point(lx, ly, inst_el)
@@ -399,20 +436,25 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
     # reference (pin-less parts: fiducials, screws). Hide it, exactly as Value
     # is hidden without >VALUE — "no placeholder = not displayed".
     _emit_property(lines, 'Reference', ref, ax, ay, arot, asize, aalign,
-                   hide=ref.startswith('#') or 'NAME' not in styles)
+                   hide=ref.startswith('#') or 'NAME' not in styles
+                        or _override_suppressed('NAME'))
     ax, ay, arot, asize, aalign = _abs_style('VALUE', 2.54)
     # Show Value only if the symbol actually has a >VALUE placeholder — an IC
     # with no value (and no >VALUE, e.g. it displays >MANF# instead) must NOT
     # sprout a Value field. Matches Eagle: no placeholder = not displayed.
     _emit_property(lines, 'Value', value, ax, ay, arot, asize, aalign,
-                   hide='VALUE' not in styles)
+                   hide='VALUE' not in styles or _override_suppressed('VALUE'))
     _emit_property(lines, 'Footprint', fp_ref, kx, ky, 0, 1.27, 'center', hide=True)
     _emit_property(lines, 'Datasheet', attrs.pop('datasheet', ''), kx, ky, 0,
                    1.27, 'center', hide=True)
     for k, v in attrs.items():
         st = _abs_style(k, 0)
+        shown = (k in styles or k.lower() in
+                 {q for q, t in overrides.items() if t.get('x') is not None
+                  and t.get('hidden') != 'yes'})
         _emit_property(lines, k, _eagle_overbar_to_kicad(v), st[0], st[1],
-                       st[2], st[3], st[4], hide=k not in styles)
+                       st[2], st[3], st[4],
+                       hide=not shown or _override_suppressed(k))
 
     # Per-pin uuid entries: KiCad regenerates them, kiutils reads fine
     # without — omitted (less to get wrong; ground truth carries them only

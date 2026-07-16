@@ -77,6 +77,7 @@ detected — we do not try to guess our way around a broken project):
 """
 import base64
 import copy
+import math
 import fnmatch
 import json
 import re
@@ -101,7 +102,7 @@ from babel.kicad_parser import (
     _resolve_footprint_path, _read_footprint, _resolve_symbol,
     _um, _f, _rot_fp, _text_size_um, _stroke_width_um, _arc_params,
     _unit_id_to_gate_letter, _KICAD_RESERVED_PROP_KEYS, _align,
-    _is_erc_power_source,
+    _is_erc_power_source, _contains_hide_yes,
 )
 from babel.kicad_schematic import _pt, _mirror_and_angle, _abs_pin_pos_mm, _build_nets
 from babel.svg_renderer import _bounds
@@ -1008,6 +1009,94 @@ class _Canvas:
         self.n_skipped_multi_gate = 0
 
 
+def _instance_hidden_prop_keys(text):
+    """{(placement uuid, property key)} for every placed schematic symbol
+    property carrying `(hide yes)` — the same kiutils 1.4.8 read gap
+    _hidden_keys_from_symbol_nodes works around for LIBRARY symbols, at the
+    placement level (kiutils reads hide=False for every one of them)."""
+    tree = _kiutils_sexpr.parse_sexp(text)
+    out = set()
+    for item in tree[1:]:
+        if not (isinstance(item, list) and item and item[0] == 'symbol'):
+            continue
+        u = next((sub[1] for sub in item
+                  if isinstance(sub, list) and sub and sub[0] == 'uuid'), None)
+        for sub in item:
+            if isinstance(sub, list) and sub and sub[0] == 'property' \
+                    and _contains_hide_yes(sub):
+                out.add((u, sub[1]))
+    return out
+
+
+def _field_overrides(sym, sym_el, inst_x_um, inst_y_um, ir_rot, ir_mirror, dx,
+                     hidden_props):
+    """KiCad per-instance field placements -> IR <instance><text> overrides
+    (Eagle's smashed records) — the exact inverse of the exporter's
+    _abs_style: a field is an override only when it DIFFERS from the
+    library placeholder's default (position under the field transform —
+    negate-theta when mirrored — or visibility); everything inherited
+    emits nothing (one fact, one place). A hidden property whose library
+    placeholder is visible becomes a suppression-only record (hidden=yes,
+    no geometry). Without this, every smashed Eagle schematic came back
+    un-smashed with fields at library defaults (closed-loop catch: the
+    user hand-restored IC2's records to show the difference)."""
+    styles = {}
+    for t in sym_el.findall('text'):
+        s = (t.text or '').strip()
+        if s.startswith('>'):
+            styles[s[1:].lower()] = (
+                float(t.get('x', 0)), float(t.get('y', 0)),
+                float(t.get('rot', 0) or 0),
+                int(t.get('size', 1778)), t.get('align', 'bottom-left'))
+    out = []
+    for p in sym.properties:
+        if p.key in ('Footprint', 'Datasheet') \
+                or p.key in _KICAD_RESERVED_PROP_KEYS:
+            continue
+        key = ('NAME' if p.key == 'Reference'
+               else 'VALUE' if p.key == 'Value'
+               else clean_attr_name(p.key).upper())
+        if not key:
+            continue
+        lib = styles.get(key.lower())
+        if _is_hidden(p) or (sym.uuid, p.key) in hidden_props:
+            if lib is not None:
+                out.append({'_text': f'>{key}', 'hidden': 'yes'})
+            continue
+        ax = (p.position.X + dx) * 1000
+        ay = -p.position.Y * 1000
+        aang = float(p.position.angle or 0) % 360
+        asize = int(_text_size_um(p.effects))
+        aalign = _align(p.effects.justify if p.effects else None)
+        if lib is not None:
+            lx, ly, lrot, lsize, lalign = lib
+            fx = -lx if ir_mirror else lx
+            th = math.radians(-ir_rot if ir_mirror else ir_rot)
+            ex = inst_x_um + fx * math.cos(th) - ly * math.sin(th)
+            ey = inst_y_um + fx * math.sin(th) + ly * math.cos(th)
+            if (abs(ex - ax) < 5 and abs(ey - ay) < 5
+                    and (aang - lrot) % 180 == 0
+                    and abs(asize - lsize) <= 1 and aalign == lalign):
+                continue
+        ddx, ddy = ax - inst_x_um, ay - inst_y_um
+        r = math.radians(-ir_rot)
+        lx = ddx * math.cos(r) - ddy * math.sin(r)
+        ly = ddx * math.sin(r) + ddy * math.cos(r)
+        if ir_mirror:
+            lx = -lx
+        # Text angles fold to [0,180) with justify PRESERVED — both KiCad
+        # and Eagle render upside-down text right-side up around the same
+        # anchor (ground truth: kicad_exporter._norm_text_angle), so the
+        # +180 representative is the same record.
+        lrot = ((ir_rot - aang) if ir_mirror else (aang - ir_rot)) % 180
+        rec = {'_text': f'>{key}', 'x': str(round(lx)), 'y': str(round(ly)),
+               'size': str(asize), 'align': aalign, 'font': 'vector'}
+        if lrot:
+            rec['rot'] = _f(lrot)
+        out.append(rec)
+    return out
+
+
 def _collect_canvas(sch, sch_path, dx, cv, ctx, stray_check):
     """One KiCad schematic file's canvas content (placed symbols, wires,
     junctions, labels, decorative geometry) accumulated into `cv`.
@@ -1032,6 +1121,9 @@ def _collect_canvas(sch, sch_path, dx, cv, ctx, stray_check):
     comp_name_by_libid = ctx['comp_name_by_libid']
     library_by_libid = ctx['library_by_libid']
     groups = ctx['groups']
+    # kiutils (hide yes) read gap, placement-level (see the function)
+    hidden_props = _instance_hidden_prop_keys(
+        Path(sch_path).read_text(encoding='utf-8'))
 
     # Supply locality is a per-FILE fact (lib_symbols cache copies) — see
     # _power_locality.
@@ -1235,6 +1327,9 @@ def _collect_canvas(sch, sch_path, dx, cv, ctx, stray_check):
             'x': _um(sym_x), 'y': _um(-sym.position.Y),
             'rot': _f(ir_rot), 'mirror': str(ir_mirror),
             'attrs': inst_attrs,
+            'texts': _field_overrides(sym, sym_el, sym_x * 1000,
+                                      -sym.position.Y * 1000,
+                                      ir_rot, ir_mirror, dx, hidden_props),
         }
         if gate_letter:
             inst_kwargs['gate'] = gate_letter
@@ -1497,6 +1592,11 @@ def _write_canvas(parent_el, cv, nets, wire_default_um=152, wire_um_by_class=Non
             inst_el.set('populate', inst['populate'])
         for k, v in inst['attrs']:
             ET.SubElement(inst_el, 'attr', name=k, value=v)
+        for tkw in inst.get('texts', ()):
+            t = ET.SubElement(inst_el, 'text')
+            t.text = tkw.pop('_text')
+            for k, v in tkw.items():
+                t.set(k, v)
 
     label_geom = {(p, text): (angle, effects, style)
                    for p, text, angle, effects, style, *_ in cv.label_records}
