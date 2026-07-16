@@ -370,6 +370,17 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
             lx, ly, lrot, lsize, lalign = styles[key]
         else:
             return kx, ky + default_dy_mm, 0, 1.27, 'center'
+        # Horizontal justify is a SYMBOL fact, inherited from the library
+        # placeholder — not the per-instance smash value (user decision;
+        # matches "поля наследуются из символа"). Eagle bakes a
+        # mirror-FLIPPED align into a mirrored instance's smash (e.g.
+        # library center-right -> stored center-left on an MR90 part,
+        # tolmach Q1), but KiCad does NOT flip justify for a mirrored
+        # symbol at render (measured), so honoring the stored value shows
+        # the text on the wrong side. Take the library align; keep the
+        # smashed position/angle/size.
+        if key in styles:
+            lalign = styles[key][4]
         axu, ayu, arot = field_to_kicad(ix_um, iy_um, inst_rot, inst_mirror,
                                         lx, ly, lrot)
         ax, ay = page.pt(axu, ayu)
