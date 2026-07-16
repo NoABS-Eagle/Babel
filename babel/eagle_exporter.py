@@ -1011,15 +1011,17 @@ def _emit_instance(instances_el, inst_el, placeholders):
     (no implicit single-gate default the way IR omits it for
     single-mode components), hence the 'G$1' fallback for those.
 
-    Eagle smash model: an UN-smashed instance carries NO <attribute> records
-    and Eagle auto-places every library placeholder; a SMASHED instance
-    carries one <attribute> per library placeholder (moved ones at their
-    IR-override position, the rest at the library default). Driving the set
-    from `placeholders` (the SYMBOL), not the instance override list, is
-    what stops un-moved fields from disappearing on the KiCad round-trip
-    (RC: R1 came back with only a spurious DESCRIPTION and lost NAME/VALUE/
-    PACKAGE/TOLERANCE/ALLOCATED — the instance carried a minimal override
-    set, one fact one place)."""
+    Eagle smash model (ground-truthed: user copied an attribute-less
+    instance and hit "Restore Position" — Eagle materialized ALL library
+    placeholders as <attribute> records at their library positions). So a
+    visible-field instance is ALWAYS emitted smashed with one <attribute>
+    per library placeholder; an attribute-less `smashed` instance shows NO
+    text at all (that was the RC bug: R1 came back with no records and its
+    NAME/VALUE/PACKAGE/TOLERANCE/ALLOCATED never rendered). Un-moved fields
+    sit at the library default, moved ones at their IR-override position.
+    The set is driven by `placeholders` (the SYMBOL), never the instance
+    override list. A component with NO placeholders (frame, footprint-only)
+    is emitted plain — nothing to show."""
     kwargs = {'part': inst_el.get('name'), 'gate': inst_el.get('gate') or 'G$1',
               'x': _tomm(inst_el.get('x')), 'y': _tomm(inst_el.get('y'))}
     rot = _instance_rot_attr(inst_el)
@@ -1027,11 +1029,11 @@ def _emit_instance(instances_el, inst_el, placeholders):
         kwargs['rot'] = rot
     overrides = {(t.text or '').strip().lstrip('>').upper(): t
                  for t in inst_el.findall('text')}
-    if overrides:
+    if placeholders:
         kwargs['smashed'] = 'yes'
     out = ET.SubElement(instances_el, 'instance', **kwargs)
-    if not overrides:
-        return                     # Eagle auto-positions every placeholder
+    if not placeholders:
+        return                     # nothing to show (frame / footprint-only)
 
     # Emit ONE <attribute> per library placeholder, absolute coords/angles.
     inst_rot = float(inst_el.get('rot', 0))
