@@ -379,9 +379,30 @@ def _footprint_name_value_geometry(text):
     return out
 
 
+def _footprint_hidden_fptext(text):
+    """{'reference','value'} for every `(fp_text reference|value ...
+    (hide yes))` — the SAME kiutils 1.4.8 read gap as the property/pin
+    ones: FpText.hide only recognizes the bare `hide` atom, not the
+    `(hide yes)` list form KiCad writes, so a hidden value text reads back
+    visible and sprouts a spurious >VALUE placeholder (RC board: our own
+    export writes the footprint value on F.Fab `(hide yes)`, the original
+    Eagle package had no >VALUE at all)."""
+    tree = _kiutils_sexpr.parse_sexp(text)
+    if not tree or tree[0] != 'footprint':
+        return set()
+    out = set()
+    for item in tree[1:]:
+        if isinstance(item, list) and len(item) > 2 and item[0] == 'fp_text' \
+                and item[1] in ('reference', 'value') and _contains_hide_yes(item):
+            out.add(item[1])
+    return out
+
+
 def _read_footprint(path):
     fp = Footprint.from_file(str(path), encoding='utf-8')
-    fp._name_value_geometry = _footprint_name_value_geometry(Path(path).read_text(encoding='utf-8'))
+    text = Path(path).read_text(encoding='utf-8')
+    fp._name_value_geometry = _footprint_name_value_geometry(text)
+    fp._hidden_fptext = _footprint_hidden_fptext(text)
     return fp
 
 
@@ -1073,7 +1094,11 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
         tag = type(item).__name__
 
         if tag == 'FpText':
-            if item.hide:
+            # kiutils misreads `(hide yes)` on fp_text as visible — consult
+            # the raw-text sidechannel for reference/value (see
+            # _footprint_hidden_fptext)
+            if item.hide or (item.type in ('reference', 'value')
+                             and item.type in getattr(fp, '_hidden_fptext', ())):
                 continue
             ln = _layer_n(item.layer)
             if ln is None:

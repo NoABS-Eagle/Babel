@@ -3088,3 +3088,17 @@ VALUE-на-фабе пропущен — структура как в ориги
 же цепочке чинится сама, если гнать СВЕЖИЙ экспорт (устаревший hand-resaved
 RC_kicad имел пады P$1/P$2 и пустой pin-mapping — артефакт старого экспорта).
 Board + KiCad round-trip зелёные.
+
+### kiutils gap #5: (hide yes) на fp_text не читается → спурьёзный >VALUE (2026-07-15)
+
+Продолжение RC board. Даже после board-фикса у ПАКЕТА оставался лишний
+>VALUE. Корень: `.kicad_mod` пишет `(fp_text value ... (hide yes))` на
+F.Fab (наш же KiCad-экспорт), но kiutils 1.4.8 читает `item.hide` = False
+для value-fp_text (тот же read-gap `(hide yes)`-формы, что уже обходили для
+property/pin). `_convert_footprint` пропускал только `item.hide`, так что
+скрытый value порождал >VALUE-плейсхолдер, которого в оригинале не было.
+Фикс: sidechannel `_footprint_hidden_fptext` (сырой s-expr) в
+`_read_footprint`, проверяется в FpText-ветке. Итог: R1206 несёт только
+>NAME — как оригинал. Board + KiCad round-trip зелёные. Пятый обход
+kiutils-hide-gap этой сессии (property символа, pin_names/numbers,
+property размещённого символа, теперь fp_text).
