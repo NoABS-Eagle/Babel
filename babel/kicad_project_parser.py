@@ -76,6 +76,7 @@ detected — we do not try to guess our way around a broken project):
     registered library, not just nickname matching.
 """
 import base64
+import copy
 import fnmatch
 import json
 import re
@@ -1034,6 +1035,9 @@ def _collect_canvas(sch, sch_path, dx, cv, ctx, stray_check):
 
     for sym in sch.schematicSymbols:
         lib_id = f'{sym.libraryNickname}:{sym.entryName}' if sym.libraryNickname else sym.entryName
+        if ctx['power_value_virt']:
+            _v = next((p.value for p in sym.properties if p.key == 'Value'), None)
+            lib_id = ctx['power_value_virt'].get((lib_id, _v), lib_id)
         gates = gates_by_libid[lib_id]
 
         # Single-mode component (no <gate>, gates == [(None, sym_name,
@@ -1090,9 +1094,52 @@ def _collect_canvas(sch, sch_path, dx, cv, ctx, stray_check):
         # one per gate) — every gate letter besides 'A' skips this.
         inst_attrs = []
         if gate_letter in (None, 'A'):
+            comp_defaults = ctx['comp_attrs_by_libid'].get(lib_id, {})
             value_prop = next((p for p in sym.properties if p.key == 'Value'), None)
             if value_prop and not _kicad_blank(value_prop.value):
-                inst_attrs.append(('value', _kicad_overbar_to_eagle(value_prop.value)))
+                v = _kicad_overbar_to_eagle(value_prop.value)
+                # An instance Value equal to the entry name or the library
+                # default is the fallback both KiCad and Eagle display for
+                # "no value set" (our own exporter writes `value or
+                # comp_name`) — materializing it would stamp the component
+                # name into every instance's value on the way back to Eagle.
+                entry = lib_id.split(':', 1)[-1]
+                if v not in (entry, comp_defaults.get('value')):
+                    inst_attrs.append(('value', v))
+            # Per-instance power Value rename (KiCad allows GND -> AGND on
+            # one placed symbol) is not expressible in IR — the net name
+            # lives on the library symbol's sup PIN, one per symbol. Reject
+            # with a pointer, never guess (feedback: легко и однозначно).
+            sup_pins = [p.get('name')
+                        for p in ctx['pool'][sym_name].findall('pin')
+                        if p.get('direction') == 'sup']
+            if sup_pins and value_prop and value_prop.value:
+                v = clean_attr_name(_kicad_overbar_to_eagle(value_prop.value))
+                if v not in sup_pins:
+                    raise ValueError(
+                        f'{sch_path.name}: power symbol {designator} '
+                        f'({lib_id}) has per-instance Value {v!r} != library '
+                        f'net name {sup_pins[0]!r} — per-instance power '
+                        f'renames are not supported; make a dedicated power '
+                        f'symbol for that net in the library and re-export.')
+            # Every OTHER instance property is a device attribute (same
+            # collect-ALL rule the library side already follows —
+            # decisions.md "Field-парсинг"; found lost by the closed-loop
+            # oracle: tolmach's manf/digikey#/ru etc. survived to the
+            # .kicad_sch but never came back to IR). Dedup against the
+            # pool component's own <attributes> — a value equal to the
+            # component default is inherited, not an override.
+            for p in sym.properties:
+                if p.key in ('Reference', 'Value', 'Footprint'):
+                    continue
+                if _kicad_blank(p.value):
+                    continue
+                key = 'datasheet' if p.key == 'Datasheet' else p.key
+                val = _kicad_overbar_to_eagle(p.value)
+                # pool attrs store keys lowercased (kicad_parser rule)
+                if val in (comp_defaults.get(key), comp_defaults.get(key.lower())):
+                    continue
+                inst_attrs.append((key, val))
 
         # Which of the component's (possibly several) <footprint>s THIS
         # instance actually uses — per-instance `Footprint` property,
@@ -1614,6 +1661,53 @@ def convert_project_full(src, output_path):
                 f'archive before converting.')
         template_by_libid[lib_id] = sym
 
+    # Per-instance power Value renames (a legal KiCad idiom: place GND,
+    # set its Value to AGND — the INSTANCE Value names the net). IR models
+    # exactly one net name per supply symbol (the sup PIN's name), so each
+    # distinct Value becomes its own cloned component — an unambiguous
+    # split, not a guess and not a reject (found on testData/multichannel:
+    # +1V1 placed with Value "vbias").
+    power_value_virt = {}          # (lib_id, instance Value) -> virtual lib_id
+    power_default_used = set()     # power lib_ids with >=1 default-Value instance
+    def _tpl_value(tpl):
+        p = next((q for q in tpl.properties if q.key == 'Value'), None)
+        return p.value if p else ''
+    for sch in [s for _, s in pages] + [msch for _, msch in modules.values()]:
+        for sym in sch.schematicSymbols:
+            lib_id = f'{sym.libraryNickname}:{sym.entryName}' if sym.libraryNickname else sym.entryName
+            tpl = template_by_libid.get(lib_id)
+            if tpl is None or not tpl.isPower or _is_erc_power_source(tpl):
+                continue
+            v = next((p.value for p in sym.properties if p.key == 'Value'), None)
+            if not v or v == _tpl_value(tpl):
+                power_default_used.add(lib_id)
+                continue
+            if (lib_id, v) in power_value_virt:
+                continue
+            clone = copy.deepcopy(tpl)
+            old_entry = clone.entryName
+            suffix = clean_attr_name(_kicad_overbar_to_eagle(v))
+            clone.entryName = f'{old_entry}@{suffix}'
+            for u_ in clone.units:
+                if (u_.entryName or '').startswith(old_entry):
+                    u_.entryName = clone.entryName + u_.entryName[len(old_entry):]
+            vp = next((p for p in clone.properties if p.key == 'Value'), None)
+            if vp is not None:
+                vp.value = v
+            virt = f'{lib_id}@{suffix}'
+            template_by_libid[virt] = clone
+            footprint_refs_by_libid[virt] = set()
+            power_value_virt[(lib_id, v)] = virt
+            import_log.log(lib_id, v,
+                           f'POWER Value rename -> dedicated component '
+                           f'{clone.entryName!r} (net = per-instance Value)')
+    # A power symbol whose EVERY placement was renamed leaves no instance
+    # on the base component — drop it, or the pool grows a phantom entry
+    # (caught by roundtrip_kicad: IR2 rightfully has no unused '+1V1').
+    for lib_id in {k for k, _ in power_value_virt} - power_default_used:
+        del template_by_libid[lib_id]
+        del footprint_refs_by_libid[lib_id]
+
     fp_cache = {}
     groups = {}   # lib_id -> {footprint_ref: Footprint}
     for lib_id, fp_refs in footprint_refs_by_libid.items():
@@ -1640,6 +1734,7 @@ def convert_project_full(src, output_path):
     out_models_dir = output_path.parent / output_path.stem
 
     comp_name_by_libid = {}
+    comp_attrs_by_libid = {}
     gates_by_libid = {}
     gate_letter_by_libid = {}   # lib_id -> {kicad unitId: gate letter}, ir_schema.md "Размещение многорежимного компонента"
     library_by_libid = {}
@@ -1686,6 +1781,7 @@ def convert_project_full(src, output_path):
             attrs_el = ET.SubElement(comp_el, 'attributes')
             for k, v in info['attrs']:
                 ET.SubElement(attrs_el, 'attr', name=k, value=v)
+        comp_attrs_by_libid[lib_id] = dict(info['attrs'] or [])
 
         proj_el.append(comp_el)
 
@@ -1693,6 +1789,8 @@ def convert_project_full(src, output_path):
            'gate_letter_by_libid': gate_letter_by_libid,
            'comp_name_by_libid': comp_name_by_libid,
            'library_by_libid': library_by_libid,
+           'comp_attrs_by_libid': comp_attrs_by_libid,
+           'power_value_virt': power_value_virt,
            'groups': groups}
 
     # --- Net classes (ir_schema.md "Net class"): definitions -> <classes>,

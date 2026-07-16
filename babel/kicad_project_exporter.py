@@ -316,6 +316,26 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
 
     attrs = _resolved_attrs(comp_el, inst_el)
     value = _eagle_overbar_to_kicad(attrs.pop('value', '') or comp_name)
+    if is_supply:
+        # KiCad names the net BY THE POWER SYMBOL'S VALUE (Eagle names it
+        # by the sup-pin) — anything else in Value silently renames the
+        # schematic net away from the board's (caught by the closed-loop
+        # oracle: Eagle "3.3V" supply device with sup-pin VDD_3V3 came
+        # back as net "3.3V" on the schematic vs VDD_3V3 on the board).
+        # Consistency wins over the displayed text; the visual change is
+        # logged, not silent.
+        sup_names = _sup_pin_names(comp_el, pool)
+        if len(sup_names) == 1:
+            net_name = next(iter(sup_names))
+            if value != net_name:
+                import_log.log(designator, value,
+                               f'SUPPLY_VALUE -> "{net_name}" (KiCad names '
+                               f'the net by the power symbol Value)')
+                value = net_name
+        else:
+            import_log.log(designator, value,
+                           f'SUPPLY_VALUE ambiguous: {len(sup_names)} sup '
+                           f'pins, Value left as-is')
 
     # Footprint reference for THIS instance: per-instance variant if
     # recorded, the single footprint otherwise, '' for footprint-less.

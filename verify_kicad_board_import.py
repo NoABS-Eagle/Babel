@@ -65,10 +65,23 @@ def _geo_key(c):
     return None
 
 
+_ANON = re.compile(r'^N\$\d+$|^Net-\(.*\)$|^unconnected-\(.*\)$')
+
+
 def _signal_items(layout):
-    out = Counter()
+    # Anonymous net names are generated labels, not facts: Eagle numbers
+    # them N$1.., a KiCad round-trip regenerates them differently. Compare
+    # by a canonical label derived from the net's own contactref set.
+    canon = {}
     for s in layout.findall('signal'):
         n = s.get('name')
+        if _ANON.match(n or ''):
+            crs = sorted((c.get('element'), c.get('pad'))
+                         for c in s.findall('contactref'))
+            canon[n] = f'ANON:{crs[0][0]}.{crs[0][1]}' if crs else n
+    out = Counter()
+    for s in layout.findall('signal'):
+        n = canon.get(s.get('name'), s.get('name'))
         for c in s:
             if c.tag == 'contactref':
                 out[(n, 'cref', c.get('element'), c.get('pad'))] += 1

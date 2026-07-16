@@ -110,6 +110,18 @@ def _mirror_and_angle(angle, mirror):
     """
     eff_angle = (angle + 180) % 360 if mirror == 'x' else angle % 360
     flip_x = mirror in ('x', 'y')
+    if flip_x:
+        # KiCad composes a mirrored placement as mirror-AFTER-rotate; IR's
+        # canon is mirror-then-rotate (svg_renderer._inst_point). The two
+        # differ by the rotation sense: M·R(θ) = R(−θ)·M — so a mirrored
+        # KiCad angle lands in IR negated. Perfectly symmetric to Eagle's
+        # MR{α} -> IR −α finding (decisions.md), and proven directly
+        # against KiCad itself: a 12-orientation truth table (4 angles x
+        # none/x/y, kicad-cli netlist as the oracle) — the un-negated form
+        # missed the pin entirely at every mirror+90/270 combo, the
+        # negated form hits all 12/12 (closed-loop catch: tolmach's
+        # mirrored R47/C48/Q1/ZD2 came back with swapped/lost pins).
+        eff_angle = (-eff_angle) % 360
     ir_rot = eff_angle
     ir_mirror = 1 if flip_x else 0
     return eff_angle, flip_x, ir_rot, ir_mirror

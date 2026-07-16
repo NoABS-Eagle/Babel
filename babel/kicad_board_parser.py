@@ -29,6 +29,7 @@ from pathlib import Path
 from kiutils.utils import sexpr as _kiutils_sexpr
 
 from babel import import_log
+from babel.eagle_board_exporter import _instance_footprint
 from babel.ir_util import format_stack
 from babel.kicad_layers import kicad_to_ir
 from babel.kicad_parser import _arc_params
@@ -435,6 +436,84 @@ def _emit_element(layout, fp, frame, code_to_name, known_refdes):
 # Entry
 # ---------------------------------------------------------------------------
 
+_ANON_NET = re.compile(r'^N\$\d+$|^Net-\(.*\)$|^unconnected-\(.*\)$')
+
+
+def _schem_net_by_pad(proj_el):
+    """(designator, pad) -> schematic net name: <schematic> pinrefs pushed
+    through each instance's footprint <pin-mapping>."""
+    comp = {c.get('name'): c for c in proj_el.findall('component')}
+    inst = {i.get('name'): i
+            for i in proj_el.find('schematic').findall('instance')}
+    pin2pad = {}                   # designator -> {pin: pad}
+    out = {}
+    for net in proj_el.find('schematic').findall('net'):
+        for pr in net.iter('pinref'):
+            d, pin = pr.get('part'), pr.get('pin')
+            if d not in pin2pad:
+                i = inst.get(d)
+                c = comp.get(i.get('component')) if i is not None else None
+                fp = _instance_footprint(c, i) if c is not None else None
+                pm = fp.find('pin-mapping') if fp is not None else None
+                pin2pad[d] = {} if pm is None else \
+                    {m.get('pin'): m.get('pad') for m in pm.findall('map')}
+            pad = pin2pad[d].get(pin)
+            if pad is not None:
+                out[(d, pad)] = net.get('name')
+    return out
+
+
+def _adopt_schematic_net_names(layout, signals, proj_el):
+    """The schematic owns net identity (project import, path b): every board
+    net that touches schematic pins must carry the SCHEMATIC's name.
+    Anonymous board names (Eagle N$..., KiCad Net-(R1-Pad2) /
+    unconnected-(...)) are adopted silently-with-log — they are generated
+    labels, not facts. A NAMED board net disagreeing with the schematic is
+    a real desync (stale board, F8 never run) — hard reject, the user fixes
+    the source, we never guess which side is right."""
+    if proj_el.find('schematic') is None:
+        return
+    pad2net = _schem_net_by_pad(proj_el)
+    conflicts = []
+    pending = []                     # (old name, sig element, target name)
+    for name, sig in signals.items():
+        votes = {pad2net.get((cr.get('element'), cr.get('pad')))
+                 for cr in sig.findall('contactref')} - {None}
+        if not votes:
+            continue
+        if len(votes) > 1:
+            conflicts.append(f'{name!r} spans schematic nets {sorted(votes)}')
+            continue
+        want = votes.pop()
+        if want == name:
+            continue
+        if not _ANON_NET.match(name):
+            conflicts.append(f'{name!r} is named {want!r} on the schematic')
+            continue
+        pending.append((name, sig, want))
+    # Two phases, because the schematic's regenerated anonymous numbering
+    # can collide with the board's own (board N$1 and schematic N$1 are
+    # unrelated nets) — renaming in a single pass would merge a renamed
+    # signal into a NOT-yet-renamed namesake.
+    for name, _, _ in pending:
+        del signals[name]
+    for name, sig, want in pending:
+        if want in signals:            # two board fragments of one net
+            for child in list(sig):
+                signals[want].append(child)
+            layout.remove(sig)
+        else:
+            sig.set('name', want)
+            signals[want] = sig
+        import_log.log('kicad_pcb', name,
+                       f'NET renamed to schematic name "{want}"')
+    if conflicts:
+        raise ValueError(
+            'board <-> schematic net desync (stale board? run "Update PCB '
+            'from Schematic" in KiCad, fix the source, re-export):\n  ' +
+            '\n  '.join(conflicts))
+
+
 def convert_board(pcb_path, proj_el, known_refdes, layout_name='main'):
     """Parse pcb_path into a <layout> appended to proj_el.
 
@@ -531,6 +610,8 @@ def convert_board(pcb_path, proj_el, known_refdes, layout_name='main'):
             continue
         seen.add((refdes, pad))
         ET.SubElement(_signal(net), 'contactref', element=refdes, pad=pad)
+
+    _adopt_schematic_net_names(layout, signals, proj_el)
 
     import_log.log('kicad_pcb', layout_name,
                    f'{len(layout.findall("element"))} element(s), '

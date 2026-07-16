@@ -445,12 +445,21 @@ def export_symbol(comp_el, root, lib_name):
     # "no placeholder = not displayed" rule the schematic instance uses.
     lines.extend(_prop('Reference', ref_val, _at(name_style),
                        _effects(name_style), hide=is_power or not has_name))
-    # A power symbol's Value IS the net name it drives (KiCad reads it to name
-    # the net). The generic supply part carries no `value` attr, so fall back
-    # to the symbol name (`GND`, `+3V3`) — otherwise a freshly placed symbol
-    # drives an unnamed net.
-    if is_power and not value_val:
-        value_val = comp_id
+    # A power symbol's Value IS the net name it drives (KiCad reads it to
+    # name the net) — and in IR that name is the `sup` PIN's name, never the
+    # component name or its display value (Eagle model: supply device
+    # "3.3V" with sup pin VDD_3V3 drives net VDD_3V3; the closed-loop
+    # oracle caught the schematic net renamed to "3.3V" while the board
+    # kept VDD_3V3). Same rule kicad_project_exporter applies to the
+    # placed instances' Value.
+    if is_power:
+        sup_names = {el.get('name')
+                     for _, gsym in gate_syms for el in gsym.findall('pin')
+                     if el.get('direction') == 'sup'}
+        if len(sup_names) == 1:
+            value_val = next(iter(sup_names))
+        elif not value_val:
+            value_val = comp_id
     lines.extend(_prop('Value',     _eagle_overbar_to_kicad(value_val),
                        _at(value_style), _effects(value_style)))
     lines.extend(_prop('Footprint', fp_ref,    '0 -2.54 0',      _effects(_hidden), hide=True))
