@@ -51,6 +51,16 @@ PKG_LAYER_MAP = {
     51: '151',  52: '-151',    # tDocu / bDocu
 }
 
+# Eagle mirrors sided layer PAIRS on a bottom-placed element (a mirrored
+# element's NAME record sits on bNames 26, its silk on bPlace 22 — ground
+# truth testData/new/tolmach.brd CON1/CON14). One map, both directions:
+# used to LOCALIZE attribute-record layers on board import and to re-apply
+# the placement mirror on export.
+MIRROR_LAYER = {}
+for _t, _b in ((1, 16), (21, 22), (25, 26), (27, 28), (29, 30), (31, 32),
+               (39, 40), (41, 42), (51, 52)):
+    MIRROR_LAYER[_t], MIRROR_LAYER[_b] = _b, _t
+
 
 # Deliberate drops (eda_ir_design.md "Импорт ВЫБОРОЧНЫЙ"): derived layers
 # (Pads/Vias are pad/via renderings, Unrouted is the ratsnest — connectivity
@@ -454,8 +464,13 @@ def convert_package(pkg_el, pkg_name):
     desc_text = (desc_el.text or '') if desc_el is not None else ''
     clean_desc = re.sub(r'\s*<!--3d:\{[^}]*\}-->', '', desc_text).strip()
     if clean_desc:
-        d = ET.SubElement(fp, 'description')
-        d.text = clean_desc
+        # ir_schema.md I8: no dedicated <description> element on footprints —
+        # the prose rides as the ordinary `fp_desc` attribute of the VARIANT
+        # (the <footprint> under a component IS the variant; an orphan
+        # standalone footprint keeps it the same way).
+        fa = ET.SubElement(fp, 'attributes')
+        ET.SubElement(fa, 'attr', name='fp_desc', value=clean_desc,
+                      type='general')
 
     for child in pkg_el:
         tag = child.tag
@@ -512,17 +527,6 @@ def convert_package(pkg_el, pkg_name):
 # ---------------------------------------------------------------------------
 # Component (deviceset) conversion
 # ---------------------------------------------------------------------------
-
-def collect_attributes(ds_el):
-    attrs = {}
-    for tech in ds_el.iter('technology'):
-        for attr in tech.findall('attribute'):
-            name = attr.get('name')
-            val  = attr.get('value', '')
-            if name not in attrs or (not attrs[name] and val):
-                attrs[name] = val
-    return attrs
-
 
 def convert_deviceset(ds_el, packages):
     """One Eagle <deviceset> -> a LIST of IR <component> elements, one per
@@ -586,11 +590,15 @@ def convert_deviceset(ds_el, packages):
         comp.set('name', ds_name + tech_name if tech_name else ds_name)
         if ds_el.get('prefix'):
             comp.set('prefix', ds_el.get('prefix'))
-        if ds_el.get('uservalue') == 'yes':
-            comp.set('uservalue', 'yes')
+        # `uservalue` НЕ хранится (ir_schema.md "ФОРМАЛЬНАЯ МОДЕЛЬ"): это
+        # флаг права редактирования, запрещённое IR понятие. uservalue!=yes
+        # означает "value ЕСТЬ имя устройства, Eagle выводит его сам" — импорт
+        # МАТЕРИАЛИЗУЕТ выведенное значение (на ВАРИАНТ — деривация зависит от
+        # device), экспорт всегда пишет uservalue="yes".
+        fixed_value = ds_el.get('uservalue') != 'yes'
 
         attrs_el = ET.SubElement(comp, 'attributes')
-        ET.SubElement(attrs_el, 'attr').attrib.update({'name': 'value', 'value': ''})
+        ET.SubElement(attrs_el, 'attr', name='value', value='', type='general')
         # `description` is a plain attribute in IR, same as everywhere else
         # (KiCad/Altium) — no dedicated <description> element. Eagle's own
         # native deviceset <description> is special-cased back out of this
@@ -599,8 +607,8 @@ def convert_deviceset(ds_el, packages):
         # deviceset-level fact, not per-technology).
         desc_el = ds_el.find('description')
         if desc_el is not None and desc_el.text:
-            ET.SubElement(attrs_el, 'attr').attrib.update(
-                {'name': 'description', 'value': desc_el.text})
+            ET.SubElement(attrs_el, 'attr', name='description',
+                          value=desc_el.text, type='general')
 
         if not multi and gate_list:
             comp.set('symbol', gate_list[0].get('symbol', ''))
@@ -612,6 +620,7 @@ def convert_deviceset(ds_el, packages):
                 g.set('x', str(round(float(gate.get('x', '0')) * 1000)))
                 g.set('y', str(round(float(gate.get('y', '0')) * 1000)))
 
+        schema_keys = set()   # объединение ключей всех вариантов (I9/I10)
         for device in ds_el.find('devices').findall('device'):
             pkg_name = device.get('package')
             if not pkg_name or pkg_name not in packages:
@@ -629,16 +638,29 @@ def convert_deviceset(ds_el, packages):
 
             # This technology's OWN attributes only — no merging across
             # different technology names (that was the bug being fixed).
+            # ir_schema.md I10: an EMPTY value is a schema DECLARATION and
+            # is never dropped — the key joins the family schema (union on
+            # the component, below); only real VALUES live on the variant.
             dev_attrs: dict[str, str] = {}
             for attr in tech_el.findall('attribute'):
                 n = attr.get('name', '').lower()
+                if not n:
+                    continue
+                schema_keys.add(n)
                 v = attr.get('value', '')
-                if n and v:
+                if v:
                     dev_attrs[n] = v
+            if fixed_value:
+                # uservalue!=yes: Eagle выводит value сам — материализуем его
+                # на варианте (деривация = имя компонента + имя device,
+                # то же правило, что раньше молча жило в eagle_board_exporter).
+                dev_attrs.setdefault('value', comp.get('name') + (dev_variant or ''))
             if dev_attrs:
-                fa = ET.SubElement(fp, 'attributes')
+                fa = fp.find('attributes')
+                if fa is None:
+                    fa = ET.SubElement(fp, 'attributes')
                 for n, v in dev_attrs.items():
-                    ET.SubElement(fa, 'attr').attrib.update({'name': n, 'value': v})
+                    ET.SubElement(fa, 'attr', name=n, value=v, type='general')
 
             connects = device.find('connects')
             if connects is not None:
@@ -652,6 +674,18 @@ def convert_deviceset(ds_el, packages):
                         m.set('pin', conn.get('pin'))
 
             comp.append(fp)
+
+        # СХЕМА семейства = объединение ключей всех вариантов (I9), пустое
+        # значение = объявление (I10). Ключи, уже объявленные выше (value,
+        # description), не дублируются.
+        declared = {a.get('name') for a in attrs_el.findall('attr')}
+        for n in sorted(schema_keys - declared):
+            ET.SubElement(attrs_el, 'attr', name=n, value='', type='general')
+
+        if fixed_value and comp.find('footprint') is None:
+            # Безвариантный компонент с выводимым value (supply, frame):
+            # материализовать некуда, кроме самого компонента.
+            attrs_el.find('attr[@name="value"]').set('value', comp.get('name'))
 
         components.append(comp)
 

@@ -487,7 +487,15 @@ def _kicad_overbar_to_eagle(s):
     """
     if not s:
         return s
-    return _OVERBAR_RE.sub(lambda m: f'!{m.group(1)}!', s)
+    out = _OVERBAR_RE.sub(lambda m: f'!{m.group(1)}!', s)
+    # Eagle canonical form omits the closing toggle at end-of-string
+    # (Eagle writes '!NRST', an unclosed toggle runs to the end — see
+    # _eagle_overbar_to_kicad). Keeping the trailing '!' made the SAME net
+    # exist as '!NRST' (Eagle-sourced IR) and '!NRST!' (KiCad round-trip) —
+    # names must be byte-identical to bind (maximus desync).
+    if out.endswith('!') and not s.endswith('!'):
+        out = out[:-1]
+    return out
 
 
 def _kicad_multiline_to_eagle(s):
@@ -1079,8 +1087,12 @@ def _convert_footprint(fp, fp_name, models_dir=None, out_models_dir=None):
     placement_angle = (fp.position.angle or 0) if fp.position else 0
     fp_el = ET.Element('footprint', name=fp_name)
     if fp.description:
-        d = ET.SubElement(fp_el, 'description')
-        d.text = fp.description
+        # ir_schema.md I8: no dedicated <description> element — the KiCad
+        # (descr ...) prose rides as the ordinary `fp_desc` attribute of the
+        # variant this footprint becomes.
+        fa = ET.SubElement(fp_el, 'attributes')
+        ET.SubElement(fa, 'attr', name='fp_desc', value=fp.description,
+                      type='general')
 
     def _layer_n(kicad_layer):
         """KiCad layer name -> IR layer attribute value (str) or None (drop).
@@ -1573,7 +1585,7 @@ def convert(sym_path, output_path, project_dir=None):
         if info['attrs']:
             attrs_el = ET.SubElement(comp_el, 'attributes')
             for k, v in info['attrs']:
-                ET.SubElement(attrs_el, 'attr', name=k, value=v)
+                ET.SubElement(attrs_el, 'attr', name=k, value=v, type='general')
 
         lib_el.append(comp_el)
         n_components += 1

@@ -12,6 +12,7 @@ from pathlib import Path
 from xml.dom import minidom
 
 from babel import import_log
+from babel.eagle_parser import MIRROR_LAYER
 from babel.eagle_exporter import (_LAYERS_FILE, _eagle_designator, _eagle_name,
                                   _emit_arc, _emit_geometry, _geom_sig,
                                   _pkg_eagle_layer, _resolved_attrs, _tomm,
@@ -25,9 +26,15 @@ def _stack(layout_el):
     """Ordered Eagle copper numbers for this layout, top first. The copper
     COUNT comes from the stack formula (ir_schema.md "Формула стека" — the
     one authoritative place); the Eagle NUMBERING prefers the original
-    layerSetup from the eagle <passthrough> (keeps Eagle's both-ends inner
-    numbering stable on round-trip), falling back to the canonical
-    1, 2..N-1, 16."""
+    layerSetup from the eagle <passthrough> (keeps the source numbering
+    stable on a pure Eagle round-trip, free fidelity). Fallback (no
+    passthrough — a KiCad-sourced layout): the canonical SEQUENTIAL
+    1, 2..N-1, 16. Eagle's both-ends habit (1,2,15,16) is UI convention,
+    not stack physics — the physical copper order is the numeric order of
+    the ACTIVE layers, so (1+2*3+16) is the same board; per the user, the
+    renumbering is the natural consequence of passing through the IR's
+    ordinal layers, NOT something to mimic (comparisons must normalize by
+    stack position instead)."""
     copper = len(parse_stack(layout_el.get('stack'))[0])
     pt = layout_el.find("passthrough[@tool='eagle']")
     if pt is not None:
@@ -144,9 +151,16 @@ def _emit_element_attribute(el_out, t, e, force_layer=None):
     ex, ey = float(e.get('x')), float(e.get('y'))
     rot = float(e.get('rot', 0))
     mirror = e.get('side') == 'bottom'
+
+    def _sided(eagle_n):
+        # Re-apply the placement mirror to the LOCAL (mount-side) layer —
+        # exact inverse of the board importer's localization (ground truth
+        # tolmach CON1: mirrored element, NAME on bNames 26, silk on bPlace).
+        return MIRROR_LAYER.get(eagle_n, eagle_n) if mirror else eagle_n
+
     if t.get('hidden') == 'yes':
         a.set('x', _tomm(e.get('x'))); a.set('y', _tomm(e.get('y')))
-        a.set('size', '1.778'); a.set('layer', '27')
+        a.set('size', '1.778'); a.set('layer', str(_sided(27)))
         a.set('display', 'off')
         return
     lx, ly = float(t.get('x', 0)), float(t.get('y', 0))
@@ -163,10 +177,10 @@ def _emit_element_attribute(el_out, t, e, force_layer=None):
     amirror = (t.get('mirror') == '1') != mirror
     a.set('size', _tomm(t.get('size', '1778')))
     if force_layer is not None:
-        a.set('layer', str(force_layer))
+        a.set('layer', str(_sided(force_layer)))
     else:
         eagle_layer = _pkg_eagle_layer(t.get('layer') or '125')
-        a.set('layer', str(eagle_layer if eagle_layer is not None else 25))
+        a.set('layer', str(_sided(eagle_layer if eagle_layer is not None else 25)))
     if amirror:
         # arot is the IR-absolute placed angle; Eagle MR wants its own
         # rotate-then-mirror reading — the −α inverse, as everywhere
@@ -363,14 +377,39 @@ def export_board(ir_path, output_path=None, layout_name=None):
     # --- passthrough: designrules/autorouter now, errors after signals
     pt = layout.find("passthrough[@tool='eagle']")
     errors_el = None
+    have_dr = False
     if pt is not None:
         for tag in ('designrules', 'autorouter'):
             src_el = pt.find(tag)
             if src_el is not None:
                 if tag == 'designrules':
                     _apply_stack_to_designrules(src_el, stack, layout)
+                    have_dr = True
                 board.append(src_el)
         errors_el = pt.find('errors')
+    if not have_dr:
+        # No Eagle passthrough (KiCad-sourced layout): WITHOUT designrules
+        # Eagle falls back to its default (1*16) two-layer setup and every
+        # inner-layer wire lands on an INACTIVE layer — synthesize the
+        # minimal rules the stack formula defines: layerSetup activating
+        # exactly our coppers + mtCopper/mtIsolate thicknesses. The
+        # lamination split (core vs prepreg) is NOT an IR fact — a
+        # symmetric middle-core sketch is emitted and logged; пользователь
+        # проверяет физику ламинации (та же конвенция, что у via-спанов).
+        dr = ET.SubElement(board, 'designrules', name='default')
+        joins = ['+'] * (len(stack) - 1)
+        joins[(len(stack) // 2) - 1] = '*'      # core at the middle junction
+        setup = '(' + ''.join(
+            str(n) + (joins[i] if i < len(joins) else '')
+            for i, n in enumerate(stack)) + ')'
+        ET.SubElement(dr, 'param', name='layerSetup', value=setup)
+        ET.SubElement(dr, 'param', name='mtCopper', value=' '.join(['0.035mm'] * 16))
+        ET.SubElement(dr, 'param', name='mtIsolate', value=' '.join(['0.15mm'] * 15))
+        _apply_stack_to_designrules(dr, stack, layout)
+        import_log.log(layout.get('name'), 'designrules',
+                       f'DESIGNRULES synthesized (no Eagle passthrough): '
+                       f'layerSetup {setup} + stack thicknesses; lamination '
+                       f'split is a sketch — verify in Eagle')
 
     elements_el = ET.SubElement(board, 'elements')
     for e in elements_ir:
@@ -382,20 +421,12 @@ def export_board(ir_path, output_path=None, layout_name=None):
         el_out.set('package', _eagle_name(fp.get('name')))
         value = ''
         if inst is not None and comp is not None:
-            # IR's VALUE concept = the (lowercase) 'value' attribute on the
-            # shared instance — the schematic importer's naming convention.
-            # uservalue != yes and no explicit value -> Eagle's own
-            # derivation, which it BAKES into element@value on the board
-            # (unlike the .sch part, where an absent value= suffices):
-            # deviceset+technology+device. The IR component name IS
-            # deviceset+technology (per-technology component split) and the
-            # footprint variant keeps the device name verbatim incl. its
-            # leading dash ('-SOT89'). With uservalue="yes" the value is
-            # the user's text and EMPTY is a legal state (luminoso SJ1).
-            value = _resolved_attrs(comp, inst).get('value', '')
-            if not value and comp.get('uservalue') != 'yes':
-                value = (_eagle_name(comp.get('renamed-from') or comp.get('name'))
-                         + (fp.get('variant') or ''))
+            # Разрешение по канону I9 (инстанс > вариант > компонент):
+            # выводимое Eagle'ом value больше не деривится здесь — импорт
+            # МАТЕРИАЛИЗОВАЛ его на варианте (ir_schema.md "uservalue НЕ
+            # ХРАНИТСЯ"); user-editable value с пустым значением — легальное
+            # состояние (luminoso SJ1).
+            value = _resolved_attrs(comp, inst, fp).get('value', '')
         el_out.set('value', value)
         el_out.set('x', _tomm(e.get('x'))); el_out.set('y', _tomm(e.get('y')))
         rot = _element_rot(e)
@@ -439,19 +470,25 @@ def export_board(ir_path, output_path=None, layout_name=None):
             # Names go back UPPERCASE — Eagle's own canon (its UI uppercases
             # attribute names on entry), inverse of the import lowercasing.
             emitted_l = {n.lower() for n in emitted}
-            for aname, aval in sorted(_resolved_attrs(comp, inst).items()):
-                # 'value'/'description' in the component attribute container
-                # are IR bookkeeping (deviceset description text, value
-                # default) — not Eagle attributes, never baked onto elements
+            for aname, aval in sorted(_resolved_attrs(comp, inst, fp).items()):
+                # 'value'/'description'/'sym_desc'/'fp_desc' in the component
+                # attribute container are IR bookkeeping (deviceset/symbol/
+                # package description text, value default) — not Eagle
+                # attributes, never baked onto elements
                 if aname.lower() in emitted_l or \
-                        aname.lower() in ('name', 'value', 'description'):
+                        aname.lower() in ('name', 'value', 'description',
+                                          'sym_desc', 'fp_desc'):
                     continue
                 a = ET.SubElement(el_out, 'attribute')
                 a.set('name', aname.upper()); a.set('value', aval)
                 a.set('x', _tomm(e.get('x'))); a.set('y', _tomm(e.get('y')))
-                a.set('size', '1.778'); a.set('layer', '27')
+                # Bottom element: value copies sit on bValues with the full
+                # MR rot — Eagle's own records (ground truth tolmach CON1:
+                # layer="28" rot="MR90"), the M was wrongly stripped before.
+                bottom = e.get('side') == 'bottom'
+                a.set('size', '1.778'); a.set('layer', '28' if bottom else '27')
                 if rot:
-                    a.set('rot', rot.lstrip('M'))
+                    a.set('rot', rot)
                 a.set('display', 'off')
 
     signals_el = ET.SubElement(board, 'signals')

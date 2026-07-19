@@ -6,6 +6,7 @@ a parameter); the CLI entrypoint calls write() once the run is done to also
 flush the same lines to a sibling `<output>.import.log` file, so a headless/
 batch run can be grepped/diffed without re-parsing console output.
 """
+import sys
 from pathlib import Path
 
 _entries = []
@@ -17,7 +18,16 @@ def log(*parts):
     buffered for write().
     """
     line = ' '.join(str(p) for p in parts)
-    print(f'  ! {line}')
+    try:
+        print(f'  ! {line}')
+    except UnicodeEncodeError:
+        # A legacy Windows console codepage (cp1251 etc.) can't encode
+        # every Unicode character a source label may legally contain (real
+        # case: a proper U+2212 MINUS SIGN in board silkscreen text) — the
+        # LOG must never be what crashes an otherwise-successful
+        # conversion, so degrade this one line instead of losing the run.
+        enc = sys.stdout.encoding or 'ascii'
+        print(f'  ! {line}'.encode(enc, errors='replace').decode(enc))
     _entries.append(line)
 
 

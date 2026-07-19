@@ -39,6 +39,10 @@
     .header-lib { color: var(--muted); font-size: 12px; }
     .header-lib a { color: var(--muted); }
     .header-lib a:hover { color: var(--text); text-decoration: none; }
+    .header-kind { color: var(--accent); font-size: 11px; border: 1px solid var(--border);
+                   border-radius: 3px; padding: 1px 6px; }
+    .header-src { color: var(--muted); font-size: 11px; overflow: hidden;
+                  text-overflow: ellipsis; white-space: nowrap; max-width: 34ch; }
 
     main { padding: 24px; max-width: 1400px; margin: 0 auto; }
 
@@ -99,6 +103,7 @@
       min-width: 180px;
     }
     .artifact-btn:hover { border-color: var(--accent); color: var(--text); text-decoration: none; }
+    .artifact-btn.swift  { border-left: 3px solid var(--accent); }
     .artifact-btn.eagle  { border-left: 3px solid var(--eagle); }
     .artifact-btn.kicad  { border-left: 3px solid var(--kicad); }
     .artifact-btn.altium { border-left: 3px solid var(--altium); }
@@ -157,6 +162,8 @@
     {% if lib_name %}
     <span class="header-sep">/</span>
     <span class="header-lib"><a href="/library">{{ lib_name }}</a></span>
+    <span class="header-kind">{{ 'проект — пул всех библиотек' if lib_kind == 'project' else 'библиотека' }}</span>
+    {% if lib_src %}<span class="header-src" title="{{ lib_src }}">{{ lib_src }}</span>{% endif %}
     {% endif %}
   </header>
   <main>

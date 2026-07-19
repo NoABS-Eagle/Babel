@@ -248,12 +248,59 @@ def place_footprint(fp_el, ex_um, ey_um, rot_deg, bottom, skip_texts=()):
     children — the footprint's copy is not emitted."""
     out = []
     for el in fp_el:
-        if el.tag in ('description', 'model3d', 'pin-mapping'):
+        if el.tag in ('description', 'model3d', 'pin-mapping', 'attributes'):
             continue
         if el.tag == 'text' and (el.text or '').strip() in skip_texts:
             continue
         out.append(place_ir_element(el, ex_um, ey_um, rot_deg, bottom))
     return out
+
+
+def instance_footprint(comp_el, inst_el):
+    """The <footprint> variant an instance is placed as, or None.
+
+    `footprint=` on the instance is recorded only for 2+-variant components
+    (ir_schema.md "Component instance") and may hold either the footprint
+    NAME or its VARIANT string (the unique-by-construction fallback when one
+    package backs several devices) — both are accepted here.
+    """
+    fps = comp_el.findall('footprint')
+    if not fps:
+        return None
+    if len(fps) == 1:
+        return fps[0]
+    key = inst_el.get('footprint') if inst_el is not None else None
+    if key:
+        for fp in fps:
+            if fp.get('name') == key or fp.get('variant') == key:
+                return fp
+    return fps[0]
+
+
+def resolved_attrs(comp_el, inst_el=None, fp_el=None):
+    """{name: value} по канону разрешения ir_schema.md "ФОРМАЛЬНАЯ МОДЕЛЬ"
+    (I9): инстанс > вариант > компонент. The component carries the family
+    SCHEMA (every key, empty value = declaration, I10) plus family-wide
+    facts; the variant carries this device's values; the instance overrides
+    both. A variant-level empty value never shadows anything (values live
+    on the variant, the schema lives on the component)."""
+    attrs = {}
+    attrs_el = comp_el.find('attributes')
+    if attrs_el is not None:
+        for a in attrs_el.findall('attr'):
+            attrs[a.get('name')] = a.get('value', '')
+    if fp_el is None and inst_el is not None:
+        fp_el = instance_footprint(comp_el, inst_el)
+    if fp_el is not None:
+        fa = fp_el.find('attributes')
+        if fa is not None:
+            for a in fa.findall('attr'):
+                if a.get('value', ''):
+                    attrs[a.get('name')] = a.get('value')
+    if inst_el is not None:
+        for a in inst_el.findall('attr'):
+            attrs[a.get('name')] = a.get('value', '')
+    return attrs
 
 
 def is_copper(layer_n):
@@ -294,6 +341,16 @@ def _edge_tangents(e):
         rx, ry = (px - cx) / r, (py - cy) / r
         return (-s * ry, s * rx)
     return tang(x1, y1), tang(x2, y2)
+
+
+def _edge_len(e):
+    """Arc length of an edge (line: chord; arc: r·sweep)."""
+    kind, x1, y1, x2, y2, curve = e
+    if kind == 'arc' and curve:
+        c = arc_center(x1, y1, x2, y2, curve)
+        if c is not None:
+            return c[2] * math.radians(abs(curve))
+    return math.hypot(x2 - x1, y2 - y1)
 
 
 def _offset_edge(e, r):
@@ -456,42 +513,59 @@ def offset_contour(vertices, r):
             continue
         edges.append(('arc' if curve else 'line', x1, y1, x2, y2,
                       float(curve or 0.0)))
-    off = []
-    for e in edges:
-        oe = _offset_edge(e, r)
-        if oe is not None:
-            off.append((e, oe))
-    out = []
-    m = len(off)
-    for i in range(m):
-        (e1, o1), (e2, o2) = off[i], off[(i + 1) % m]
-        out.append(i)
-        p_end = (o1[3], o1[4])
-        p_start = (o2[1], o2[2])
-        gap = math.hypot(p_start[0] - p_end[0], p_start[1] - p_end[1])
-        if gap < 1e-3:
-            continue
-        t1 = _edge_tangents(e1)[1]
-        t2 = _edge_tangents(e2)[0]
-        cross = t1[0] * t2[1] - t1[1] * t2[0]
-        vx, vy = e1[3], e1[4]           # the original corner
-        if cross > 1e-9:
-            # convex (left turn on a CCW contour): round pen join around V
-            a1 = math.degrees(math.atan2(p_end[1] - vy, p_end[0] - vx))
-            a2 = math.degrees(math.atan2(p_start[1] - vy, p_start[0] - vx))
-            sweep = (a2 - a1) % 360
-            off[i] = (e1, o1)
-            out.append(('join', p_end, p_start, sweep))
-        else:
-            # concave: offset edges overlap — trim both to their intersection
-            xs = _edge_intersections(o1, o2)
-            if not xs:
-                raise ValueError(
-                    'contour offset: concave corner failed to trim — '
-                    'self-intersecting offset (pen wider than the feature?)')
-            px, py = min(xs, key=lambda p: math.hypot(p[0] - vx, p[1] - vy))
-            off[i] = (e1, _trim_edge(o1, px, py, at_end=True))
-            off[(i + 1) % m] = (e2, _trim_edge(o2, px, py, at_end=False))
+    # Corner resolution with EDGE CONSUMPTION: a centerline edge shorter
+    # than the local concave overlap is swallowed whole by the pen (Komar
+    # PHASE_B_GND: a 53 µm closing sliver under a 100 µm pen radius) — the
+    # true boundary simply doesn't contain its image, exactly how Eagle
+    # renders it. When a concave trim finds no intersection, the shorter
+    # of the two offset edges is dropped and the pass restarts against
+    # pristine offsets; each restart removes one edge, so this terminates.
+    # Deterministic geometry of the Minkowski boundary, not a guess — a
+    # genuinely degenerate contour still fails below (< 3 edges left, or
+    # the global self-intersection check).
+    while True:
+        off = []
+        for e in edges:
+            oe = _offset_edge(e, r)
+            if oe is not None:
+                off.append((e, oe))
+        if len(off) < 3:
+            raise ValueError(
+                'contour offset: contour degenerates under this pen '
+                '(fewer than 3 edges survive)')
+        consumed = None
+        out = []
+        m = len(off)
+        for i in range(m):
+            (e1, o1), (e2, o2) = off[i], off[(i + 1) % m]
+            out.append(i)
+            p_end = (o1[3], o1[4])
+            p_start = (o2[1], o2[2])
+            gap = math.hypot(p_start[0] - p_end[0], p_start[1] - p_end[1])
+            if gap < 1e-3:
+                continue
+            t1 = _edge_tangents(e1)[1]
+            t2 = _edge_tangents(e2)[0]
+            cross = t1[0] * t2[1] - t1[1] * t2[0]
+            vx, vy = e1[3], e1[4]           # the original corner
+            if cross > 1e-9:
+                # convex (left turn on a CCW contour): round pen join around V
+                a1 = math.degrees(math.atan2(p_end[1] - vy, p_end[0] - vx))
+                a2 = math.degrees(math.atan2(p_start[1] - vy, p_start[0] - vx))
+                sweep = (a2 - a1) % 360
+                out.append(('join', p_end, p_start, sweep))
+            else:
+                # concave: offset edges overlap — trim both to intersection
+                xs = _edge_intersections(o1, o2)
+                if not xs:
+                    consumed = e1 if _edge_len(o1) < _edge_len(o2) else e2
+                    break
+                px, py = min(xs, key=lambda p: math.hypot(p[0] - vx, p[1] - vy))
+                off[i] = (e1, _trim_edge(o1, px, py, at_end=True))
+                off[(i + 1) % m] = (e2, _trim_edge(o2, px, py, at_end=False))
+        if consumed is None:
+            break
+        edges = [e for e in edges if e is not consumed]
     result = []
     for item in out:
         if isinstance(item, tuple):
@@ -513,6 +587,202 @@ def offset_contour(vertices, r):
                     'contour offset: result self-intersects (narrow neck '
                     'thinner than the pen) — hard reject')
     return result
+
+
+def _edge_circle(e):
+    """(cx, cy, r) of an arc edge's full circle, or None for a line."""
+    kind, x1, y1, x2, y2, curve = e
+    if kind == 'arc' and curve:
+        return arc_center(x1, y1, x2, y2, curve)
+    return None
+
+
+def _unbounded_intersections(e1, e2):
+    """Intersection points of two edges' UNBOUNDED carriers (infinite lines /
+    full circles). The inverse-offset miter needs this: the boundary edges
+    were TRIMMED by the forward offset, so their inward images are shorter
+    than the centerline edges and the true vertex lies beyond the segment
+    ends — segment-bounded intersection can't see it."""
+    c1, c2 = _edge_circle(e1), _edge_circle(e2)
+    if c1 is None and c2 is None:
+        x1, y1, x2, y2 = e1[1:5]
+        x3, y3, x4, y4 = e2[1:5]
+        d1x, d1y = x2 - x1, y2 - y1
+        d2x, d2y = x4 - x3, y4 - y3
+        den = d1x * d2y - d1y * d2x
+        if abs(den) < 1e-12:
+            return []
+        t = ((x3 - x1) * d2y - (y3 - y1) * d2x) / den
+        return [(x1 + d1x * t, y1 + d1y * t)]
+    if c1 is not None and c2 is not None:
+        (ax, ay, ar), (bx, by, br) = c1, c2
+        d = math.hypot(bx - ax, by - ay)
+        if d < 1e-9:
+            return []
+        a = (ar * ar - br * br + d * d) / (2 * d)
+        h2 = ar * ar - a * a
+        if h2 < -1e-6:
+            return []
+        h = math.sqrt(max(h2, 0.0))
+        mx, my = ax + a * (bx - ax) / d, ay + a * (by - ay) / d
+        ux, uy = -(by - ay) / d, (bx - ax) / d
+        return [(mx + h * ux, my + h * uy), (mx - h * ux, my - h * uy)]
+    if c1 is None:
+        line, (cx, cy, r) = e1, c2
+    else:
+        line, (cx, cy, r) = e2, c1
+    x1, y1, x2, y2 = line[1:5]
+    dx, dy = x2 - x1, y2 - y1
+    l = math.hypot(dx, dy)
+    if l < 1e-9:
+        return []
+    dx, dy = dx / l, dy / l
+    t0 = (cx - x1) * dx + (cy - y1) * dy
+    px, py = x1 + dx * t0, y1 + dy * t0
+    h2 = r * r - ((px - cx) ** 2 + (py - cy) ** 2)
+    if h2 < -1e-6:
+        return []
+    h = math.sqrt(max(h2, 0.0))
+    return [(px + dx * h, py + dy * h), (px - dx * h, py - dy * h)]
+
+
+def _edges_match(ea, eb, tol):
+    """One boundary edge ≈ one rebuilt edge, all numerics within tol (arcs
+    also compare sweep, in degrees against a fixed 0.1° allowance — angle
+    is not a length, µm tolerance doesn't apply to it)."""
+    if ea[0] != eb[0]:
+        return False
+    if any(abs(a - b) > tol for a, b in zip(ea[1:5], eb[1:5])):
+        return False
+    return abs((ea[5] or 0.0) - (eb[5] or 0.0)) <= 0.1
+
+
+def unoffset_contour(edges, r, tol=2.5):
+    """Inverse of offset_contour: a copper-boundary contour (KiCad zone
+    outline) -> the pen CENTERLINE vertices [(x_um, y_um, curve_deg), ...],
+    pen radius r (µm). Returns (vertices, exact).
+
+    Structure mirrors the forward construction exactly (никаких эвристик —
+    каждый шаг обратим по построению):
+      - a CONVEX arc of radius == r (µm tolerance) is a round pen JOIN —
+        it collapses back into a plain centerline vertex AT ITS CENTER
+        (the forward pass put the join circle around that very vertex);
+      - every other edge is a real centerline edge offset outward:
+        _offset_edge(e, -r) shifts a line back along its own normal and
+        restores an arc's radius around the SAME center (curve preserved);
+      - vertices are re-established: through a join — the join center;
+        between directly-adjacent edges — the intersection of the two
+        inward carriers (un-trimming what the forward pass trimmed; косые
+        углы обрабатываются пересечением, наклон ребра роли не играет).
+
+    `exact` reports whether re-running offset_contour on the result
+    reproduces the input contour within tol — True for our own exporter's
+    output (self-check oracle), False for a hand-drawn zone whose sharp
+    convex corners the pen necessarily rounds (physically equal to KiCad's
+    own min_thickness-stroked fill, so the COPPER still matches; caller
+    logs it). Degenerate input (necks thinner than the pen, collapsed
+    arcs) raises ValueError — hard reject, never a guess."""
+    if len(edges) < 1:
+        raise ValueError('zone outline: empty contour')
+    area_verts = [(e[1], e[2], e[5] or 0.0) for e in edges]
+    if contour_area(area_verts) < 0:
+        edges = [(e[0], e[3], e[4], e[1], e[2], -(e[5] or 0.0))
+                 for e in reversed(edges)]
+    n = len(edges)
+    join_center = [None] * n
+    for i, e in enumerate(edges):
+        if e[0] == 'arc' and (e[5] or 0) > 0:
+            c = arc_center(e[1], e[2], e[3], e[4], e[5])
+            if c is not None and abs(c[2] - r) <= tol:
+                join_center[i] = (c[0], c[1])
+    segs = [i for i in range(n) if join_center[i] is None]
+    if not segs:
+        raise ValueError('zone outline: only pen-join arcs, no centerline '
+                         'edges (bare pen dot/ring)')
+    ins = {}
+    for i in segs:
+        o = _offset_edge(edges[i], -r)
+        if o is not None:
+            ins[i] = o
+    segs = [i for i in segs if i in ins]
+    if not segs:
+        raise ValueError('zone outline: every centerline edge degenerated '
+                         'under the inverse offset')
+
+    m = len(segs)
+    conn = []          # conn[k]: vertices between segs[k] and segs[(k+1)%m]
+    for k in range(m):
+        a, b = segs[k], segs[(k + 1) % m]
+        between = []
+        i = (a + 1) % n
+        while i != b:
+            if join_center[i] is not None:
+                between.append(join_center[i])
+            i = (i + 1) % n
+        if between:
+            conn.append(between)
+            continue
+        # direct miter: un-trim to the carriers' intersection nearest the
+        # boundary corner (the shared endpoint the forward trim produced)
+        corner = (edges[a][3], edges[a][4])
+        xs = _unbounded_intersections(ins[a], ins[b])
+        if xs:
+            conn.append([min(xs, key=lambda p: math.hypot(p[0] - corner[0],
+                                                          p[1] - corner[1]))])
+            continue
+        # collinear continuation: the two inward endpoints coincide
+        pa, pb = (ins[a][3], ins[a][4]), (ins[b][1], ins[b][2])
+        if math.hypot(pb[0] - pa[0], pb[1] - pa[1]) <= tol * 2:
+            conn.append([((pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2)])
+            continue
+        raise ValueError('zone outline: adjacent edges have no carrier '
+                         'intersection — not an offset image')
+
+    out = []           # (x, y, curve-of-edge-leaving-this-vertex)
+    for k in range(m):
+        sv = conn[k - 1][-1]
+        ev = conn[k][0]
+        e = edges[segs[k]]
+        curve = 0.0
+        if e[0] == 'arc' and e[5]:
+            cx, cy, _ = _edge_circle(ins[segs[k]])
+            a1 = math.degrees(math.atan2(sv[1] - cy, sv[0] - cx))
+            a2 = math.degrees(math.atan2(ev[1] - cy, ev[0] - cx))
+            curve = ((a2 - a1) % 360) if e[5] > 0 else -((a1 - a2) % 360)
+            # atan2 re-fit noise: snap to a whole degree, same convention
+            # as kicad_board_parser._snap_sweep
+            snapped = round(curve)
+            if snapped and abs(curve - snapped) < 5e-3:
+                curve = float(snapped)
+        out.append((sv[0], sv[1], curve))
+        for p in conn[k][:-1]:
+            out.append((p[0], p[1], 0.0))
+
+    verts = []
+    for x, y, curve in out:
+        xi, yi = round(x), round(y)
+        if verts and (xi, yi) == (verts[-1][0], verts[-1][1]):
+            continue
+        verts.append((xi, yi, curve))
+    if len(verts) > 1 and (verts[0][0], verts[0][1]) == (verts[-1][0], verts[-1][1]):
+        verts.pop()
+    if len(verts) < 3:
+        raise ValueError('zone outline: centerline collapsed to fewer than '
+                         '3 vertices')
+
+    rebuilt = offset_contour(verts, r)     # ValueError propagates = reject
+    rest = list(rebuilt)
+    exact = len(rest) == len(edges)
+    if exact:
+        for ea in edges:
+            for j, eb in enumerate(rest):
+                if _edges_match(ea, eb, tol):
+                    rest.pop(j)
+                    break
+            else:
+                exact = False
+                break
+    return verts, exact
 
 
 DEFAULT_STACK = '35[1530]35'

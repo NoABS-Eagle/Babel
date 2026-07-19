@@ -775,7 +775,8 @@ def convert_project(src, output_dir):
             if info['attrs']:
                 attrs_el = ET.SubElement(comp_el, 'attributes')
                 for k, v in info['attrs']:
-                    ET.SubElement(attrs_el, 'attr', name=k, value=v)
+                    ET.SubElement(attrs_el, 'attr', name=k, value=v,
+                                  type='general')
 
             lib_el.append(comp_el)
             n_components += 1
@@ -884,6 +885,57 @@ def _alloc_port_slot(occupied_coords):
         k += 1
 
 
+def _flatten_pinless_pages(pages, project_dir):
+    """A (sheet) occurrence with ZERO explicit hierarchical pins has no real
+    port interface — old-style KiCad hierarchy used purely to organize a
+    flat design into files, every connection made through global labels
+    exactly like an ordinary top-level page (ir_schema.md "Модуль" is a
+    design block with a real port interface; a sheet with no pins never had
+    one). Recursively promoted into MORE top-level pages (tiled in the same
+    row as everything _detect_pages found), never modules.
+
+    Confirmed on testData/freq: several sub-sheets are pinless
+    organization-only sheets whose implicit global-label connections made
+    _collect_modules' port-synthesis stack ports along the sheet symbol's
+    tiny edge (22.86x13.97mm) far past the block — and past the page frame
+    itself. Each sheet FILE has its own full-size paper (A4 here),
+    completely independent of the small placeholder block drawn on the
+    parent page, so tiling it as its own page gives the content real room
+    instead of a synthesized stub geometry problem to solve.
+
+    Same-file reuse across pinless sheets is a HARD REJECT (ir_schema.md
+    "легко и однозначно, без эвристик"): with zero pins there's no
+    parameterization distinguishing one placement from another, so whether
+    two placements of the same file should share one page or become two
+    independent copies is genuinely ambiguous — not something to guess.
+    """
+    result = list(pages)
+    seen = {p.resolve() for p, _ in pages}
+    queue = list(pages)
+    while queue:
+        page_path, sch = queue.pop()
+        for sheet in sch.sheets:
+            if sheet.pins:
+                continue   # a real port interface -> _collect_modules' module
+            mod_path = project_dir / sheet.fileName.value
+            rp = mod_path.resolve()
+            if rp in seen:
+                raise ValueError(
+                    f'{page_path.name} -> {sheet.fileName.value}: this pinless sheet '
+                    f'file is referenced more than once. With zero sheet pins it is '
+                    f'imported as an independent top-level page (ir_schema.md '
+                    f'"Модуль" requires a real port interface), and reusing the same '
+                    f'file for two placements is ambiguous — one shared page or two '
+                    f'independent copies? Give each placement its own sheet file and '
+                    f're-export.')
+            seen.add(rp)
+            new_sch = Schematic.from_file(str(mod_path), encoding='utf-8')
+            new_page = (mod_path, new_sch)
+            result.append(new_page)
+            queue.append(new_page)
+    return result
+
+
 def _collect_modules(pages, project_dir):
     """Every (sheet) symbol across all top-level pages -> ({stem: (path,
     Schematic)}, [(page_idx, HierarchicalSheet, stem), ...]).
@@ -904,6 +956,8 @@ def _collect_modules(pages, project_dir):
     sheet_uses = []
     for page_idx, (page_path, sch) in enumerate(pages):
         for sheet in sch.sheets:
+            if not sheet.pins:
+                continue   # promoted to its own page by _flatten_pinless_pages
             fname = sheet.fileName.value
             mod_path = project_dir / fname
             stem = mod_path.stem
@@ -958,7 +1012,10 @@ def _sheet_ports(sheet):
         }
         side = min(dist, key=dist.get)
         coord_mm = rx if side in ('top', 'bottom') else -ry
-        out.append((pin.name, _PORT_DIRECTION.get(pin.connectionType, 'io'),
+        # overbar-нормализация: имя порта в IR — Eagle-форма (!CS), как и
+        # имена цепей/меток (единая точка связывания порт↔цепь)
+        out.append((_kicad_overbar_to_eagle(pin.name),
+                    _PORT_DIRECTION.get(pin.connectionType, 'io'),
                     side, _um(coord_mm)))
     return out
 
@@ -1007,6 +1064,9 @@ class _Canvas:
         self.portref_keys = set()   # (inst_name, port_name) -> written as <portref>, not <pinref>
         self.global_sup_names = set()   # net names carried by GLOBAL supply pins
         self.local_sup_names = set()    # ...by (power local) supply pins (KiCad 10)
+        self.sym_uuid_refdes = {}   # placed symbol uuid -> designator (board
+                                    # footprint (path) identity, ir_schema.md
+                                    # «по path/UUID, не refdes»)
         self.n_skipped_multi_unit = 0
         self.n_skipped_multi_gate = 0
 
@@ -1175,6 +1235,7 @@ def _collect_canvas(sch, sch_path, dx, cv, ctx, stray_check):
 
         ref_prop = next((p for p in sym.properties if p.key == 'Reference'), None)
         designator = ref_prop.value if ref_prop and ref_prop.value else sym.uuid
+        cv.sym_uuid_refdes[str(sym.uuid)] = designator
 
         # Per-instance Value override (e.g. "10k" on a generic Device:R
         # placed as R1, "4.7k" on the next one) — deliberately NOT
@@ -1195,13 +1256,14 @@ def _collect_canvas(sch, sch_path, dx, cv, ctx, stray_check):
             value_prop = next((p for p in sym.properties if p.key == 'Value'), None)
             if value_prop and not _kicad_blank(value_prop.value):
                 v = _kicad_overbar_to_eagle(value_prop.value)
-                # An instance Value equal to the entry name or the library
-                # default is the fallback both KiCad and Eagle display for
-                # "no value set" (our own exporter writes `value or
-                # comp_name`) — materializing it would stamp the component
-                # name into every instance's value on the way back to Eagle.
-                entry = lib_id.split(':', 1)[-1]
-                if v not in (entry, comp_defaults.get('value')):
+                # An instance Value equal to the LIBRARY DEFAULT is not an
+                # override — plain I4 resolution, nothing to record. Only
+                # that one comparison: the old extra "equals the entry name
+                # means unset" guess existed to undo our own exporter's
+                # `value or comp_name` fallback (removed) and swallowed
+                # honest values that legitimately equal the component name
+                # (deviceset "33µH" with value "33µH", tolmach L1).
+                if v != comp_defaults.get('value'):
                     inst_attrs.append(('value', v))
             # Per-instance power Value rename (KiCad allows GND -> AGND on
             # one placed symbol) is not expressible in IR — the net name
@@ -1475,8 +1537,7 @@ def _collect_canvas(sch, sch_path, dx, cv, ctx, stray_check):
         # markdown-заметка схемы"): the box carries exactly what a note
         # needs — raw text + a width — and the auto-wrap is done by OUR
         # renderer with OUR metrics, so KiCad's line breaking never needs
-        # guessing at all. Frame/fill of the source box are dropped (IR
-        # has no color; a note is drawn by editor convention).
+        # guessing at all.
         x1, y1 = _pt(tb.position.X + dx, tb.position.Y)
         w_um = round(float(tb.size.X) * 1000)
         h_um = round(float(tb.size.Y) * 1000)
@@ -1484,6 +1545,23 @@ def _collect_canvas(sch, sch_path, dx, cv, ctx, stray_check):
                      x1, x1 + w_um, y1, y1 + h_um)
         cv.deco_notes.append((x1, y1, w_um, tb.text or '',
                                (tb.position.angle or 0) % 360))
+        # The box's own border/fill is a SEPARATE decorative rectangle,
+        # same GRAPHIC-layer home as a plain Rectangle shape just above —
+        # per the user (2026-07-19): previously dropped entirely (only the
+        # note's text content survived), silently losing real drawn
+        # framing. Both corners go through `_pt` independently, same as the
+        # Rectangle branch, rather than assuming a sign for size.X/size.Y —
+        # this file has been bitten by exactly that kind of inversion bug
+        # before (rot_fp, the shape-fill polarity bug noted above).
+        # Rotation is NOT carried (deco_shapes 'rect' has no angle slot,
+        # matching plain Rectangle's own axis-aligned-only limitation) —
+        # a rotated text_box's border will come through unrotated.
+        x2, y2 = _pt(tb.position.X + dx + tb.size.X, tb.position.Y + tb.size.Y)
+        box_filled = getattr(getattr(tb, 'fill', None), 'type', None) in ('outline', 'color')
+        box_width_um = int(_stroke_width_um(tb, ctx['graphic_default_um']))
+        bcx, bcy = (x1 + x2) // 2, (y1 + y2) // 2
+        cv.deco_shapes.append(('rect', bcx, bcy, abs(x2 - x1), abs(y2 - y1),
+                             0, 0 if box_filled else box_width_um))
 
     for fl in sch.netclassFlags:
         # netclass_flag directive (KiCad v7+) — an on-wire class assignment.
@@ -1540,7 +1618,12 @@ def _collect_canvas(sch, sch_path, dx, cv, ctx, stray_check):
         # the user at the exact sheet/position to fix, in KiCad's own
         # on-screen coordinates — not used for any geometry/connectivity
         # decision, which stays in the tiled dx-shifted space as before.
-        cv.label_records.append((lp, l.text, l.position.angle, l.effects, style,
+        # Единая overbar-нормализация на входе: KiCad ~{SIG} -> IR !SIG.
+        # Сюда попадают local/global/hierarchical labels разом — внутри
+        # модульного файла hierarchical label ИМЕНУЕТ цепь порта, и её имя
+        # обязано сойтись с именем порта из _sheet_ports (то же преобразование).
+        cv.label_records.append((lp, _kicad_overbar_to_eagle(l.text),
+                               l.position.angle, l.effects, style,
                                sch_path.name, l.position.X, l.position.Y))
 
 
@@ -1579,6 +1662,8 @@ def _write_canvas(parent_el, cv, nets, wire_default_um=152, wire_um_by_class=Non
                                      name=inst['designator'],
                                      x=inst['x'], y=inst['y'],
                                      rot=inst['rot'], mirror=inst['mirror'])
+            if inst.get('offset'):
+                inst_el.set('offset', inst['offset'])
         else:
             inst_el = ET.SubElement(parent_el, 'instance', component=inst['component'],
                                      library=inst['library'], name=inst['designator'],
@@ -1592,7 +1677,7 @@ def _write_canvas(parent_el, cv, nets, wire_default_um=152, wire_um_by_class=Non
         if inst.get('populate'):
             inst_el.set('populate', inst['populate'])
         for k, v in inst['attrs']:
-            ET.SubElement(inst_el, 'attr', name=k, value=v)
+            ET.SubElement(inst_el, 'attr', name=k, value=v, type='general')
         for tkw in inst.get('texts', ()):
             t = ET.SubElement(inst_el, 'text')
             t.text = tkw.pop('_text')
@@ -1729,6 +1814,7 @@ def convert_project_full(src, output_path):
     sym_lib_table, fp_lib_table = _augment_lib_tables(project_dir, sym_lib_table, fp_lib_table)
 
     pages = _detect_pages(pro_path, project_dir)
+    pages = _flatten_pinless_pages(pages, project_dir)
     modules, sheet_uses = _collect_modules(pages, project_dir)
 
     for _, sch in pages:
@@ -1885,7 +1971,7 @@ def convert_project_full(src, output_path):
         if info['attrs']:
             attrs_el = ET.SubElement(comp_el, 'attributes')
             for k, v in info['attrs']:
-                ET.SubElement(attrs_el, 'attr', name=k, value=v)
+                ET.SubElement(attrs_el, 'attr', name=k, value=v, type='general')
         comp_attrs_by_libid[lib_id] = dict(info['attrs'] or [])
 
         proj_el.append(comp_el)
@@ -1956,6 +2042,7 @@ def convert_project_full(src, output_path):
     # the module file's own paper DOES become a synthesized Frame + stray
     # validation, same as a page (see inside the loop).
     module_cvs = []
+    mod_sym_uuid = {}          # symbol uuid in a module file -> (stem, inner refdes)
     synth_ports_by_stem = {}   # stem -> [(name, direction, side, coord_um_str)]
     mod_el_by_stem = {}
     module_net_names_by_stem = {}
@@ -2101,10 +2188,17 @@ def convert_project_full(src, output_path):
 
         _write_canvas(mod_el, cv, mod_nets, wire_default_um, wire_um_by_class)
         module_cvs.append(cv)
+        # board footprint (path) second component = the symbol uuid INSIDE
+        # the module file -> inner refdes (shared by every instance)
+        for u, d in cv.sym_uuid_refdes.items():
+            mod_sym_uuid[u] = (stem, d)
 
     # --- Schematic canvas: placed instances + connectivity, across all pages ---
     cv_top = _Canvas()
     used_modinst_names = set()
+    sheet_uuid_minst = {}        # sheet placement uuid -> module instance name
+    flattened_page_names = set()  # pinless sheets promoted to a page — see below
+    minst_offset_counter = [0]   # Eagle designator offsets, synthesized 100,200,…
     synth_tails = []   # (tail_end_pt, inst_name, port_name) — for the silent-merge guard below
     modinst_names_by_stem = {}   # stem -> [instance names] — for netclass pattern expansion
 
@@ -2155,6 +2249,18 @@ def convert_project_full(src, output_path):
         # net; portref_keys makes the writer emit <portref> instead of
         # <pinref> for these (ir_schema.md "Модуль").
         for sheet in sch.sheets:
+            if not sheet.pins:
+                # Promoted to its own tiled page by _flatten_pinless_pages —
+                # no module instance, no namespace of its own (pages merge
+                # into the ONE top canvas by plain name, ir_schema.md
+                # "Листов как сущности нет"). The board may still reference
+                # nets through the OLD hierarchical path
+                # (/SheetName/local, KiCad's own scoping before Babel
+                # flattened it) — record the sheet name so the board side
+                # can recognize and strip that prefix instead of mistaking
+                # it for a stale/unknown module instance.
+                flattened_page_names.add((sheet.sheetName.value or '').strip())
+                continue
             stem = Path(sheet.fileName.value).stem
             inst_name = (sheet.sheetName.value or '').strip() or f'MD{len(used_modinst_names) + 1}'
             base, k = inst_name, 2
@@ -2168,6 +2274,15 @@ def convert_project_full(src, output_path):
                                 'MODULE_INSTANCE duplicate sheet name, renamed ->', inst_name)
             used_modinst_names.add(inst_name)
             modinst_names_by_stem.setdefault(stem, []).append(inst_name)
+            # Board footprint (path) starts with THIS sheet placement's uuid
+            # — the identity key for module elements (никакой арифметики
+            # рефдесов, «по path/UUID»).
+            sheet_uuid_minst[str(sheet.uuid)] = inst_name
+            # Eagle-side designator disambiguation: KiCad has no offset
+            # concept, synthesize the Eagle convention (100, 200, …) so the
+            # Eagle export flattens DCDC1:C1 -> C101 without collisions.
+            minst_offset_counter[0] += 100
+            minst_offset = str(minst_offset_counter[0])
             x0_mm, y0_mm = sheet.position.X + dx, sheet.position.Y
             _stray_check(f'module instance {inst_name}',
                          round(x0_mm * 1000), round((x0_mm + sheet.width) * 1000),
@@ -2183,11 +2298,13 @@ def convert_project_full(src, output_path):
                 'x': _um(x0_mm + sheet.width / 2),
                 'y': _um(-(y0_mm + sheet.height / 2)),
                 'rot': '0', 'mirror': '0', 'attrs': [],
+                'offset': minst_offset,
             })
             for pin in sheet.pins:
                 pp = _pt(pin.position.X + dx, pin.position.Y)
-                cv_top.pin_points.append((pp, inst_name, pin.name, False))
-                cv_top.portref_keys.add((inst_name, pin.name))
+                pname = _kicad_overbar_to_eagle(pin.name)
+                cv_top.pin_points.append((pp, inst_name, pname, False))
+                cv_top.portref_keys.add((inst_name, pname))
 
             # Synthesized (supply/global) ports of this module: the source
             # has NO parent-side geometry at all (the connection was
@@ -2414,17 +2531,62 @@ def convert_project_full(src, output_path):
     # --- board: .kicad_pcb -> <layout> (kicad_board_parser, raw s-expr).
     # A project with no board is a legitimate schematic-only project.
     if pcb_path.exists():
-        if modules:
-            # module boards carry flattened refdes (TM1:C1 -> C101) and
-            # hierarchical net names — the reverse mapping isn't built yet
-            # (flat projects first, simple -> complex)
-            import_log.log('kicad_pcb', pro_path.stem, 'BOARD deferred',
-                           f'hierarchical project ({len(modules)} module(s)) '
-                           f'— module board import not supported yet')
-        else:
-            from babel.kicad_board_parser import convert_board
-            known_refdes = {i.get('name') for i in schem_el.iter('instance')}
-            convert_board(pcb_path, proj_el, known_refdes)
+        from babel.kicad_board_parser import convert_board
+        # Hierarchical identity (ir_schema.md «по path/UUID, не refdes»):
+        # top instances by their designator; module elements by the IR
+        # address `MINST:refdes`, resolved from the footprint's (path
+        # "/{sheet_inst_uuid}/{sym_uuid}") — never from the flattened
+        # board Reference (C101).
+        known_refdes = {i.get('name') for i in schem_el.iter('instance')}
+        for m in proj_el.findall('module'):
+            inner = [i.get('name') for i in m.findall('instance')]
+            for minst_el in schem_el.findall('instance'):
+                if minst_el.get('module') == m.get('name'):
+                    known_refdes |= {f'{minst_el.get("name")}:{n}'
+                                     for n in inner}
+        top_sym_uuid = cv_top.sym_uuid_refdes
+
+        def _path_to_addr(path):
+            parts = [p for p in (path or '').strip('/').split('/') if p]
+            if len(parts) == 1:
+                return top_sym_uuid.get(parts[0])
+            if len(parts) == 2:
+                minst = sheet_uuid_minst.get(parts[0])
+                hit = mod_sym_uuid.get(parts[1])
+                if minst and hit:
+                    return f'{minst}:{hit[1]}'
+            return None
+
+        def _board_fp_resolver(lib_id):
+            # Board-only footprints (no symbol, no path — logo/mech)
+            # resolve through the same fp-lib-table machinery as every
+            # symbol-referenced footprint; same archive precondition.
+            fp_path = _resolve_footprint_path(lib_id, project_dir,
+                                              fp_lib_table)
+            if fp_path is None:
+                return None
+            if fp_path not in fp_cache:
+                fp_cache[fp_path] = _read_footprint(fp_path)
+            fp = fp_cache[fp_path]
+            fp_el, _ = _convert_footprint(fp, fp.entryName)
+            if ':' in lib_id:
+                fp_el.set('library', lib_id.split(':', 1)[0])
+            return fp_el
+
+        # (minst, port) -> parent net name: a module-crossing board net
+        # belongs to the PARENT's net whatever representative name KiCad
+        # chose for it.
+        port_parent = {}
+        for net_el in schem_el.findall('net'):
+            for pr in net_el.iter('portref'):
+                port_parent[(pr.get('part'), pr.get('port'))] = net_el.get('name')
+
+        convert_board(pcb_path, proj_el, known_refdes,
+                      fp_resolver=_board_fp_resolver,
+                      path_to_addr=_path_to_addr,
+                      minst_names=set(sheet_uuid_minst.values()),
+                      page_names=flattened_page_names,
+                      port_parent=port_parent)
 
     raw = minidom.parseString(ET.tostring(proj_el, encoding='unicode')).toprettyxml(indent='  ')
     output_path.write_text(raw, encoding='utf-8')

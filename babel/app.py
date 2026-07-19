@@ -9,11 +9,12 @@ from pathlib import Path
 from flask import Flask, render_template, request, redirect, url_for, abort, send_file
 
 from babel.svg_renderer import render_symbol, render_footprint
-from babel.ir_util import symbol_pool, component_gates, resolve_model3d_file
+from babel.ir_util import symbol_pool, component_gates, resolve_model3d_file, resolved_attrs
 from babel.eagle_parser import convert as eagle_parse
 from babel.altium_parser import convert as altium_parse
 from babel.eagle_exporter import export as eagle_export
-from babel.kicad_exporter import export as kicad_export
+from babel.kicad_exporter import export as kicad_export, \
+    needs_variant_split, variant_symbol_name
 from babel.detector import scan
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
@@ -42,17 +43,21 @@ _ensure_3d_assets()
 
 _SESSION_IR       = Path(__file__).parent / '.session.ir.xml'
 _SESSION_STEP_DIR = Path(__file__).parent / '.session.3d'   # STEP files for current session
+_SESSION_SRC      = Path(__file__).parent / '.session.src'  # original source path, for the header
 
 _ir_root: ET.Element = None
 _lib_name: str = ''
+_src_path: str = ''   # what the user actually opened (survives the session copy)
 
 
-def _load_ir(ir_path: str):
-    global _ir_root, _lib_name
+def _load_ir(ir_path: str, src_path: str = None):
+    global _ir_root, _lib_name, _src_path
     import shutil
     tree = ET.parse(ir_path)
     _ir_root = tree.getroot()
     _lib_name = _ir_root.get('name', Path(ir_path).stem)
+    _src_path = str(src_path or ir_path)
+    _SESSION_SRC.write_text(_src_path, encoding='utf-8')
     shutil.copy2(ir_path, _SESSION_IR)
 
     # Copy 3D model files from sibling dir to session step dir
@@ -67,9 +72,12 @@ def _load_ir(ir_path: str):
 
 def _restore_session():
     """Load last session on server startup, if available."""
+    global _src_path
     if _SESSION_IR.exists():
         try:
-            _load_ir(str(_SESSION_IR))
+            src = (_SESSION_SRC.read_text(encoding='utf-8').strip()
+                   if _SESSION_SRC.exists() else None)
+            _load_ir(str(_SESSION_IR), src_path=src)
         except Exception:
             pass
 
@@ -84,7 +92,11 @@ def _component(cid):
 
 @app.context_processor
 def _globals():
-    return {'lib_name': _lib_name}
+    # A <project> root is the merged pool of ALL the project's libraries —
+    # label it so the user knows they're not looking at one source library.
+    kind = ('project' if _ir_root is not None and _ir_root.tag == 'project'
+            else 'library')
+    return {'lib_name': _lib_name, 'lib_kind': kind, 'lib_src': _src_path}
 
 
 # ── Workspace ────────────────────────────────────────────────────────────────
@@ -101,6 +113,20 @@ def home():
     return render_template('workspace.html', path=path, artifacts=artifacts, error=error)
 
 
+# ── Open: native IR (.swlib / .swprj) ────────────────────────────────────────
+
+@app.route('/open/swlib')
+def open_swlib():
+    """Open a .swlib — or the library half of a .swprj: the pool shape is
+    identical (components + <symbols> at root), the viewer just never draws
+    the project's canvases (schematic/module/layout)."""
+    path = request.args.get('path', '')
+    if not path or not Path(path).exists():
+        abort(400)
+    _load_ir(path)
+    return redirect(url_for('library'))
+
+
 # ── Import: Eagle ─────────────────────────────────────────────────────────────
 
 @app.route('/import/eagle')
@@ -111,7 +137,7 @@ def import_eagle():
     tmp = tempfile.NamedTemporaryFile(suffix='.ir.xml', delete=False)
     tmp.close()
     eagle_parse(lbr, tmp.name)
-    _load_ir(tmp.name)
+    _load_ir(tmp.name, src_path=lbr)
     return redirect(url_for('library'))
 
 
@@ -125,7 +151,7 @@ def import_altium():
     tmp = tempfile.NamedTemporaryFile(suffix='.ir.xml', delete=False)
     tmp.close()
     altium_parse(intlib, tmp.name)
-    _load_ir(tmp.name)
+    _load_ir(tmp.name, src_path=intlib)
     return redirect(url_for('library'))
 
 
@@ -238,38 +264,90 @@ def library():
             'has_symbol':  bool(gates),
             'footprints':  [fp.get('name') for fp in fps],
             'pin_count':   pin_count,
+            'library':     comp.get('library', ''),
         })
+    # Source-library column exists only in a project pool (components of a
+    # standalone .swlib carry no library= — the file itself is the library).
+    has_library_col = any(r['library'] for r in rows)
     # Standalone orphan footprints (no component)
     orphans = [fp.get('name') for fp in _ir_root.findall('footprint')]
-    return render_template('library.html', components=rows, orphans=orphans)
+    return render_template('library.html', components=rows, orphans=orphans,
+                           has_library_col=has_library_col)
 
 
-@app.route('/library/<comp_id>')
+@app.route('/library/<path:comp_id>')
 def component_detail(comp_id):
+    """Eagle-library-editor-style master-detail: the symbol and the FULL
+    variant list are always visible; selecting a variant reveals its
+    footprint, pin-mapping and RESOLVED attributes (ir_schema.md I9 — here
+    only two levels exist, component/variant: a library carries no instance
+    overrides)."""
     comp = _component(comp_id)
     if comp is None:
         abort(404)
-    sym_svg = render_symbol(comp, _ir_root, scale=30) if component_gates(comp) else None
+    gates = component_gates(comp)
+    sym_svgs = [{'gate': gname or '',
+                 'svg': render_symbol(comp, _ir_root, scale=30, gate=gname)}
+                for gname, _sname in gates]
+
+    # Family schema (I10): the component's <attributes> carries every key —
+    # empty value = declaration, non-empty = family-wide fact.
     attrs_el = comp.find('attributes')
-    attributes = [{'name': a.get('name'), 'value': a.get('value', '')}
-                  for a in (attrs_el.findall('attr') if attrs_el is not None else [])]
-    footprints = []
-    for fp in comp.findall('footprint'):
+    schema = [{'name': a.get('name'), 'value': a.get('value', '')}
+              for a in (attrs_el.findall('attr') if attrs_el is not None else [])]
+    schema_keys = {a['name'] for a in schema}
+
+    fps = comp.findall('footprint')
+
+    # Cross-variant pad divergence per pin (R1206 P$1/P$2 case) — the
+    # granular "which pads diverge" view; the family-level verdict comes
+    # from kicad_exporter.needs_variant_split (reused, not duplicated).
+    pads_by_pin = {}
+    for fp in fps:
         pm = fp.find('pin-mapping')
-        pin_map = [{'pin': m.get('pin'), 'pad': m.get('pad')}
+        for m in (pm.findall('map') if pm is not None else []):
+            pads_by_pin.setdefault(m.get('pin'), set()).add(m.get('pad'))
+    divergent_pins = {p for p, pads in pads_by_pin.items() if len(pads) > 1}
+
+    split = needs_variant_split(comp)
+
+    variants = []
+    for fp in fps:
+        fa = fp.find('attributes')
+        own_nonempty = {a.get('name') for a in
+                        (fa.findall('attr') if fa is not None else [])
+                        if a.get('value', '')}
+        resolved = resolved_attrs(comp, fp_el=fp)
+        ordered = [a['name'] for a in schema] + \
+                  [k for k in resolved if k not in schema_keys]
+        # fp_desc is the STRUCTURAL per-variant description slot
+        # (ir_schema.md «СХЕМА семейства» table: it lives on the variant by
+        # design) — flagging it off-schema would be a false alarm.
+        attr_rows = [{'name': k, 'value': resolved.get(k, ''),
+                      'from_variant': k in own_nonempty,
+                      'off_schema': k not in schema_keys and k != 'fp_desc'}
+                     for k in ordered]
+        pm = fp.find('pin-mapping')
+        pin_map = [{'pin': m.get('pin'), 'pad': m.get('pad'),
+                    'divergent': m.get('pin') in divergent_pins}
                    for m in (pm.findall('map') if pm is not None else [])]
         step_path = resolve_model3d_file(fp, _SESSION_STEP_DIR)
-        step_url  = (url_for('serve_step', filename=step_path.name)
-                     if step_path is not None else None)
-        footprints.append({
-            'id':       fp.get('name'),
-            'svg':      render_footprint(fp, fixed_size=260),
-            'pin_map':  pin_map,
-            'step_url': step_url,
+        variants.append({
+            'id':        fp.get('name'),
+            'variant':   fp.get('variant') or '',
+            'fp_desc':   resolved.get('fp_desc', ''),
+            'device_name': variant_symbol_name(comp, fp) if split else None,
+            'svg':       render_footprint(fp, fixed_size=260),
+            'pin_map':   pin_map,
+            'step_url':  (url_for('serve_step', filename=step_path.name)
+                          if step_path is not None else None),
+            'attrs':     attr_rows,
+            'diverges':  any(r['divergent'] for r in pin_map),
         })
     return render_template('component.html',
-                           comp_id=comp_id, sym_svg=sym_svg,
-                           attributes=attributes, footprints=footprints)
+                           comp_id=comp_id, sym_svgs=sym_svgs,
+                           renamed_from=comp.get('renamed-from'),
+                           schema=schema, variants=variants, split=split)
 
 
 # ── Dev entrypoint ────────────────────────────────────────────────────────────
@@ -279,7 +357,7 @@ _restore_session()
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         p = sys.argv[1]
-        if p.endswith('.swlib') or p.endswith('.ir.xml'):
+        if p.endswith('.swlib') or p.endswith('.swprj') or p.endswith('.ir.xml'):
             _load_ir(p)
         elif p.endswith('.lbr'):
             tmp = tempfile.NamedTemporaryFile(suffix='.ir.xml', delete=False)

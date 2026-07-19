@@ -13,9 +13,9 @@ the existing structure close to 1:1 — no _build_nets/_DSU equivalent here.
 A `.sch` is self-contained (embedded <schematic><libraries><library> carries
 every symbol/package/deviceset the file's <parts> reference) — no external
 library-resolution table to consult, unlike KiCad's sym-lib-table precondition.
-eagle_parser.py's convert_symbol/convert_package/convert_deviceset/
-collect_attributes are reused verbatim against this embedded library, since
-its shape is identical to a standalone .lbr's <library>.
+eagle_parser.py's convert_symbol/convert_package/convert_deviceset are
+reused verbatim against this embedded library, since its shape is identical
+to a standalone .lbr's <library>.
 
 Stray/page-membership validation (ir_schema.md's frame-boundary concept,
 mirroring kicad_project_parser's page/frame handling): per the user, Eagle
@@ -33,13 +33,14 @@ import math
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from xml.dom import minidom
 
 from babel.eagle_parser import (
-    convert_symbol, convert_package, convert_deviceset, collect_attributes,
+    convert_symbol, convert_package, convert_deviceset,
     parse_rot, _um, LAYER_MAP, _copy_step_files,
 )
 from babel.eagle_exporter import _rotate_vec, _SIDE_NORMAL, _port_geometry, _PORT_PIN_LEN_UM
-from babel.ir_util import component_gates, is_multi_gate
+from babel.ir_util import component_gates, is_multi_gate, resolved_attrs, sanitize_filename
 from babel import import_log
 
 _GAP_UM = 12700  # 0.5" gap between tiled pages/sheets, same as kicad_project_parser
@@ -572,7 +573,7 @@ def _write_canvas(parent_el, instances, nets):
         if inst.get('footprint'):
             inst_el.set('footprint', inst['footprint'])
         for k, v in inst['attrs']:
-            ET.SubElement(inst_el, 'attr', name=k, value=v)
+            ET.SubElement(inst_el, 'attr', name=k, value=v, type='general')
         for rec in inst.get('ph', ()):
             t = ET.SubElement(inst_el, 'text')
             t.text = rec.pop('text')
@@ -837,6 +838,81 @@ def _collect_classes(schematic_el, proj_el):
 
 
 # ---------------------------------------------------------------------------
+# Step 10: per-library .swlib emission
+# ---------------------------------------------------------------------------
+
+def _write_project_libs(proj_el, output_path):
+    """Every project conversion also emits the LIBRARIES the project uses
+    (per the user; kicad_project_parser.convert_project already does this
+    per sym-lib-table nickname): the project pool's <component> elements,
+    grouped by their library= attribute, become standalone .swlib files in
+    <out_stem>_libs/ next to the .swprj, each with its own <symbols> pool
+    restricted to what its components reference.
+
+    Names keep the pool spelling (@N namesake suffixes, renamed-from
+    intact): this file is the project's VIEW of the library, not a
+    reconstruction of the source .lbr — de-suffixing would re-collide the
+    very names @N exists to keep apart. Only the component's library=
+    attribute is dropped (it becomes the .swlib's own name). 3D sidecars
+    follow the library-path convention: <lib>/ next to <lib>.swlib, copied
+    from the project's own sidecar dir (already populated at this point).
+    """
+    import copy
+
+    pool_syms = {s.get('name'): s
+                 for s in proj_el.find('symbols').findall('symbol')}
+    by_lib = {}
+    for comp in proj_el.findall('component'):
+        lib_name = comp.get('library')
+        if not lib_name:
+            raise ValueError(
+                f'component "{comp.get("name")}" has no library= attribute — '
+                f'cannot emit per-library .swlib')
+        by_lib.setdefault(lib_name, []).append(comp)
+    if not by_lib:
+        return []
+
+    libs_dir = output_path.parent / f'{output_path.stem}_libs'
+    libs_dir.mkdir(parents=True, exist_ok=True)
+
+    written = []
+    for lib_name, comps in by_lib.items():
+        lib_el = ET.Element('library', name=lib_name)
+        symbols_el = ET.SubElement(lib_el, 'symbols')
+        added_syms = set()
+        for comp in comps:
+            for _gate, sym_name in component_gates(comp):
+                if sym_name in added_syms:
+                    continue
+                sym_el = pool_syms.get(sym_name)
+                if sym_el is None:
+                    raise ValueError(
+                        f'library "{lib_name}": component '
+                        f'"{comp.get("name")}" references symbol '
+                        f'"{sym_name}" absent from the project pool')
+                symbols_el.append(copy.deepcopy(sym_el))
+                added_syms.add(sym_name)
+        for comp in comps:
+            comp_copy = copy.deepcopy(comp)
+            del comp_copy.attrib['library']
+            lib_el.append(comp_copy)
+
+        lib_out_path = libs_dir / f'{sanitize_filename(lib_name)}.swlib'
+        # Model files resolve by footprint name from the project's own
+        # sidecar dir (<out_stem>/, filled by _copy_step_files above) into
+        # this .swlib's sidecar dir.
+        _copy_step_files(lib_el, output_path, lib_out_path)
+        xml_str = minidom.parseString(ET.tostring(lib_el, encoding='unicode')) \
+                         .toprettyxml(indent='  ')
+        lines = [l for l in xml_str.splitlines() if l.strip()]
+        result = '<?xml version="1.0" encoding="utf-8"?>\n' + '\n'.join(lines[1:])
+        lib_out_path.write_text(result, encoding='utf-8')
+        print(f'Written: {lib_out_path}  ({len(comps)} components)')
+        written.append(str(lib_out_path))
+    return written
+
+
+# ---------------------------------------------------------------------------
 # Step 1/8: top-level entry point
 # ---------------------------------------------------------------------------
 
@@ -1017,21 +1093,21 @@ def convert_project_full(src, output_path):
         layout_el = convert_board(brd_path, name_map=name_map, known=known,
                                   net_names=net_names, attr_sink=board_attrs)
 
-        # Board-side attribute values merge into the SHARED instance —
-        # Eagle allows editing/adding element attributes right in the board
-        # editor without syncing the .sch part (luminoso ground truth: 75
-        # elements with brd-only attrs), while the IR attribute model keeps
-        # ONE value home. Union rule, deterministic: absent -> add (logged);
-        # empty vs non-empty -> non-empty wins; two DIFFERENT non-empty
-        # values -> hard reject (no side is authoritative, a human must
-        # pick). Module-instance parts merge across ALL siblings with the
-        # same rules (per-sibling divergence of non-empty values is
-        # inexpressible: the module canvas is shared).
+        # Board-side attribute values are NOT copied (ir_schema.md "План
+        # импорта Eagle-проекта", шаг 4): the component is ONE entity in
+        # every context and everything real already arrived from the library
+        # (шаг 1, schema incl. empty declarations) and the schematic part
+        # overrides (шаг 3). What Eagle bakes onto <element> is its own
+        # per-board value COPY of those same attributes — redundant by
+        # construction now that the schema isn't truncated on import.
+        # A copy that matches the resolved IR value is dropped silently;
+        # anything else (a genuinely board-only attribute, or a value edited
+        # in the board editor and never synced back) is dropped WITH a log
+        # line — конвенция "не терять молча".
         # FIRST-wins on duplicate names: a multi-gate part is several
         # <instance> elements sharing one designator, and the importer puts
-        # the part's attrs on the FIRST gate — the merge must target the
-        # same element (last-wins silently stranded merged attrs on a gate
-        # nobody reads: PowerPCB module LMV324, 4 gates).
+        # the part's attrs on the FIRST gate — resolution must read the
+        # same element (PowerPCB module LMV324, 4 gates).
         inst_el_by_name = {}
         for i in schem_el.findall('instance'):
             inst_el_by_name.setdefault(i.get('name'), i)
@@ -1044,40 +1120,23 @@ def convert_project_full(src, output_path):
                     if minst['module'] == m.get('name'):
                         addr = f'{minst["designator"]}:{mi_el.get("name")}'
                         mod_inst_by_addr.setdefault(addr, mi_el)
+        comps_by_name = {c.get('name'): c for c in proj_el.findall('component')}
         for el_name, battrs in board_attrs.items():
-            # explicit None test: a childless ET.Element is FALSY, `or`
-            # would drop every instance that has no <attr> children yet —
-            # exactly the ones this merge exists to fill
             target = inst_el_by_name.get(el_name)
             if target is None:
                 target = mod_inst_by_addr.get(el_name)
-
-            if target is None:
-                continue
-            existing = {a.get('name'): a for a in target.findall('attr')}
-            added = []
-            for aname, bval in battrs.items():
-                cur = existing.get(aname)
-                if cur is None:
-                    ET.SubElement(target, 'attr', name=aname, value=bval)
-                    existing[aname] = target[-1]
-                    added.append(aname)
-                    continue
-                cval = cur.get('value') or ''
-                if cval == bval or not bval:
-                    continue
-                if not cval:
-                    cur.set('value', bval)
-                    added.append(aname)
-                    continue
-                raise ValueError(
-                    f'{brd_path}: element {el_name!r} attribute {aname!r} '
-                    f'diverges between board ({bval!r}) and schematic '
-                    f'({cval!r}) — no side is authoritative, reconcile in '
-                    f'Eagle and re-import')
-            if added:
-                import_log.log(el_name, ','.join(sorted(added)),
-                               'BOARD_ATTRS merged into shared instance')
+            resolved = {}
+            if target is not None:
+                comp = comps_by_name.get(target.get('component'))
+                if comp is not None:
+                    resolved = resolved_attrs(comp, target)
+            dropped = sorted(k for k, v in battrs.items()
+                             if resolved.get(k) != v)
+            if dropped:
+                import_log.log(el_name, ','.join(dropped),
+                               'BOARD_ATTRS board-only attribute value(s) '
+                               'dropped (шаг 4 плана импорта: атрибуты платы '
+                               'не копируем)')
         # every board element must resolve — diagnostics over silence
         unresolved = sorted({e.get('name') for e in layout_el
                              if e.tag == 'element'
@@ -1106,12 +1165,14 @@ def convert_project_full(src, output_path):
     _copy_step_files(proj_el, src, output_path)
 
     tree_str = ET.tostring(proj_el, encoding='unicode')
-    from xml.dom import minidom
     xml_str = minidom.parseString(tree_str).toprettyxml(indent='  ')
     lines = [l for l in xml_str.splitlines() if l.strip()]
     result = '<?xml version="1.0" encoding="utf-8"?>\n' + '\n'.join(lines[1:])
     output_path.write_text(result, encoding='utf-8')
     print(f'Written: {output_path}')
+
+    _write_project_libs(proj_el, output_path)
+
     import_log.write(output_path)
     return result
 

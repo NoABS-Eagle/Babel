@@ -34,6 +34,7 @@
     <thead>
       <tr>
         <th>ID</th>
+        {% if has_library_col %}<th>Library</th>{% endif %}
         <th>Symbol</th>
         <th>Footprints</th>
         <th>Pins</th>
@@ -42,7 +43,8 @@
     <tbody>
       {% for c in components %}
       <tr>
-        <td><a href="/library/{{ c.id }}">{{ c.id }}</a></td>
+        <td><a href="/library/{{ c.id|urlencode }}">{{ c.id }}</a></td>
+        {% if has_library_col %}<td class="attr-name">{{ c.library }}</td>{% endif %}
         <td>
           {% if c.has_symbol %}
             <span class="badge ok">✓</span>

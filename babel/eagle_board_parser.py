@@ -18,7 +18,8 @@ import xml.etree.ElementTree as ET
 
 from babel import import_log
 from babel.eagle_parser import (convert_geometry, convert_geometry_mapped,
-                                convert_package, _pkg_layer, _um, fmt, parse_rot)
+                                convert_package, _pkg_layer, _um, fmt, parse_rot,
+                                MIRROR_LAYER)
 from babel.ir_util import format_stack
 
 
@@ -107,7 +108,15 @@ def _convert_element(e, layout, layout_name, pkg_placeholders=frozenset(),
             t.set('font', 'vector')
         if a.get('ratio'):
             t.set('ratio', a.get('ratio'))
-        ir_layer = _pkg_layer(int(a.get('layer')))
+        # Layer is LOCALIZED like x/y/rot: Eagle stores the BOARD-side
+        # number (a mirrored element's NAME sits on bNames 26), the IR
+        # record keeps the element-local, mount-side view — undo the
+        # placement mirror by swapping the t/b pair, symmetric with
+        # eagle_board_exporter._emit_element_attribute re-applying it.
+        eagle_n = int(a.get('layer'))
+        if mirror:
+            eagle_n = MIRROR_LAYER.get(eagle_n, eagle_n)
+        ir_layer = _pkg_layer(eagle_n)
         if ir_layer:
             t.set('layer', ir_layer)
 
@@ -388,7 +397,7 @@ def convert_board(brd_path, layout_name='main', name_map=None, known=None,
     for a in (board_attrs if board_attrs is not None else ()):
         if a.get('name'):
             ET.SubElement(layout, 'attr', name=a.get('name'),
-                          value=a.get('value', ''))
+                          value=a.get('value', ''), type='general')
 
     plain = board.find('plain')
     if plain is not None:

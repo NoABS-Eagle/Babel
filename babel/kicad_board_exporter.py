@@ -65,6 +65,14 @@ _STD_LAYERS = [
     (29, 'B.CrtYd', 'user', 'B.Courtyard'),
     (35, 'F.Fab', 'user', None),
     (33, 'B.Fab', 'user', None),
+    # IR 146 PLATING (маркер металлизации резов, Eagle Milling 46) — a
+    # DEDICATED user layer so the reverse mapping stays unambiguous
+    # (sharing Dwgs.User with IR 150 broke the 120+146 -> Milling 46 fold
+    # after a KiCad circle). User.N id = 37+2N (ground truth testData/t2:
+    # User.1=39). User.45 is KiCad's LAST user layer — User.46 refused to
+    # load ("not in fixed layer hash", user's real KiCad 10); display name
+    # PLATING via the rename slot.
+    (127, 'User.45', 'user', 'PLATING'),
 ]
 
 def _uuid(*key):
@@ -447,6 +455,15 @@ def _emit_footprint(out, e, fp, lib_name, value, frame, pad_nets, n_copper,
     elif ':' not in des:
         log('SYMBOL_LINK missing', 'no schematic path (footprint unlinked '
             'until F8 re-associates by refdes)')
+
+    # (descr) — KiCad's native home of the `fp_desc` variant attribute; the
+    # board copy matters because the project IMPORTER reads footprints off
+    # the board, not the .pretty (kicad_project_parser docstring) — without
+    # it fp_desc died on the KiCad→IR leg of the circle (tolmach CON1/Z7).
+    fa = fp.find('attributes')
+    da = fa.find('attr[@name="fp_desc"]') if fa is not None else None
+    if da is not None and da.get('value'):
+        out.append(f'\t\t(descr {_q(da.get("value"))})')
 
     # Reference/Value properties anchored at the footprint's own >NAME/>VALUE
     # placeholders (their local frame), value hidden when placeholder absent
@@ -846,11 +863,17 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
     # instance sits on (from top_level_sheets), passed in per instance.
     minst_page_name = minst_page_name or {}
     def _net_disp(ir_name):
+        # Единая точка overbar-нормализации имён цепей на выходе в KiCad:
+        # IR держит Eagle-форму (!NRST), KiCad-файлы — ~{NRST}. Конверсия
+        # ВСЕГДА здесь (net-таблица, pad-нets, zone net_name идут через
+        # net_display) — выборочная конверсия давала '!NRST' на плате
+        # против '~{NRST}' в схеме одного и того же проекта (maximus).
         if ':' not in ir_name:
-            return ir_name
+            return _eagle_overbar_to_kicad(ir_name)
         minst, local = ir_name.split(':', 1)
+        local = _eagle_overbar_to_kicad(local)
         page = minst_page_name.get(minst)
-        return f'/{page}/{minst}/{local}' if page else ir_name
+        return f'/{page}/{minst}/{local}' if page else f'{minst}:{local}'
     net_display = {nm: _net_disp(nm) for nm in net_code}
 
     # thermal gap ≡ zone clearance (decisions.md 2026-07-12): a pour with no

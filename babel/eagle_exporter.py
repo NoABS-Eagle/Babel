@@ -1,11 +1,13 @@
 """IR → Eagle .lbr exporter."""
+import copy
 import math
 import re
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from pathlib import Path
 from babel.eagle_parser import fmt
-from babel.ir_util import parse_layer, symbol_pool, component_gates, is_multi_gate
+from babel.ir_util import (parse_layer, symbol_pool, component_gates,
+                           is_multi_gate, resolved_attrs, instance_footprint)
 from babel import import_log
 
 
@@ -495,23 +497,23 @@ def export_package(fp_el, pkg_name):
                 folded.add(pool.pop())
                 milled.add(id(el))
 
-    desc_text = ''
-    desc = fp_el.find('description')
-    if desc is not None and desc.text:
-        desc_text = desc.text
-
+    # <package><description> — НАТИВНЫЙ дом атрибута `fp_desc` варианта
+    # (не эвристика: мы точно знаем, что этим данным там самое место —
+    # решение пользователя, отменившее раннее «проза теряется»), плюс
+    # 3D-метаданные комментом.
+    fa = fp_el.find('attributes')
+    da = fa.find('attr[@name="fp_desc"]') if fa is not None else None
+    desc_text = da.get('value', '') if da is not None else ''
     m3 = fp_el.find('model3d')
     if m3 is not None:
-        comment = _model3d_comment(m3)
-        desc_text = (desc_text + '\n' + comment).strip()
-
+        desc_text = (desc_text + '\n' + _model3d_comment(m3)).strip()
     if desc_text:
         d = ET.SubElement(pkg, 'description')
         d.text = desc_text
 
     for el in fp_el:
         t = el.tag
-        if t in ('description', 'model3d', 'pin-mapping'):
+        if t in ('description', 'model3d', 'pin-mapping', 'attributes'):
             continue
 
         if t in ('smd', 'pad', 'hole'):
@@ -612,8 +614,11 @@ def export_deviceset(comp_el):
     ds.set('name', cid)
     if comp_el.get('prefix'):
         ds.set('prefix', comp_el.get('prefix'))
-    if comp_el.get('uservalue') == 'yes':
-        ds.set('uservalue', 'yes')
+    # ir_schema.md "uservalue НЕ ХРАНИТСЯ": флаг права редактирования в IR
+    # отсутствует, значение материализовано на импорте — Eagle-экспорт пишет
+    # uservalue="yes" ВСЕГДА (цена: value фиксированных деталей становится
+    # редактируемым, прямое следствие принятого "правь откуда угодно").
+    ds.set('uservalue', 'yes')
 
     # `description` is a plain IR attribute (same as KiCad/Altium — no
     # dedicated element), but Eagle has its own native deviceset
@@ -647,11 +652,17 @@ def export_deviceset(comp_el):
             else:
                 gate.set('x', '0'); gate.set('y', '0')
 
-    # Skip 'value' (built-in Eagle attribute), 'description' (already routed
-    # to Eagle's native <description> above) and empty values.
+    # Component <attributes> = СХЕМА семейства (ir_schema.md I9/I10): every
+    # key goes out on every technology, EMPTY values included — an empty
+    # attribute in Eagle is exactly the schema declaration the import
+    # preserved. Skipped: 'value' (built-in Eagle attribute, routed via
+    # <part value=>/element@value), 'description' (routed to Eagle's native
+    # <description> above), 'sym_desc'/'fp_desc' (IR bookkeeping for other
+    # tools' native description slots, not Eagle attributes).
     _seen_attrs = {}
     for a in (attrs_el.findall('attr') if attrs_el is not None else []):
-        if a.get('name', '').lower() in ('value', 'description') or not a.get('value', ''):
+        if a.get('name', '').lower() in ('value', 'description',
+                                         'sym_desc', 'fp_desc'):
             continue
         key = _eagle_name(a.get('name', '')).upper()
         _seen_attrs[key] = a.get('value', '')   # last value wins on collision
@@ -746,7 +757,12 @@ def export_deviceset(comp_el):
         fp_attrs = {}
         if fp_attrs_el is not None:
             for a in fp_attrs_el.findall('attr'):
-                if not a.get('value', ''):
+                # 'value' is materialized on the variant (import-side
+                # uservalue derivation) — it travels via <part value=>/
+                # element@value, never as a technology attribute; 'fp_desc'
+                # is the package-description prose, not an Eagle attribute.
+                if not a.get('value', '') or \
+                        a.get('name', '').lower() in ('value', 'fp_desc'):
                     continue
                 fp_attrs[_eagle_name(a.get('name', '')).upper()] = a.get('value', '')
         merged = dict(attr_pairs)
@@ -765,7 +781,17 @@ def export_deviceset(comp_el):
 def export(ir_path, output_path=None):
     tree = ET.parse(ir_path)
     ir_root = tree.getroot()
-    lib_name = ir_root.get('name', Path(ir_path).stem)
+    if not ir_root.get('name'):
+        ir_root.set('name', Path(ir_path).stem)
+    return export_tree(ir_root, output_path)
+
+
+def export_tree(ir_root, output_path=None):
+    """IR <library> (in-memory) -> Eagle .lbr string. The file-path wrapper
+    is export(); this entry exists so export_schematic can emit the
+    project's libraries as standalone .lbr artifacts (ir_schema.md I11)
+    without a serialize/reparse round."""
+    lib_name = ir_root.get('name', 'library')
 
     # Collect packages: from component footprints AND orphaned standalone footprints
     packages_map = {}
@@ -872,16 +898,12 @@ def _frame_bbox(inst_el, comp_el, pool):
     return cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
 
 
-def _resolved_attrs(comp_el, inst_el):
-    """Component attrs overlaid with this instance's own overrides — same
-    precedence svg_renderer._resolve_placeholder already uses (instance wins).
+def _resolved_attrs(comp_el, inst_el, fp_el=None):
+    """инстанс > вариант > компонент (ir_schema.md "ФОРМАЛЬНАЯ МОДЕЛЬ" I9) —
+    thin wrapper over the shared ir_util.resolved_attrs; the variant is
+    resolved from the instance's own `footprint=` when not passed explicitly.
     """
-    attrs = {}
-    attrs_el = comp_el.find('attributes')
-    if attrs_el is not None:
-        attrs = {a.get('name'): a.get('value', '') for a in attrs_el.findall('attr')}
-    attrs.update({a.get('name'): a.get('value', '') for a in inst_el.findall('attr')})
-    return attrs
+    return resolved_attrs(comp_el, inst_el, fp_el)
 
 
 def _instance_rot_attr(inst_el):
@@ -962,6 +984,20 @@ def _emit_part(parts_el, inst_el, comp_el, lib_name, dev_name_by_fp):
     for a in inst_el.findall('attr'):
         name, val = a.get('name'), a.get('value', '')
         if name == 'value':
+            continue
+        if name.lower() in ('description', 'fp_desc', 'sym_desc'):
+            # These live in Eagle's NATIVE description slots (deviceset/
+            # package <description>), never as a <part> attribute — an
+            # instance-level copy is a KiCad-import artifact (a generic
+            # symbol can't carry per-variant defaults, so the value rides
+            # the placed fields). Emitting it as an attribute made the
+            # schematic diverge from the board, which never bakes these.
+            home = resolved_attrs(comp_el, None,
+                                  instance_footprint(comp_el, inst_el))
+            if val and val != home.get(name.lower(), ''):
+                import_log.log(inst_el.get('name'), name,
+                               'INSTANCE_DESC diverges from the library '
+                               'description, dropped (native slot wins)')
             continue
         ET.SubElement(part, 'attribute', name=name.upper(), value=val)
     # Base-configuration assembly flag (ir_schema.md "Варианты сборки"):
@@ -1050,9 +1086,14 @@ def _emit_instance(instances_el, inst_el, placeholders):
             a.set('layer', _SYM_TEXT_LAYER.get(ph['layer'], '96'))
             continue
         # position/angle from the override when the field was MOVED, else
-        # the library default; style (size/align/layer) is ALWAYS the
-        # library's (источник истины — символ)
-        if t is not None and t.get('x') is not None:
+        # the library default; layer is ALWAYS the library's (источник
+        # истины — символ). size/align are independent override axes too
+        # (kicad_project_parser._field_overrides compares BOTH against the
+        # library default alongside position when deciding whether an
+        # override exists at all) — a moved field can legitimately also be
+        # resized, same reasoning as the align fix above.
+        has_override = t is not None and t.get('x') is not None
+        if has_override:
             lx, ly = float(t.get('x', 0)), float(t.get('y', 0))
             lrot = float(t.get('rot', 0) or 0)
         else:
@@ -1064,7 +1105,8 @@ def _emit_instance(instances_el, inst_el, placeholders):
         ay = ey_um + lx * math.sin(r) + ly * math.cos(r)
         arot = (inst_rot - lrot) % 360 if inst_mirror else (inst_rot + lrot) % 360
         a.set('x', _tomm(str(round(ax)))); a.set('y', _tomm(str(round(ay))))
-        a.set('size', _tomm(ph['size']))
+        a.set('size', _tomm(t.get('size')) if has_override and t.get('size') is not None
+              else _tomm(ph['size']))
         a.set('layer', _SYM_TEXT_LAYER.get(ph['layer'], '96'))
         a.set('font', 'vector')
         rs = f'{arot:g}'
@@ -1072,8 +1114,12 @@ def _emit_instance(instances_el, inst_el, placeholders):
             a.set('rot', f'MR{rs}')
         elif arot:
             a.set('rot', f'R{rs}')
-        if ph['align'] != 'bottom-left':
-            a.set('align', ph['align'])
+        # Align is its own override axis too (real case: freq R4's
+        # Reference has NO justify at all in the source, i.e. centered on
+        # both axes, while the library placeholder is justify=left).
+        align = t.get('align') if has_override else ph['align']
+        if align != 'bottom-left':
+            a.set('align', align)
         if t is not None and t.get('hidden') == 'yes':
             a.set('display', 'off')
 
@@ -1537,21 +1583,11 @@ def export_schematic(ir_path, output_path=None):
         modinst_sheet = {inst_el.get('name'): 0 for inst_el in module_insts}
         n_sheets = 1
 
-    # Coordinates are written straight from IR, unshifted — per the user,
-    # not this exporter's job to hunt for a "nice" quadrant (each Eagle
-    # <sheet> is already its own self-contained unit in the file, doesn't
-    # need to avoid overlapping any other sheet's geometry the way tiled
-    # pages on one shared IR <schematic> canvas do). Negative coordinates
-    # are valid Eagle geometry — the user repositions the visible area in
-    # Eagle itself if they want a specific quadrant, cheaper and less
-    # error-prone than us re-deriving a shift here (see decisions.md
-    # "Eagle-экспорт: без sheet_shift").
-    def _sx(sheet_idx, x_um):
-        return _tomm(x_um)
-
-    def _sy(sheet_idx, y_um):
-        return _tomm(y_um)
-
+    # Coordinates are written straight from IR through every emit function
+    # below (negative coordinates are valid Eagle geometry) — the per-
+    # sheet X re-zero happens once, structurally, as a final pass just
+    # before serialization (see below, near the closing XML write): it
+    # needs `frames`' tile boundaries, which are still being resolved here.
     eagle = ET.Element('eagle', version='9.6.2')
     drawing = ET.SubElement(eagle, 'drawing')
     settings = ET.SubElement(drawing, 'settings')
@@ -1785,6 +1821,40 @@ def export_schematic(ir_path, output_path=None):
 
     port_geom = _port_geometry(module_els, module_insts)
 
+    def _segment_sheet(seg_el, net_name):
+        """Positional fallback for a segment with NO pinref/portref at all —
+        a documentation-only stub (real case: freq MCU_SHEET's "Входы/
+        выходы МК" legend, a global label + short wire that never touches
+        a component pin). Without this, `sheet_candidates` below came back
+        empty and silently defaulted to sheet 0 regardless of the
+        segment's actual tiled position — its real coordinates (some other
+        page's tile) then landed far outside sheet 0's own frame. Same
+        frame-bbox containment discipline as `_graphic_sheet` above, over
+        every line/label/junction point the segment itself carries."""
+        if not frames:
+            return 0
+        pts = [(float(ln.get('x1')), float(ln.get('y1')))
+               for ln in seg_el.findall('line')]
+        pts += [(float(ln.get('x2')), float(ln.get('y2')))
+                for ln in seg_el.findall('line')]
+        for tag in ('label', 'junction'):
+            pts += [(float(el.get('x')), float(el.get('y')))
+                    for el in seg_el.findall(tag)]
+        if not pts:
+            return 0
+        hits = None
+        for x, y in pts:
+            h = {i for i, (bbox, _) in enumerate(frames)
+                 if bbox[0] <= x <= bbox[1] and bbox[2] <= y <= bbox[3]}
+            hits = h if hits is None else hits & h
+        if not hits:
+            raise ValueError(
+                f'net "{net_name}": a segment with no component reference is not '
+                f'inside any one frame — Eagle needs every drawn object placed on '
+                f'a printable sheet/frame to know which page it belongs to. Move it '
+                f'inside a frame (or remove overlapping frames) and re-export.')
+        return next(iter(hits))
+
     for net_el in schem_el.findall('net'):
         segs_by_sheet = {}
         for seg_el in net_el.findall('segment'):
@@ -1798,7 +1868,8 @@ def export_schematic(ir_path, output_path=None):
                 raise ValueError(
                     f'net "{net_el.get("name")}": one segment touches parts on different '
                     f'sheets — not supported, a net segment must stay on one printable page.')
-            sheet_idx = next(iter(sheet_candidates), 0)
+            sheet_idx = (next(iter(sheet_candidates)) if sheet_candidates
+                         else _segment_sheet(seg_el, net_el.get('name')))
             segs_by_sheet.setdefault(sheet_idx, []).append(seg_el)
 
         for sheet_idx, segs in segs_by_sheet.items():
@@ -1808,6 +1879,33 @@ def export_schematic(ir_path, output_path=None):
             for seg_el in segs:
                 seg_out = ET.SubElement(net_out, 'segment')
                 _emit_segment(seg_out, seg_el, port_geom, multi_parts=multi_parts)
+
+    # Per-sheet X re-zero (revives the removed "sheet_shift", X-only this
+    # time): IR keeps one continuous tiled canvas, so a page far down the
+    # row carries a large cumulative X offset (each tiled sub-page's own
+    # dx, ir_schema.md "Импорт страниц источника"). Left unshifted, that
+    # offset accumulates past Eagle's own internal coordinate ceiling —
+    # confirmed real by the user on testData/freq (9 tiled pages,
+    # ~1.86m+ absolute X on later sheets): past some magnitude Eagle's own
+    # editor snaps the coordinate back near 0, scrambling that sheet's
+    # layout. Subtracting each sheet's OWN tile-start (`frames[i][0][0]`,
+    # already computed above for the containment split) keeps every sheet
+    # self-contained near a small local range, same as its KiCad source.
+    # X ONLY — Y stays untouched. The prior "sheet_shift" removal
+    # (decisions.md "Eagle-экспорт: без sheet_shift") was burned by
+    # exactly this kind of shift conflating an already-Y-flipped IR
+    # coordinate with a raw one; X carries no such flip, so this reuses a
+    # single known-good tile boundary instead of re-deriving anything.
+    dx_um_by_sheet = [bbox[0] for bbox, _ in frames] if frames else [0]
+    for sheet_idx, sheet_el in enumerate(sheet_els):
+        dx_mm = round(dx_um_by_sheet[sheet_idx] / 1000, 6)
+        if not dx_mm:
+            continue
+        for el in sheet_el.iter():
+            for attr in ('x', 'x1', 'x2'):
+                v = el.get(attr)
+                if v is not None:
+                    el.set(attr, f'{float(v) - dx_mm:g}')
 
     xml_str = minidom.parseString(ET.tostring(eagle, encoding='unicode')) \
                      .toprettyxml(indent='  ')
@@ -1821,6 +1919,23 @@ def export_schematic(ir_path, output_path=None):
         Path(output_path).write_text(result, encoding='utf-8')
         print(f'Written: {output_path}  ({n_sheets} sheet(s), {len(part_insts)} part(s), '
               f'{len(module_els)} module(s), {len(module_insts)} moduleinst(s))')
+        # ir_schema.md I11: экспорт проекта ВСЕГДА выкладывает библиотеки
+        # самостоятельными артефактами рядом — встроенных копий в .sch/.brd
+        # НЕ достаточно. Одна .lbr на каждую использованную библиотеку, тот
+        # же пер-nickname раскрой, что и у встроенных <library> выше.
+        out_dir = Path(output_path).parent
+        for this_lib_name, lib_components in components_by_lib.items():
+            lib_root = ET.Element('library', name=_eagle_name(this_lib_name))
+            syms_el = ET.SubElement(lib_root, 'symbols')
+            seen_syms = set()
+            for comp_el in lib_components:
+                for _, sname in component_gates(comp_el):
+                    if sname not in seen_syms and sname in pool:
+                        seen_syms.add(sname)
+                        syms_el.append(copy.deepcopy(pool[sname]))
+            for comp_el in lib_components:
+                lib_root.append(copy.deepcopy(comp_el))
+            export_tree(lib_root, out_dir / f'{_eagle_name(this_lib_name)}.lbr')
         import_log.write(output_path)
     return result
 

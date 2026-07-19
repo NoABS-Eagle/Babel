@@ -145,10 +145,27 @@ def check(stem):
         else:
             print(f'  ok  {len(ea)} elements (package/x/y/rot)')
 
-    # attribute VALUES must survive: src set ⊆ rt set (the import's union
-    # merge may legitimately ADD schematic-side attrs to the board copies)
+    # attribute VALUES must survive: src set ⊆ rt set (Eagle bakes value
+    # copies of the resolved instance attrs on every element; the exporter
+    # regenerates them from the IR's one value home). The ONE legitimate
+    # loss is a board-only attribute value the importer dropped BY DESIGN
+    # (ir_schema.md "План импорта Eagle-проекта", шаг 4) — every such drop
+    # is logged, so the allowance is read back from the import log, never
+    # assumed.
+    dropped_names = set()
+    log_path = Path(str(ir) + '.import.log')
+    if log_path.exists():
+        for line in log_path.read_text(encoding='utf-8').splitlines():
+            parts = line.split()
+            if 'BOARD_ATTRS' in line and len(parts) >= 2:
+                dropped_names |= {n.upper() for n in parts[1].split(',')}
     aa, ab = _element_attrs(a), _element_attrs(b)
-    lost = {n: aa[n] - ab.get(n, set()) for n in aa if aa[n] - ab.get(n, set())}
+    lost = {n: {(k, v) for k, v in aa[n] - ab.get(n, set())
+                if k.upper() not in dropped_names}
+            for n in aa}
+    lost = {n: d for n, d in lost.items() if d}
+    n_dropped = sum(1 for n in aa for k, _ in aa[n] - ab.get(n, set())
+                    if k.upper() in dropped_names)
     if lost:
         ok = False
         for n, d in list(lost.items())[:5]:
@@ -157,13 +174,15 @@ def check(stem):
         n_at = sum(len(v) for v in aa.values())
         extra_names = Counter(k for n in aa for k, _ in ab.get(n, set()) - aa[n])
         extra = sum(extra_names.values())
-        # extras are legitimate ONLY as sch->board merge products; name the
-        # names so injected garbage is visible to the eye (a synthesized
-        # 'DESCRIPTION' slipped through a bare count once)
+        # extras are legitimate ONLY as library-schema/instance attrs the
+        # source board never baked; name the names so injected garbage is
+        # visible to the eye (a synthesized 'DESCRIPTION' slipped through a
+        # bare count once)
         names = (' [' + ', '.join(f'{k}x{v}' for k, v in extra_names.most_common(6)) + ']'
                  if extra_names else '')
         print(f'  ok  element attributes ({n_at} records survive'
-              + (f', +{extra} merged from sch{names})' if extra else ')'))
+              + (f', -{n_dropped} board-only dropped by design' if n_dropped else '')
+              + (f', +{extra} regenerated from library/sch{names})' if extra else ')'))
 
     sa, sb = _signal_geom(a), _signal_geom(b)
     if set(sa) != set(sb):

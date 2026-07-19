@@ -40,12 +40,13 @@ from pathlib import Path
 
 from babel import import_log
 from babel.ir_util import (symbol_pool, component_gates, sanitize_filename,
-                            rotate_port_side, arc_mid, instance_designator)
+                            rotate_port_side, arc_mid, instance_designator,
+                            resolved_attrs, instance_footprint)
 from babel.kicad_schematic import _collinear_between, field_to_kicad
 from babel.kicad_exporter import (
     export as export_library, export_symbol,
     _f, _mm, _q, _justify, _build_pin_map, _eagle_overbar_to_kicad,
-    _norm_text_angle,
+    _norm_text_angle, needs_variant_split, variant_symbol_name,
 )
 
 _SCH_VERSION = 20260306   # ground truth: real KiCad 10.0 output (user-saved
@@ -134,14 +135,10 @@ def _frame_bbox(inst_el, comp_el, pool):
 
 
 def _resolved_attrs(comp_el, inst_el):
-    """Component attrs overlaid with instance overrides (instance wins) —
-    same precedence as everywhere else in this project."""
-    attrs = {}
-    attrs_el = comp_el.find('attributes')
-    if attrs_el is not None:
-        attrs = {a.get('name'): a.get('value', '') for a in attrs_el.findall('attr')}
-    attrs.update({a.get('name'): a.get('value', '') for a in inst_el.findall('attr')})
-    return attrs
+    """инстанс > вариант > компонент (ir_schema.md "ФОРМАЛЬНАЯ МОДЕЛЬ" I9) —
+    thin wrapper over the shared ir_util.resolved_attrs; the variant is
+    resolved from the instance's own `footprint=`."""
+    return resolved_attrs(comp_el, inst_el)
 
 
 def _sup_pin_names(comp_el, pool):
@@ -274,6 +271,12 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
     INST:REFDES colon composite). None/empty → the flat single-path form."""
     designator = inst_el.get('name')
     comp_name = comp_el.get('name')
+    if needs_variant_split(comp_el):
+        # divergent per-variant pin numbering: the placement references the
+        # atomic split symbol of ITS OWN variant (see
+        # kicad_exporter.needs_variant_split)
+        comp_name = variant_symbol_name(
+            comp_el, instance_footprint(comp_el, inst_el))
     lib_id = f'{lib_name}:{comp_name}'
     page.lib_ids.add(comp_name)
 
@@ -291,8 +294,14 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
     rot = float(inst_el.get('rot', '0')) % 360
     mirrored = inst_el.get('mirror') == '1'
 
+    # No comp_name fallback for an empty value: an empty resolved value is a
+    # REAL state (user-editable value never typed — I5/I10) and Eagle shows
+    # it empty too. The old `or comp_name` fallback forced the importer into
+    # a "Value == entry name means unset" guess, which swallowed honest
+    # values that legitimately equal the component name (deviceset "33µH"
+    # with value "33µH" — caught by the closed-loop linter on tolmach L1).
     attrs = _resolved_attrs(comp_el, inst_el)
-    value = _eagle_overbar_to_kicad(attrs.pop('value', '') or comp_name)
+    value = _eagle_overbar_to_kicad(attrs.pop('value', ''))
     if is_supply:
         # KiCad names the net BY THE POWER SYMBOL'S VALUE (Eagle names it
         # by the sup-pin) — anything else in Value silently renames the
@@ -599,15 +608,15 @@ def _label_anchor(net_name, segments, pages, part_page, other_wires):
             mid = ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
             for pt in (a, b, mid):
                 if fallback is None:
-                    fallback = (page, pt)
+                    fallback = (page, pt, seg_el)
                 if not any(_collinear_between(wa, wb, pt)
                            for wa, wb in other_wires):
-                    return page, pt[0], pt[1]
+                    return page, pt[0], pt[1], seg_el
     if fallback is not None:
         import_log.log(net_name, '', 'LABEL_ANCHOR every point of the net '
                         'touches another net\'s wire — label may merge nets, '
                         'check in KiCad')
-        return fallback[0], fallback[1][0], fallback[1][1]
+        return fallback[0], fallback[1][0], fallback[1][1], fallback[2]
     return None
 
 
@@ -633,16 +642,19 @@ def _emit_nets(pages, canvas_el, part_page, comp_by_desig, pool, ns,
         net_name = net_el.get('name')
         segments = net_el.findall('segment')
 
-        has_label = any(seg.findall('label') for seg in segments)
-        self_named = any(
-            comp_by_desig.get(r.get('part')) is not None
-            and net_name in _sup_pin_names(comp_by_desig[r.get('part')], pool)
-            for seg in segments for r in seg.findall('pinref'))
-
         # Which single label position the hierarchical label takes over
         # (first label of the net; for a label-less net — first wire end).
         hier = hier_ports.get(net_name)
         hier_placed = False
+
+        # Per-ISLAND naming ledger: a KiCad net name lives ONLY on attached
+        # labels / supply pins, per electrical island — so a named net's
+        # island without either both loses the name AND falls off the net
+        # (same-text labels are what join islands into one KiCad net).
+        # Found on Komar PHASE_A_GND: the unlabeled one-wire stub to
+        # MODULE2 came back as autonamed N$1 and desynced board vs
+        # schematic. Net-level "has a label somewhere" is not enough.
+        named_segs = set()
 
         for seg_el in segments:
             page = _segment_page(pages, seg_el, part_page, net_name)
@@ -655,6 +667,7 @@ def _emit_nets(pages, canvas_el, part_page, comp_by_desig, pool, ns,
             for j in seg_el.findall('junction'):
                 _emit_junction(page, j, ns)
             for l in seg_el.findall('label'):
+                named_segs.add(id(seg_el))
                 if hier and not hier_placed:
                     _emit_hier_label(page, net_name, hier[0],
                                      l.get('x'), l.get('y'),
@@ -665,6 +678,12 @@ def _emit_nets(pages, canvas_el, part_page, comp_by_desig, pool, ns,
                 _emit_label(page, net_name, l.get('x'), l.get('y'),
                             l.get('rot', '0'), l.get('size', '1270'), ns,
                             style=l.get('style', 'crummy'), in_module=in_module)
+            # a supply pin names (and globally joins) ITS island
+            if any(comp_by_desig.get(r.get('part')) is not None
+                   and net_name in _sup_pin_names(comp_by_desig[r.get('part')],
+                                                  pool)
+                   for r in seg_el.findall('pinref')):
+                named_segs.add(id(seg_el))
 
         # Hierarchical label for a port whose net had no label of its own
         # (synthesized supply ports): safe anchor on the net's own wires
@@ -674,37 +693,41 @@ def _emit_nets(pages, canvas_el, part_page, comp_by_desig, pool, ns,
                      if nm != net_name for w in ws]
             anchor = _label_anchor(net_name, segments, pages, part_page, other)
             if anchor is not None:
-                page, ax, ay = anchor
+                page, ax, ay, aseg = anchor
                 _emit_hier_label(page, net_name, hier[0], ax, ay, '0', ns)
                 hier_placed = True
                 consumed_hier.add(net_name)
+                named_segs.add(id(aseg))
             else:
                 import_log.log(net_name, '', 'MODULE_PORT net has no wire to '
                                 'anchor a hierarchical_label, port left dangling')
 
-        # Label synthesis (plan §3): a user-named net with no label of its
-        # own and no supply self-naming loses its name in KiCad — emit one
-        # local label at the first wire end. N$-autonames are NOT
-        # materialized — except when the net carries a class= (the
-        # netclass_pattern in .kicad_pro matches by exact name, an unnamed
-        # net would silently lose its class — logged).
-        needs_name = (not has_label and not self_named and not hier
-                      and (not re.fullmatch(r'N\$\d+', net_name)
-                           or net_el.get('class')))
-        if needs_name:
+        # Label synthesis (plan §3, per ISLAND): every island of a
+        # user-named net that still has no label/supply/hier gets one at a
+        # safe anchor on its own wires. N$-autonames are NOT materialized —
+        # except when the net carries a class= (the netclass_pattern in
+        # .kicad_pro matches by exact name, an unnamed net would silently
+        # lose its class — logged); a multi-island classed autonet needs
+        # the label on every island for the same reason a named net does.
+        if not re.fullmatch(r'N\$\d+', net_name) or net_el.get('class'):
             other = [w for nm, ws in wires_by_net.items()
                      if nm != net_name for w in ws]
-            anchor = _label_anchor(net_name, segments, pages, part_page, other)
-            if anchor is not None:
-                page, ax, ay = anchor
+            for seg_el in segments:
+                if id(seg_el) in named_segs:
+                    continue
+                anchor = _label_anchor(net_name, [seg_el], pages, part_page,
+                                       other)
+                if anchor is None:
+                    import_log.log(net_name, '', 'NET island has no wire to '
+                                    'anchor a label, name will be lost in '
+                                    'KiCad')
+                    continue
+                page, ax, ay, _aseg = anchor
                 _emit_label(page, net_name, ax, ay, '0', '1270', ns,
                             in_module=in_module)
                 if re.fullmatch(r'N\$\d+', net_name):
                     import_log.log(net_name, '', 'NET_LABEL synthesized for an '
                                     'auto-named net to keep its class assignment')
-            else:
-                import_log.log(net_name, '', 'NET name has no wire to anchor a '
-                                'label, name will be lost in KiCad')
 
     for pname in hier_ports:
         if pname not in consumed_hier:
@@ -897,7 +920,7 @@ def _emit_sheet(page, inst_el, mod_el, mod_page, proj_name, ns, page_num):
         shape = _PORT_SHAPE.get(p.get('direction', 'io'), 'bidirectional')
         pj = {'right': 'right', 'left': 'left',
               'top': 'left', 'bottom': 'left'}[side]
-        lines += [f'\t\t(pin {_q(p.get("name"))} {shape}',
+        lines += [f'\t\t(pin {_q(_eagle_overbar_to_kicad(p.get("name"))) } {shape}',
                   f'\t\t\t(at {_f(px)} {_f(py)} {_SIDE_ANGLE[side]})',
                   f'\t\t\t(uuid "{_quuid(ns, "sheetpin", inst_name, p.get("name"))}")',
                   '\t\t\t(effects',
@@ -1038,12 +1061,24 @@ def _lib_symbols_cache(lib_ids, comp_by_name, ir_root, lib_name,
     KiCad forks the copy per file), so a uniform per-file flip needs no
     GND_1-style fork at all. Top-level pages keep `(power global)`:
     cross-page merge by name is the IR single-canvas semantics."""
+    # atomic split symbols (needs_variant_split) are referenced by their
+    # per-variant name, not the component's — resolve those here
+    split_defs = {}
+    for c in ir_root.findall('component'):
+        if needs_variant_split(c):
+            for fp in c.findall('footprint'):
+                split_defs[variant_symbol_name(c, fp)] = (c, fp)
     chunks = ['\t(lib_symbols']
     for comp_name in sorted(lib_ids):
         comp_el = comp_by_name.get(comp_name)
-        if comp_el is None:
+        if comp_el is not None:
+            sexp = export_symbol(comp_el, ir_root, lib_name)
+        elif comp_name in split_defs:
+            c, fp = split_defs[comp_name]
+            sexp = export_symbol(c, ir_root, lib_name,
+                                 variant_fp=fp, sym_name=comp_name)
+        else:
             continue
-        sexp = export_symbol(comp_el, ir_root, lib_name)
         if not sexp:
             continue
         old = f'(symbol {_q(comp_name)}'

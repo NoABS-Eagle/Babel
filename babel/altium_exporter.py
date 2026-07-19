@@ -812,7 +812,7 @@ def _export_footprint(fp_el, pcblib, step_dir=None):
 
     for child in fp_el:
         tag = child.tag
-        if tag in ('model3d', 'pin-mapping', 'description'):
+        if tag in ('model3d', 'pin-mapping', 'description', 'attributes'):
             continue
         if tag in ('smd', 'pad', 'hole'):
             pcb_layer = None            # pads pick their own layer below

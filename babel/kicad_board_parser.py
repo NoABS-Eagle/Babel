@@ -18,8 +18,10 @@ Milestone scope (flat tolmach, simple -> complex):
   general thickness, logged), nets, tracks (segment/arc), through vias,
   free board graphics (gr_*), placed footprints -> <element> with un-baked
   side/rot, synthetic babel:HOLE_* -> <hole>.
-Deferred, NEVER silently (import_log): zones, keepouts, rules,
-dimensions, groups, element-level text overrides.
+Zones (pours) import via the pen-model inverse offset (ir_util.
+unoffset_contour — см. _import_zone). Deferred, NEVER silently
+(import_log): keepout rule areas, rules, dimensions, groups,
+element-level text overrides.
 """
 import math
 import re
@@ -30,9 +32,9 @@ from kiutils.utils import sexpr as _kiutils_sexpr
 
 from babel import import_log
 from babel.eagle_board_exporter import _instance_footprint
-from babel.ir_util import format_stack
+from babel.ir_util import format_stack, unoffset_contour
 from babel.kicad_layers import kicad_to_ir
-from babel.kicad_parser import _arc_params
+from babel.kicad_parser import _arc_params, _kicad_overbar_to_eagle
 
 _MIN_VERSION = 20241229          # anything older than KiCad 9/10 era rejects
 
@@ -114,12 +116,24 @@ def _ir_layer(name, ctx, what):
 # Stack
 # ---------------------------------------------------------------------------
 
+_COPPER_LAYER_TYPES = {'signal', 'power', 'mixed', 'jumper'}
+
+
 def _copper_names(pcb):
-    """Ordered copper layer names from the (layers ...) table, top-down."""
+    """Ordered copper layer names from the (layers ...) table, top-down.
+
+    The type field (2nd/3rd token) is what the layer is USED for — signal,
+    power (plane), mixed, or jumper — never a marker of "not really
+    copper"; the `.Cu` name suffix alone is what makes a layer copper.
+    Confirmed real (testData/freq): a 4-layer board with F.Cu/In2.Cu set to
+    "jumper" and In1.Cu to "mixed" (chosen explicitly in Board Setup) was
+    undercounted to 1 signal-typed layer (B.Cu only), tripping the
+    single-sided hard-reject on a board that was never single-sided.
+    """
     names = []
     layers = _get(pcb, 'layers') or []
     for it in layers[1:]:
-        if isinstance(it, list) and len(it) >= 3 and str(it[2]) == 'signal' \
+        if isinstance(it, list) and len(it) >= 3 and str(it[2]) in _COPPER_LAYER_TYPES \
                 and str(it[1]).endswith('.Cu'):
             names.append(str(it[1]))
     # KiCad's table order is F.Cu, inners..., B.Cu already; keep it.
@@ -170,16 +184,31 @@ def _read_stack(pcb, n_copper):
 # Copper: tracks, vias
 # ---------------------------------------------------------------------------
 
+_UNCONNECTED_NET = re.compile(r'^(?:[^:/]+:)?unconnected-\(.*\)$')
+
+
 def _net_name(item, code_to_name):
     """KiCad 10 canon is name-only `(net "NAME")` — the numbered net table
     died with v9 (a resave normalizes every reference to this form). The
     numbered legacy forms `(net N "NAME")` / `(net N)` still parse (our own
-    fresh export writes them, v10 accepts them)."""
+    fresh export writes them, v10 accepts them).
+
+    KiCad 10 also gives net CODE 0 (genuinely no connection) a synthetic
+    descriptive NAME instead of leaving it numeric/blank — confirmed real
+    (testData/freq, D4 pad 24: `(net "unconnected-(D4-NC-Pad24)")`). It's a
+    real string, not net-0-numeric, so the checks above happily returned it
+    as if it were an actual net — Eagle has no such convention (a pad
+    simply absent from every `<net>` IS its "unconnected"), so this leaked
+    through as a literal signal named e.g. "UNCONNECTED-(D4-NC-PAD24)".
+    Treated as None here, same as every other "no net" case — every caller
+    already skips on None (tracks/vias/zones/pads all read "no net" this
+    way), so recognizing it once here is enough."""
     it = _get(item, 'net')
     if it is None or len(it) < 2:
         return None
     if isinstance(it[1], str) and not it[1].lstrip('-').isdigit():
-        return it[1] or None                       # (net "NAME")
+        name = it[1] or None                        # (net "NAME")
+        return None if name and _UNCONNECTED_NET.match(name) else name
     if len(it) > 2:
         return str(it[2]) or None                  # (net N "NAME")
     code = int(it[1])
@@ -250,6 +279,157 @@ def _fill_none(item):
     if isinstance(v, list):
         v = _val(f, 'type', default='')
     return str(v) in ('none', 'no')
+
+
+def _zone_outline_edges(poly_node, frame):
+    """(polygon (pts ...)) -> closed edge list [('line'/'arc', x1, y1, x2,
+    y2, curve), ...] in IR µm. Node semantics = the exact inverse of
+    kicad_board_exporter._zone_pts: the pts list alternates (xy) points and
+    (arc start mid end) nodes, line edges are implied between consecutive
+    nodes, an arc's start absorbs the preceding point, closure is implicit.
+    The 3-point arc refit runs on frame-flipped points, so the sweep sign
+    lands in IR orientation the same way _emit_track's does."""
+    nodes = []
+    for it in (_get(poly_node, 'pts') or []):
+        if not isinstance(it, list) or not it:
+            continue
+        if it[0] == 'xy':
+            nodes.append(('pt', (frame.fx(it[1]), frame.fy(it[2]))))
+        elif it[0] == 'arc':
+            nodes.append(('arc', _pt(it, 'start', frame),
+                          _pt(it, 'mid', frame), _pt(it, 'end', frame)))
+    edges = []
+
+    def _line(a, b):
+        if math.hypot(b[0] - a[0], b[1] - a[1]) > 0.5:
+            edges.append(('line', a[0], a[1], b[0], b[1], 0.0))
+
+    cur = first = None
+    for nd in nodes:
+        if nd[0] == 'pt':
+            p = nd[1]
+            if cur is not None:
+                _line(cur, p)
+            cur = p
+        else:
+            _, p1, pm, p2 = nd
+            if cur is not None:
+                _line(cur, p1)
+            params = _arc_params(p1, pm, p2)
+            if params is None:
+                _line(p1, p2)
+            else:
+                edges.append(('arc', p1[0], p1[1], p2[0], p2[1],
+                              _snap_sweep(params[4])))
+            cur = p2
+        if first is None:
+            first = nd[1] if nd[0] == 'pt' else nd[1]
+    if cur is not None and first is not None:
+        _line(cur, first)
+    return edges
+
+
+def _zone_copper_layers(item):
+    """This zone's copper layer(s) — KiCad's singular `(layer "F.Cu")` or
+    plural `(layers "F.Cu" "B.Cu" ...)`. The plural form pours the SAME
+    outline identically on every listed layer at once (real case:
+    testData/freq — GND/GNDD planes poured on F.Cu+B.Cu together); the pen
+    model has no "one polygon, many layers" concept, so this becomes one
+    IR <polygon> per layer, same geometry, per the user's call (2026-07-19).
+    A listed entry that isn't a recognized copper layer is dropped with a
+    log, not silently — zones are copper-only by construction, but this
+    stays defensive rather than assuming the source is always clean."""
+    single = _val(item, 'layer')
+    if single is not None:
+        raw = [single]
+    else:
+        node = _get(item, 'layers') or []
+        raw = [str(l) for l in node[1:]]
+    out = []
+    for name in raw:
+        ir = _copper_ir(name)
+        if ir is None:
+            import_log.log('kicad_pcb', 'zone', 'ZONE layer dropped',
+                           f'{name!r} is not a copper layer')
+        else:
+            out.append(ir)
+    return out
+
+
+def _import_zone(item, frame, code_to_name, signal_fn):
+    """KiCad (zone ...) pour -> IR <polygon> under its net's <signal> —
+    the inverse of kicad_board_exporter._emit_zone, pen model (decisions.md
+    "МОДЕЛЬ ПЕРА"): centerline = outline un-offset INWARD by min_thickness/2
+    (ir_util.unoffset_contour), width = min_thickness. A non-equidistant
+    outline (hand-drawn zone with sharp corners) imports WITH a log — the
+    recovered copper equals KiCad's own min_thickness-stroked fill; a
+    degenerate one (neck thinner than the pen) hard-rejects."""
+    if _get(item, 'keepout') is not None:
+        import_log.log('kicad_pcb', 'zone', 'RULE_AREA deferred',
+                       'keepout zones not carried yet')
+        return
+    # A zone's net lives in the SAME `(net ...)` field tracks/vias use, not
+    # a separate `net_name` key — KiCad 10 canon (name-only `(net "NAME")`,
+    # confirmed real: testData/freq's zones carry no `net_name` field at
+    # all) dropped EVERY zone on the board as "no net" before this reused
+    # the same _net_name() tracks/vias already rely on.
+    net = _net_name(item, code_to_name) or ''
+    if not net:
+        import_log.log('kicad_pcb', 'zone', 'ZONE dropped', 'no net')
+        return
+    layers = _zone_copper_layers(item)
+    if not layers:
+        import_log.log('kicad_pcb', net, 'ZONE dropped',
+                       f'layer {_val(item, "layer")!r} resolves to no '
+                       f'copper layer')
+        return
+    w_um = float(_val(item, 'min_thickness', default=0) or 0) * 1000
+    if w_um <= 0:
+        raise ValueError(
+            f'zone {net!r} layer {_val(item, "layer")}: min_thickness=0 — '
+            f'ширина пера невосстановима, задайте её в KiCad и пересохраните')
+
+    cp = _get(item, 'connect_pads')
+    fill_node = _get(item, 'fill')
+    pr = _val(item, 'priority')
+
+    for poly_node in _gets(item, 'polygon'):
+        edges = _zone_outline_edges(poly_node, frame)
+        try:
+            verts, exact = unoffset_contour(edges, w_um / 2)
+        except ValueError as e:
+            raise ValueError(
+                f'zone {net!r} layer {_val(item, "layer")}: {e}') from e
+        if not exact:
+            import_log.log('kicad_pcb', net, 'ZONE outline not a pen '
+                           'equidistant', 'осевая восстановлена; медь = '
+                           'фактическая заливка KiCad (перо min_thickness)')
+        # A multi-layer zone pours the SAME outline on every listed layer at
+        # once — the pen model has no "one polygon, many layers" concept,
+        # so this is N identical-geometry IR <polygon>s, one per layer.
+        for layer in layers:
+            poly = ET.SubElement(signal_fn(net), 'polygon',
+                                 width=str(round(w_um)), layer=layer)
+            if cp is not None:
+                if len(cp) > 1 and cp[1] == 'yes':
+                    poly.set('thermals', '0')
+                cl = _val(cp, 'clearance')
+                if cl is not None and float(cl) > 0:
+                    poly.set('clearance', str(round(float(cl) * 1000)))
+            if pr is not None:
+                rank = min(max(7 - int(pr), 1), 6)
+                if rank != 1:
+                    poly.set('rank', str(rank))
+            if fill_node is not None and _val(fill_node, 'mode') == 'hatch':
+                # forward: hatch_gap = w*(100-fill)/fill => fill = 100*w/(w+gap)
+                hgap = float(_val(fill_node, 'hatch_gap', default=0) or 0) * 1000
+                if hgap > 0:
+                    pct = min(max(round(100 * w_um / (w_um + hgap)), 1), 99)
+                    poly.set('fill', str(pct))
+            for x, y, curve in verts:
+                v = ET.SubElement(poly, 'vertex', x=str(x), y=str(y))
+                if curve:
+                    v.set('curve', _f(curve))
 
 
 def _snap_sweep(sweep):
@@ -389,13 +569,20 @@ def _fp_property(fp, key):
     return None
 
 
-def _emit_element(layout, fp, frame, code_to_name, known_refdes):
+def _emit_element(layout, fp, frame, code_to_name, known_refdes,
+                  fp_resolver=None, path_to_addr=None):
     lib_id = str(fp[1])
     at = _get(fp, 'at')
     x, y = frame.x(at[1]), frame.y(at[2])
     at_rot = float(at[3]) if len(at) > 3 else 0.0
     bottom = _val(fp, 'layer') == 'B.Cu'
-    refdes = _fp_property(fp, 'Reference') or ''
+    # Identity: the footprint's (path) resolved through the schematic's
+    # uuid maps wins («по path/UUID, не refdes») — that's what turns a
+    # flattened module Reference (C101) back into the IR address DCDC1:C1.
+    # Path-less / unresolved falls back to the Reference (flat projects,
+    # board-only parts).
+    addr = path_to_addr(_val(fp, 'path')) if path_to_addr else None
+    refdes = addr or _fp_property(fp, 'Reference') or ''
 
     # our own synthetic mounting-hole footprints -> layout <hole>
     if lib_id.startswith('babel:HOLE_'):
@@ -404,14 +591,24 @@ def _emit_element(layout, fp, frame, code_to_name, known_refdes):
                       drill=_um(_val(pad, 'drill')))
         return
 
+    board_only = False
     if refdes not in known_refdes:
-        # diagnostics over silence — same REFDES-identity rule as the Eagle
-        # board path. Module-flattened refdes (TM1:C1 -> C101) will need the
-        # reverse mapping when hierarchy lands; flat projects first.
-        raise ValueError(
-            f'board footprint {refdes!r} ({lib_id}) has no schematic '
-            f'instance — REFDES identity broken (or a hierarchical project; '
-            f'module boards are not supported yet)')
+        # A footprint with NO schematic (path ...) link is a legitimate
+        # BOARD-ONLY object (logo/mechanical, KiCad places those without a
+        # symbol — Komar U$2 YOBA_17X17) -> IR `<element footprint=...>` +
+        # the footprint embedded per-layout, the exact shape
+        # eagle_board_exporter already consumes. A footprint WITH a path
+        # but an unknown refdes is a genuinely broken identity.
+        if _get(fp, 'path') is None and fp_resolver is not None:
+            board_only = True
+        else:
+            # diagnostics over silence — same REFDES-identity rule as the
+            # Eagle board path. Module-flattened refdes (TM1:C1 -> C101)
+            # will need the reverse mapping when hierarchy lands.
+            raise ValueError(
+                f'board footprint {refdes!r} ({lib_id}) has no schematic '
+                f'instance — REFDES identity broken (or a hierarchical '
+                f'project; module boards are not supported yet)')
 
     # un-bake the export convention: top at-rot = θ, bottom at-rot = θ+180
     theta = (at_rot - 180) % 360 if bottom else at_rot % 360
@@ -420,46 +617,121 @@ def _emit_element(layout, fp, frame, code_to_name, known_refdes):
         el.set('rot', _f(theta))
     if bottom:
         el.set('side', 'bottom')
+    if board_only:
+        fp_name = lib_id.split(':', 1)[-1]
+        el.set('footprint', fp_name)
+        if layout.find(f'footprint[@name="{fp_name}"]') is None:
+            fp_el = fp_resolver(lib_id)
+            if fp_el is None:
+                raise ValueError(
+                    f'board-only footprint {lib_id!r} ({refdes}) not found '
+                    f'in any library registered in fp-lib-table — export it '
+                    f'and include the library in the project archive')
+            layout.append(fp_el)
+        import_log.log('kicad_pcb', refdes,
+                       f'BOARD_ONLY element ({lib_id}), footprint embedded '
+                       f'per-layout')
+        return
 
-    # pad nets -> contactrefs on the matching <signal>
+    # pad nets -> contactrefs on the matching <signal>. Pad NAME must match
+    # the disambiguation kicad_parser._convert_footprint already applies to
+    # this same footprint's LIBRARY copy (raw NUMBER + running count ->
+    # 'a'/'b'/... suffix) — KiCad allows several physical pads sharing one
+    # NUMBER (real case: ACS758's IP+/IP- terminals, 17 pads each numbered
+    # plain "4"/"5"), and the schematic-side pin-mapping already resolves
+    # to the disambiguated names ("4","4a",...,"4p"). Without this, EVERY
+    # same-numbered pad on the board wrote the same bare contactref
+    # (pad="4") — only one of the 17 physical holes ever got connected,
+    # the rest silently had no contactref at all. Same algorithm, applied
+    # to THIS PLACEMENT's own pad order (board geometry is the source of
+    # truth for position, ir_schema.md/decisions.md "Footprint-геометрия
+    # берётся прямо с платы") — matches the library's disambiguation only
+    # as long as pad order is preserved from placement (KiCad's own normal
+    # behavior; not re-derived from the library file here).
     refs = []
+    pad_dup_count = {}
     for pad in _gets(fp, 'pad'):
+        raw_name = _kicad_overbar_to_eagle(str(pad[1]))
+        dup_n = pad_dup_count.get(raw_name, 0)
+        pad_dup_count[raw_name] = dup_n + 1
+        pad_name = raw_name if dup_n == 0 else f'{raw_name}{chr(ord("a") + dup_n - 1)}'
         net = _net_name(pad, code_to_name)
         if net:
-            refs.append((net, str(pad[1])))
+            refs.append((net, pad_name))
     if _gets(fp, 'model'):
         pass                       # model binding lives on the library side
-    return refs
+    return refdes, refs
 
 
 # ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
 
-_ANON_NET = re.compile(r'^N\$\d+$|^Net-\(.*\)$|^unconnected-\(.*\)$')
+"""Anonymous-net shapes: bare autonames, KiCad Net-(...)/unconnected-(...),
+and their module-addressed forms (`DCDC1:N$1` — the module canvas
+regenerates N$ numbering per import, identity of an autoname is
+meaningless, ir_schema.md)."""
+_ANON_NET = re.compile(
+    r'^(?:[^:/]+:)?(?:N\$\d+|Net-\(.*\)|unconnected-\(.*\))$')
 
 
 def _schem_net_by_pad(proj_el):
     """(designator, pad) -> schematic net name: <schematic> pinrefs pushed
-    through each instance's footprint <pin-mapping>."""
+    through each instance's footprint <pin-mapping>.
+
+    Multi-pad maps ('2 4') register every pad. Module canvases contribute
+    per-INSTANCE addressed entries: ('DCDC1:C1', pad) -> 'DCDC1:SW' for a
+    module-local net; a net that leaves through a PORT resolves to the
+    PARENT net attached to that instance's port on the top canvas (the
+    board names module-crossing copper by the parent — Eagle path canon).
+    """
     comp = {c.get('name'): c for c in proj_el.findall('component')}
-    inst = {i.get('name'): i
-            for i in proj_el.find('schematic').findall('instance')}
-    pin2pad = {}                   # designator -> {pin: pad}
+    schem = proj_el.find('schematic')
+
+    def _canvas_pads(canvas_el):
+        """[(designator, pad, local_net_name)] for one canvas."""
+        inst = {i.get('name'): i for i in canvas_el.findall('instance')}
+        pin2pad = {}
+        rows = []
+        for net in canvas_el.findall('net'):
+            for pr in net.iter('pinref'):
+                d, pin = pr.get('part'), pr.get('pin')
+                if d not in pin2pad:
+                    i = inst.get(d)
+                    c = comp.get(i.get('component')) if i is not None else None
+                    fp = _instance_footprint(c, i) if c is not None else None
+                    pm = fp.find('pin-mapping') if fp is not None else None
+                    pin2pad[d] = {} if pm is None else \
+                        {m.get('pin'): m.get('pad') for m in pm.findall('map')}
+                pads = pin2pad[d].get(pin)
+                if pads is not None:
+                    for pad in pads.split():
+                        rows.append((d, pad, net.get('name')))
+        return rows
+
     out = {}
-    for net in proj_el.find('schematic').findall('net'):
-        for pr in net.iter('pinref'):
-            d, pin = pr.get('part'), pr.get('pin')
-            if d not in pin2pad:
-                i = inst.get(d)
-                c = comp.get(i.get('component')) if i is not None else None
-                fp = _instance_footprint(c, i) if c is not None else None
-                pm = fp.find('pin-mapping') if fp is not None else None
-                pin2pad[d] = {} if pm is None else \
-                    {m.get('pin'): m.get('pad') for m in pm.findall('map')}
-            pad = pin2pad[d].get(pin)
-            if pad is not None:
-                out[(d, pad)] = net.get('name')
+    for d, pad, net in _canvas_pads(schem):
+        out[(d, pad)] = net
+
+    # top-net name reachable through each (module instance, port)
+    parent_by_port = {}
+    for net in schem.findall('net'):
+        for pr in net.iter('portref'):
+            parent_by_port[(pr.get('part'), pr.get('port'))] = net.get('name')
+
+    for mod in proj_el.findall('module'):
+        rows = _canvas_pads(mod)
+        ports = {p.get('name') for p in mod.findall('port')}
+        for minst in schem.findall('instance'):
+            if minst.get('module') != mod.get('name'):
+                continue
+            mn = minst.get('name')
+            for d, pad, net in rows:
+                if net in ports:
+                    parent = parent_by_port.get((mn, net))
+                    out[(f'{mn}:{d}', pad)] = parent if parent else net
+                else:
+                    out[(f'{mn}:{d}', pad)] = f'{mn}:{net}'
     return out
 
 
@@ -514,12 +786,29 @@ def _adopt_schematic_net_names(layout, signals, proj_el):
             '\n  '.join(conflicts))
 
 
-def convert_board(pcb_path, proj_el, known_refdes, layout_name='main'):
+def convert_board(pcb_path, proj_el, known_refdes, layout_name='main',
+                  fp_resolver=None, path_to_addr=None, minst_names=None,
+                  page_names=None, port_parent=None):
     """Parse pcb_path into a <layout> appended to proj_el.
 
     known_refdes: set of schematic instance designators — every placed
-    footprint must resolve to one (REFDES identity), synthetic babel:HOLE_*
-    excepted.
+    footprint must resolve to one (REFDES identity); exceptions: synthetic
+    babel:HOLE_*, and path-less BOARD-ONLY footprints when `fp_resolver`
+    (lib_id -> IR <footprint> Element, supplied by the project importer's
+    fp-lib-table machinery) can embed their geometry per-layout.
+
+    Hierarchical projects (ir_schema.md "Модуль", depth 1):
+      path_to_addr: footprint (path "/{sheet_uuid}/{sym_uuid}") -> IR
+        address `MINST:refdes` (identity «по path/UUID», the flattened
+        board Reference C101 is never parsed);
+      minst_names: module-instance designators — a board net named
+        "/…/{minst}/{local}" resolves to the IR signal `minst:local`.
+      page_names: sheet names that had ZERO sheet pins and were promoted to
+        an ordinary tiled top-level page instead of a module
+        (_flatten_pinless_pages) — a board net named "/…/{page}/{local}"
+        resolves to the bare flat name `local` (pages share ONE net
+        namespace, ir_schema.md "Листов как сущности нет"; no minst prefix
+        exists for something that was never a module).
     """
     pcb_path = Path(pcb_path)
     text = pcb_path.read_text(encoding='utf-8')
@@ -559,16 +848,57 @@ def convert_board(pcb_path, proj_el, known_refdes, layout_name='main'):
 
     signals = {}
     def _signal(name):
+        # Единая overbar-нормализация на входе (KiCad ~{SIG} -> IR !SIG) —
+        # для плоских имён целиком, для иерархических ниже к ЛОКАЛЬНОЙ
+        # части (компоненты пути — имена страниц/инстансов, не сигналы).
+        if not name.startswith('/'):
+            name = _kicad_overbar_to_eagle(name)
         if name.startswith('/'):
-            raise ValueError(
-                f'net {name!r}: hierarchical net names are not supported '
-                f'yet (module boards; flat projects first)')
+            # Hierarchical net: /[page/]…/{minst}/{local}. The minst is
+            # found by NAME among the known module instances — the local
+            # part after it is taken VERBATIM (Eagle net names legally
+            # contain '/', maximus "RTD_IEXC1/AIN3"). A local name that is
+            # a PORT is a module-CROSSING net — KiCad may pick the inner
+            # path as the representative name, but the board copper belongs
+            # to the PARENT net (port_parent, built from schematic
+            # portrefs). Anything not resolving — reject, never guess.
+            parts = name[1:].split('/')
+            if len(parts) == 1:
+                # No sheet segment at all: a LOCAL label on the ROOT page
+                # itself (KiCad's own path is empty down to the root, so
+                # the net is just "/{name}") — the root page has no
+                # namespace either (same "Листов как сущности нет" rule as
+                # any other flattened page), so the bare name IS the flat
+                # net name.
+                name = _kicad_overbar_to_eagle(parts[0])
+                if name not in signals:
+                    signals[name] = ET.SubElement(layout, 'signal', name=name)
+                return signals[name]
+            mi = next((i for i, p in enumerate(parts[:-1])
+                       if p in (minst_names or ())), None)
+            if mi is not None:
+                minst = parts[mi]
+                local = _kicad_overbar_to_eagle('/'.join(parts[mi + 1:]))
+                name = (port_parent or {}).get((minst, local),
+                                               f'{minst}:{local}')
+            else:
+                pi = next((i for i, p in enumerate(parts[:-1])
+                           if p in (page_names or ())), None)
+                if pi is None:
+                    raise ValueError(
+                        f'net {name!r}: hierarchical net name does not resolve '
+                        f'to a known module instance '
+                        f'({sorted(minst_names or ())}) or a flattened page '
+                        f'({sorted(page_names or ())}) — stale board?')
+                # A flattened page has no namespace of its own — the local
+                # part IS the flat net name (ir_schema.md "Листов как
+                # сущности нет").
+                name = _kicad_overbar_to_eagle('/'.join(parts[pi + 1:]))
         if name not in signals:
             signals[name] = ET.SubElement(layout, 'signal', name=name)
         return signals[name]
 
     contactrefs = []               # (net, refdes, pad)
-    n_zones = 0
     for item in pcb[1:]:
         if not isinstance(item, list) or not item:
             continue
@@ -589,20 +919,16 @@ def convert_board(pcb_path, proj_el, known_refdes, layout_name='main'):
         elif tag.startswith('gr_'):
             _emit_graphic(layout, item, frame)
         elif tag == 'footprint':
-            refs = _emit_element(layout, item, frame, code_to_name,
-                                 known_refdes)
-            if refs:
-                refdes = _fp_property(item, 'Reference')
-                contactrefs += [(net, refdes, pad) for net, pad in refs]
+            res = _emit_element(layout, item, frame, code_to_name,
+                                known_refdes, fp_resolver, path_to_addr)
+            if res:
+                elname, refs = res
+                contactrefs += [(net, elname, pad) for net, pad in refs]
         elif tag == 'zone':
-            n_zones += 1
+            _import_zone(item, frame, code_to_name, _signal)
         elif tag in ('group', 'dimension', 'target'):
             import_log.log('kicad_pcb', tag, f'{tag.upper()} deferred',
                            'not carried yet')
-    if n_zones:
-        import_log.log('kicad_pcb', 'zone', 'ZONES deferred',
-                       f'{n_zones} zone(s) not carried yet (pen-model '
-                       f'inverse offset pending)')
 
     seen = set()
     for net, refdes, pad in contactrefs:

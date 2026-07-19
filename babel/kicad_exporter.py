@@ -4,8 +4,10 @@ import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from babel.ir_util import (parse_layer, symbol_pool, component_gates,
-                           resolve_model3d_file, sanitize_filename, arc_mid)
+                           resolve_model3d_file, sanitize_filename, arc_mid,
+                           instance_footprint)
 from babel.kicad_layers import ir_to_kicad
+from babel import import_log
 
 _SYM_VERSION = 20251024   # KiCad 10
 _FP_VERSION  = 20251024
@@ -108,7 +110,10 @@ def model3d_kicad_xyz(m3):
 
 
 def _q(s):
-    return '"' + str(s).replace('\\', '\\\\').replace('"', '\\"') + '"'
+    # \n escaped: multi-line Eagle description prose rides (descr)/property
+    # strings, a literal newline inside a quoted s-expr token is invalid
+    return ('"' + str(s).replace('\\', '\\\\').replace('"', '\\"')
+                        .replace('\n', '\\n') + '"')
 
 
 def _eagle_overbar_to_kicad(s):
@@ -157,7 +162,15 @@ def _norm_text_angle(rot, align):
 
 
 def _build_pin_map(fp_el, gate_name=None):
-    """pin_name → first_pad_number from <pin-mapping>.
+    """pin_name → KiCad pin NUMBER string from <pin-mapping>.
+
+    A multi-pad map (`<map pad="2 4" pin="GND">`, ir_schema.md «один пин ->
+    несколько падов») becomes a KiCad 10 STACKED pin: one symbol pin whose
+    number is the bracketed pad list `[2,4]` — the user's hand-made ground
+    truth on tolmach CRYSTAL-4P-16MHZ, and exactly what kicad_parser.
+    _pin_numbers already reads back. Taking only the first pad here (the old
+    behavior) silently unlinked every extra pad from the symbol (Z7: pad 4
+    lost its GND association).
 
     For multi-gate components the mapping pins are 'GATE.pin'; pass gate_name
     to strip the matching prefix and return bare pin names.
@@ -171,9 +184,10 @@ def _build_pin_map(fp_el, gate_name=None):
     prefix = f'{gate_name}.' if gate_name else None
     for m in pm.findall('map'):
         pin = m.get('pin', '')
-        pad = m.get('pad', '').split()[0]
-        if not pin or not pad:
+        pads = m.get('pad', '').split()
+        if not pin or not pads:
             continue
+        pad = pads[0] if len(pads) == 1 else '[' + ','.join(pads) + ']'
         if prefix:
             if pin.startswith(prefix):
                 result[pin[len(prefix):]] = pad
@@ -295,10 +309,44 @@ def _sym_geom(sym_el, pin_to_pad):
 # Symbol export
 # ---------------------------------------------------------------------------
 
-def export_symbol(comp_el, root, lib_name):
+def _pin_map_signature(fp_el):
+    pm = fp_el.find('pin-mapping')
+    return frozenset((m.get('pin'), tuple(sorted((m.get('pad') or '').split())))
+                     for m in (pm.findall('map') if pm is not None else []))
+
+
+def needs_variant_split(comp_el):
+    """True when this component CANNOT be one KiCad symbol: its variants
+    carry DIVERGENT pin-mappings, and a KiCad pin NUMBER is the only
+    symbol<->pad link there is — one shared number set would wire every
+    other variant's placement to the wrong pads (maximus U13/U7,
+    NSIP83086(V): devices with different pad numbering; export_symbol baked
+    fps[0]'s numbers and the RS485 pins came back shifted by one). Per the
+    user: such a family exports as a SET OF ATOMIC symbols, one per
+    variant, named like the Eagle device (см. variant_symbol_name)."""
+    fps = comp_el.findall('footprint')
+    if len(fps) < 2:
+        return False
+    return len({_pin_map_signature(fp) for fp in fps}) > 1
+
+
+def variant_symbol_name(comp_el, fp_el):
+    """Split-symbol name = Eagle device name: component + variant suffix
+    (the variant string already carries its own separator, '-SO-20W');
+    a variant-less footprint falls back to '-' + footprint name — the same
+    convention eagle_exporter._device_names uses."""
+    v = fp_el.get('variant')
+    return comp_el.get('name', '') + (v if v else '-' + (fp_el.get('name') or ''))
+
+
+def export_symbol(comp_el, root, lib_name, variant_fp=None, sym_name=None):
     """
     Convert <component> to a KiCad symbol S-expression string.
     Returns None for components with no resolvable symbol.
+
+    variant_fp/sym_name: the per-variant ATOMIC split (needs_variant_split)
+    — the symbol is built against exactly this footprint (its pin numbers,
+    its Footprint reference, its baked attrs) under the given name.
     """
     gates = component_gates(comp_el)
     pool  = symbol_pool(root)
@@ -306,9 +354,10 @@ def export_symbol(comp_el, root, lib_name):
     if not gate_syms:
         return None
 
-    comp_id = comp_el.get('name', '')
+    comp_id = sym_name or comp_el.get('name', '')
     prefix  = comp_el.get('prefix', 'U')
-    fps     = comp_el.findall('footprint')
+    fps     = [variant_fp] if variant_fp is not None \
+        else comp_el.findall('footprint')
     multi   = len(fps) > 1
 
     # First gate drives symbol-level text/style/visibility (properties live on
@@ -319,24 +368,35 @@ def export_symbol(comp_el, root, lib_name):
     fp_ref     = f'{lib_name}:{sanitize_filename(fps[0].get("name", ""))}' if len(fps) == 1 else ''
     pin_to_pad = _build_pin_map(fps[0] if fps else None, gate_syms[0][0])
 
+    # Component-level attrs are FAMILY facts — uniform across variants by
+    # construction (ir_schema.md I9), so their VALUES ride even on a generic
+    # multi-variant symbol (blanking them here made Description vanish from
+    # the library projection and resurface as per-instance field overrides
+    # on re-import — the sch/board divergence the user caught). What a
+    # generic symbol genuinely can't bake is only the variant-DIVERGENT
+    # values — the footprint attrs below.
     attrs_el = comp_el.find('attributes')
     attrs = {}
     for a in (attrs_el.findall('attr') if attrs_el is not None else []):
-        attrs[a.get('name', '')] = '' if multi else a.get('value', '')
+        attrs[a.get('name', '')] = a.get('value', '')
 
-    # Device/technology attributes (manf#, package, digikey#, ...) live on the
-    # FOOTPRINT in IR, not the component — convert_deviceset parks Eagle's
-    # <technology> attributes there (component/footprint two-level split). For
-    # an ATOMIC KiCad symbol the .kicad_sym itself must carry their VALUES, or
-    # every placed instance shows fields the library symbol lacks (KiCad's
-    # "not atomic"). Bake the single footprint's attrs in; a multi-footprint
-    # component can't (its variants carry DIFFERENT values for the same key),
-    # so its placeholders stay blank exactly as before. Component-level attrs
-    # (value/description) win on the rare key clash.
+    # Variant attributes (manf#, package, the materialized value, ...) live
+    # on the FOOTPRINT in IR (ir_schema.md I9: значения — у варианта, схема
+    # с пустыми объявлениями — у компонента). For an ATOMIC KiCad symbol the
+    # .kicad_sym itself must carry their VALUES, or every placed instance
+    # shows fields the library symbol lacks (KiCad's "not atomic"). Merge by
+    # the resolution canon — a variant's non-empty value OVERRIDES the
+    # component's empty declaration (setdefault here once let the declared
+    # `value=""` swallow the materialized variant value: the closed-loop
+    # linter returned IC2 with an empty element value). A multi-footprint
+    # component can't bake values (its variants genuinely differ), so its
+    # symbol keeps the bare schema exactly as the generic rule prescribes.
     if not multi and fps:
         fp_attrs_el = fps[0].find('attributes')
         for a in (fp_attrs_el.findall('attr') if fp_attrs_el is not None else []):
-            attrs.setdefault(a.get('name', ''), a.get('value', ''))
+            n, v = a.get('name', ''), a.get('value', '')
+            if v or n not in attrs:
+                attrs[n] = v
 
     datasheet = attrs.pop('datasheet', '')
     value_val = attrs.pop('value', comp_id)
@@ -506,10 +566,15 @@ def export_footprint(fp_el, model_path=None):
     """
     fp_id = fp_el.get('name', 'unknown')
 
-    desc_el = fp_el.find('description')
-    desc_raw = (desc_el.text or '') if desc_el is not None else ''
-    # Strip embedded HTML / 3D metadata for KiCad description
-    desc = desc_raw.split('\n')[0].split('<')[0].strip()[:120]
+    # ir_schema.md I8: the package-description prose is the ordinary
+    # `fp_desc` attribute of the variant — routed here into KiCad's native
+    # (descr ...) slot VERBATIM. The old first-line/pre-HTML/120-char strip
+    # emptied every value that STARTS with a tag ('<a href=…', '<b>…' — the
+    # common Eagle library shape), killing fp_desc on the KiCad→IR leg
+    # (tolmach: 68 of 77 footprints lost it).
+    fa = fp_el.find('attributes')
+    desc_a = fa.find('attr[@name="fp_desc"]') if fa is not None else None
+    desc = desc_a.get('value', '') if desc_a is not None else ''
 
     # Collect >NAME / >VALUE positions from any layer
     def _fp_text_style(placeholder, default_y):
@@ -563,7 +628,7 @@ def export_footprint(fp_el, model_path=None):
 
     for el in fp_el:
         t = el.tag
-        if t in ('description', 'model3d', 'pin-mapping'):
+        if t in ('description', 'model3d', 'pin-mapping', 'attributes'):
             continue
 
         if t in ('smd', 'pad', 'hole'):
@@ -739,6 +804,20 @@ def export(ir_path, output_dir=None, lib_name=None, skip_components=None):
     for comp in root.findall('component'):
         if comp.get('name') in skip_components:
             continue
+        if needs_variant_split(comp):
+            names = []
+            for fp in comp.findall('footprint'):
+                nm = variant_symbol_name(comp, fp)
+                sexp = export_symbol(comp, root, lib_name,
+                                     variant_fp=fp, sym_name=nm)
+                if sexp:
+                    sym_parts.append(sexp)
+                    names.append(nm)
+            import_log.log(comp.get('name'), '',
+                           f'VARIANT_SPLIT divergent pin-mappings -> '
+                           f'{len(names)} atomic symbol(s): '
+                           f'{", ".join(names)}')
+            continue
         sexp = export_symbol(comp, root, lib_name)
         if sexp:
             sym_parts.append(sexp)
@@ -775,6 +854,14 @@ def export(ir_path, output_dir=None, lib_name=None, skip_components=None):
 
     for fp in root.findall('footprint'):   # orphan packages
         _write_fp(fp)
+
+    # Layout-embedded footprints (board-only elements: logo/mechanical,
+    # `<element footprint=...>` — Komar YOBA_17X17). The board references
+    # them by lib_id like any placed part, so the .pretty must carry them
+    # or the re-import's fp-lib-table resolution has nothing to find.
+    for lay in root.findall('layout'):
+        for fp in lay.findall('footprint'):
+            _write_fp(fp)
 
     print(f'Written: {sym_path}')
     print(f'Written: {pretty_dir}/ ({len(seen)} footprints)')

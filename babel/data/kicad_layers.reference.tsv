@@ -43,4 +43,4 @@
 148   Cmts.User           # Eagle 48 Document
 149   Eco2.User           # Eagle 49 Reference
 150   Dwgs.User           # Eagle 50 dxf (canonical reverse for Dwgs.User)
-146   Dwgs.User           # PLATING marker: no KiCad concept, a visible note
+146   User.45             # PLATING marker: dedicated user layer (display "PLATING"); User.45 is the LAST one KiCad has ("not in fixed layer hash" on 46, user ground truth)

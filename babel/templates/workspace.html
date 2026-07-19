@@ -16,7 +16,8 @@
 
 {% if artifacts %}
 
-  {% set has_anything = artifacts.eagle_lbr or artifacts.eagle_project
+  {% set has_anything = artifacts.swlib or artifacts.swprj
+                     or artifacts.eagle_lbr or artifacts.eagle_project
                      or artifacts.kicad_sym  or artifacts.kicad_fp_lib
                      or artifacts.kicad_project
                      or artifacts.altium_intlib or artifacts.altium_lib %}
@@ -24,6 +25,36 @@
   {% if not has_anything %}
   <div class="card">
     <div class="empty-msg">EDA-файлы не найдены.</div>
+  </div>
+  {% endif %}
+
+  {% if artifacts.swlib %}
+  <div class="card">
+    <div class="card-title">🔷 swlib Libraries</div>
+    <div class="artifact-grid">
+      {% for a in artifacts.swlib %}
+      <a href="/open/swlib?path={{ a.paths[0]|urlencode }}"
+         class="artifact-btn swift">
+        <span class="artifact-icon">🔷</span>
+        <span class="artifact-name">{{ a.label }}</span>
+      </a>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% if artifacts.swprj %}
+  <div class="card">
+    <div class="card-title">🔷 swift Projects — библиотечная часть</div>
+    <div class="artifact-grid">
+      {% for a in artifacts.swprj %}
+      <a href="/open/swlib?path={{ a.paths[0]|urlencode }}"
+         class="artifact-btn swift">
+        <span class="artifact-icon">🔷</span>
+        <span class="artifact-name">{{ a.label }}</span>
+      </a>
+      {% endfor %}
+    </div>
   </div>
   {% endif %}
 

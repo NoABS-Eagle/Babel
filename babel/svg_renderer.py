@@ -2,7 +2,7 @@
 import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from babel.ir_util import symbol_pool, component_gates, arc_center
+from babel.ir_util import symbol_pool, component_gates, arc_center, resolved_attrs
 
 _MARGIN  = 3.0   # mm padding around content (renderer works in mm internally)
 _MAX_DIM = 500   # max SVG dimension in pixels
@@ -34,7 +34,7 @@ _E = {
     15: '#FFFFFF',  # white  — Dimension
 }
 
-_BG = '#141414'   # Eagle dark editor background
+_BG = '#000000'   # black canvas (per the user), symbols and footprints alike
 
 # IR signed layer number (ir_schema.md "Плата (Board IR)") → Eagle display
 # color (from eagle_layers.xml color attributes). Footprint geometry carries
@@ -221,10 +221,13 @@ def _poly_pts(el):
 
 
 def _shape(x_ir, y_ir, w_ir, h_ir, roundness, outline_ir, color, x_min, y_max, scale,
-           rot_deg=0):
+           rot_deg=0, frame=False):
     xs, ys = _tr(x_ir, y_ir, x_min, y_max, scale)
     wp, hp = w_ir * scale, h_ir * scale
-    filled = (outline_ir == 0)
+    # A FRAME-layer shape is the cartouche border — outline by ROLE, never a
+    # filled body, even at outline=0 (Eagle's <frame> has no width attr, so
+    # the importer writes 0 there).
+    filled = (outline_ir == 0) and not frame
     fc = color if filled else 'none'
     sw = max(outline_ir * scale, 0.5) if not filled else 0
     # IR CCW+ -> SVG rotate is CW-positive on screen (Y down)
@@ -306,12 +309,6 @@ def _pad_label(x_ir, y_ir, name, x_min, y_max, scale):
 # render_schematic)
 # ---------------------------------------------------------------------------
 
-def _component_attrs(comp_el):
-    """{attr_name: value} from <component>/<attributes>."""
-    attrs_el = comp_el.find('attributes')
-    if attrs_el is None:
-        return {}
-    return {a.get('name'): a.get('value', '') for a in attrs_el.findall('attr')}
 
 
 def _resolve_placeholder(txt, designator, attrs):
@@ -365,16 +362,19 @@ def _pin_pad_map(comp_el, gate_letter=None):
 # Public API
 # ---------------------------------------------------------------------------
 
-def render_symbol(comp_el, root, scale=10):
+def render_symbol(comp_el, root, scale=10, gate=None):
     """Render a component's symbol to an SVG string.
 
-    For multi-gate components, renders the first gate only (representative preview).
+    For multi-gate components, renders the first gate by default
+    (representative preview); pass gate=<name> to render that gate.
     """
     pool = symbol_pool(root)
     gates = component_gates(comp_el)
     sym_el = None
     gate_letter = None
     for gname, sname in gates:
+        if gate is not None and gname != gate:
+            continue
         sym_el = pool.get(sname)
         if sym_el is not None:
             gate_letter = gname
@@ -382,7 +382,10 @@ def render_symbol(comp_el, root, scale=10):
     if sym_el is None:
         return '<svg xmlns="http://www.w3.org/2000/svg"><text fill="red">no symbol</text></svg>'
 
-    attrs = _component_attrs(comp_el)
+    # Library preview: no placed instance — resolve through the FIRST variant
+    # (ir_schema.md I9), so a materialized fixed value ("LED-0603") shows in
+    # the >VALUE placeholder the same way Eagle's own library browser does.
+    attrs = resolved_attrs(comp_el, None, comp_el.find('footprint'))
     pad_map = _pin_pad_map(comp_el, gate_letter)
 
     all_els = list(sym_el)
@@ -418,7 +421,8 @@ def render_symbol(comp_el, root, scale=10):
             out.append(_shape(_v(el.get('x')), _v(el.get('y')),
                                _v(el.get('w')), _v(el.get('h')),
                                int(el.get('roundness', 0)), _v(el.get('outline', '0')),
-                               _SYM_BODY, **kw, rot_deg=float(el.get('rot', 0))))
+                               _SYM_BODY, **kw, rot_deg=float(el.get('rot', 0)),
+                               frame=el.get('layer') == 'FRAME'))
 
         elif t == 'polygon':
             coords = [_tr(_v(v.get('x')), _v(v.get('y')), **kw)
@@ -554,11 +558,8 @@ def render_schematic(root, scale=8, canvas_el=None):
             continue
 
         designator = inst_el.get('name', '')
-        # Instance overrides take priority over the component's own
-        # (shared, device-level) attributes — see ir_schema.md "Component
-        # instance" resolution order.
-        attrs = dict(_component_attrs(comp_el))
-        attrs.update({a.get('name'): a.get('value', '') for a in inst_el.findall('attr')})
+        # инстанс > вариант > компонент (ir_schema.md "ФОРМАЛЬНАЯ МОДЕЛЬ" I9).
+        attrs = resolved_attrs(comp_el, inst_el)
 
         instances.append({
             'sym_el': sym_el,
@@ -606,7 +607,8 @@ def render_schematic(root, scale=8, canvas_el=None):
                 d = math.hypot(w, h) / 2
                 _track(x - d, y - d); _track(x + d, y + d)
                 prims.append(('shape', x, y, w, h, int(el.get('roundness', 0)),
-                              _v(el.get('outline', '0')), rot))
+                              _v(el.get('outline', '0')), rot,
+                              el.get('layer') == 'FRAME'))
             elif t == 'polygon':
                 vs = [_inst_point(_v(v.get('x')), _v(v.get('y')), inst) for v in el.findall('vertex')]
                 for vx, vy in vs:
@@ -670,7 +672,7 @@ def render_schematic(root, scale=8, canvas_el=None):
         _track(x - half_diag, y - half_diag)
         _track(x + half_diag, y + half_diag)
         prims.append(('shape', x, y, dxm, dym, 0, _v('152'),
-                      _inst_dir_angle(0, inst)))
+                      _inst_dir_angle(0, inst), False))
         prims.append(('text', x, y, f"{inst_el.get('name', '')}: {mod_name}",
                       _v('1270'), 0, 'center', _SYM_NAMES))
         for p in mod_el.findall('port'):
@@ -730,7 +732,8 @@ def render_schematic(root, scale=8, canvas_el=None):
             d = math.hypot(w, h) / 2
             _track(x - d, y - d); _track(x + d, y + d)
             prims.append(('shape', x, y, w, h, int(el.get('roundness', 0)),
-                          _v(el.get('outline', '0')), float(el.get('rot', 0))))
+                          _v(el.get('outline', '0')), float(el.get('rot', 0)),
+                          el.get('layer') == 'FRAME'))
         elif t == 'text' and el.text:
             # Decorative canvas text — only elements WITH content:
             # placeholder <text> lives inside symbols, never here.
@@ -777,10 +780,10 @@ def render_schematic(root, scale=8, canvas_el=None):
             _, ax1, ay1, ax2, ay2, curve, w = p
             out.append(_arc(ax1, ay1, ax2, ay2, curve, _SYM_BODY, max(w * scale, 0.5), **kw))
         elif kind == 'shape':
-            _, x, y, w, h, roundness, outline, rot = p
+            _, x, y, w, h, roundness, outline, rot, is_frame = p
             xs2, ys2 = _tr(x, y, **kw)
             wp, hp = w * scale, h * scale
-            filled = (outline == 0)
+            filled = (outline == 0) and not is_frame
             fc = _SYM_BODY if filled else 'none'
             sw = max(outline * scale, 0.5) if not filled else 0
             rot_attr = f' transform="rotate({-rot:.1f},{xs2:.1f},{ys2:.1f})"' if rot else ''
@@ -885,7 +888,7 @@ def render_footprint(fp_el, scale=20, fixed_size=None):
             return 'drop'
 
     all_els = [el for el in fp_el
-               if el.tag not in ('description', 'model3d', 'pin-mapping')
+               if el.tag not in ('description', 'model3d', 'pin-mapping', 'attributes')
                and _el_layer(el) != 'drop']
 
     x_min, x_max, y_min, y_max = _bounds(all_els)

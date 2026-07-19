@@ -22,6 +22,11 @@ def detect_file(path: Path):
     ext = path.suffix.lower()
     h = _head(path)
 
+    if ext == '.swlib' and '<library' in h:
+        return 'swlib'
+    if ext == '.swprj' and '<project' in h:
+        return 'swprj'
+
     if ext in ('.lbr', '.sch', '.brd'):
         if '<eagle' in h or 'eagle.dtd' in h:
             return 'eagle_' + ext[1:]       # eagle_lbr / eagle_sch / eagle_brd
@@ -56,7 +61,8 @@ def scan(root: str) -> dict:
       kicad_project, altium_lib
     """
     p = Path(root)
-    result = dict(root=str(p), eagle_lbr=[], eagle_project=[],
+    result = dict(root=str(p), swlib=[], swprj=[],
+                  eagle_lbr=[], eagle_project=[],
                   kicad_sym=[], kicad_fp_lib=[], kicad_project=[],
                   altium_intlib=[], altium_lib=[])
 
@@ -74,6 +80,12 @@ def scan(root: str) -> dict:
                 n = sum(1 for _ in child.glob('*.kicad_mod'))
                 result['kicad_fp_lib'].append(
                     Artifact('kicad_fp_lib', f'{child.name}  ({n} footprints)', [str(child)]))
+            # Emitted per-project library sets (<proj>_libs/*.swlib) live one
+            # level down — surface them so opening outputs/ shows everything.
+            for swlib in sorted(child.glob('*.swlib')):
+                if detect_file(swlib) == 'swlib':
+                    result['swlib'].append(
+                        Artifact('swlib', f'{swlib.stem}  ({child.name})', [str(swlib)]))
         elif child.is_file():
             kind = detect_file(child)
             if kind == 'eagle_sch':
@@ -92,7 +104,9 @@ def scan(root: str) -> dict:
 
 
 def _add(result, path, kind):
-    if kind == 'eagle_lbr':
+    if kind in ('swlib', 'swprj'):
+        result[kind].append(Artifact(kind, path.name, [str(path)]))
+    elif kind == 'eagle_lbr':
         result['eagle_lbr'].append(Artifact('eagle_lbr', path.name, [str(path)]))
     elif kind == 'kicad_sym':
         result['kicad_sym'].append(Artifact('kicad_sym', path.name, [str(path)]))

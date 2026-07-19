@@ -756,9 +756,11 @@ def convert(intlib_path: str, output_path: str):
             # not a dedicated element/component-attribute — kept first for
             # readability, no semantic significance to the order.
             if info['description']:
-                ET.SubElement(attrs_el, 'attr', name='description', value=info['description'])
+                ET.SubElement(attrs_el, 'attr', name='description',
+                              value=info['description'], type='general')
             for aname, avalue in info['attrs']:
-                ET.SubElement(attrs_el, 'attr', name=aname, value=avalue)
+                ET.SubElement(attrs_el, 'attr', name=aname, value=avalue,
+                              type='general')
             lib_el.append(comp_el)
             orig_to_compel[info['orig_name']] = comp_el
         elif info['is_generic']:
@@ -776,9 +778,11 @@ def convert(intlib_path: str, output_path: str):
                                       prefix=prefix, symbol=sym_el.get('name'))
                 attrs_el = ET.SubElement(comp_el, 'attributes')
                 if info['description']:
-                    ET.SubElement(attrs_el, 'attr', name='description', value=info['description'])
+                    ET.SubElement(attrs_el, 'attr', name='description',
+                                  value=info['description'], type='general')
                 for aname, avalue in info['attrs']:
-                    ET.SubElement(attrs_el, 'attr', name=aname, value=avalue)
+                    ET.SubElement(attrs_el, 'attr', name=aname, value=avalue,
+                                  type='general')
                 lib_el.append(comp_el)
                 generic_groups[key] = (comp_el, {})
             comp_el, fp_map = generic_groups[key]
@@ -794,9 +798,11 @@ def convert(intlib_path: str, output_path: str):
                 comp_el.append(fp_el)
             attrs_el = ET.SubElement(comp_el, 'attributes')
             if info['description']:
-                ET.SubElement(attrs_el, 'attr', name='description', value=info['description'])
+                ET.SubElement(attrs_el, 'attr', name='description',
+                              value=info['description'], type='general')
             for aname, avalue in info['attrs']:
-                ET.SubElement(attrs_el, 'attr', name=aname, value=avalue)
+                ET.SubElement(attrs_el, 'attr', name=aname, value=avalue,
+                              type='general')
             lib_el.append(comp_el)
             orig_to_compel[info['orig_name']] = comp_el
 
