@@ -1110,7 +1110,21 @@ def _emit_instance(instances_el, inst_el, placeholders):
         a.set('layer', _SYM_TEXT_LAYER.get(ph['layer'], '96'))
         a.set('font', 'vector')
         rs = f'{arot:g}'
-        if inst_mirror:
+        # `mirror` on the override is a separate axis from the PART's own
+        # mirror state: it decides only which Eagle rot PREFIX to emit
+        # (glyph-mirrored "MR" vs plain "R") — position/`arot` above stay
+        # tied to `inst_mirror` regardless, since that's the part's real
+        # geometric mirror and the override's lx/ly/lrot were computed
+        # against it. Some CAD tools (ground-truth: Altium) never actually
+        # letter-mirror Designator/Parameter text even on a mirrored part —
+        # only the anchor POSITION moves — unlike Eagle/KiCad where a
+        # mirrored part's smashed text mirrors right along with it; the
+        # importer sets this explicitly when it knows better than the
+        # inst_mirror default (see altium_project_parser._altium_field_overrides).
+        glyph_mirror = inst_mirror
+        if t is not None and t.get('mirror') is not None:
+            glyph_mirror = t.get('mirror') == '1'
+        if glyph_mirror:
             a.set('rot', f'MR{rs}')
         elif arot:
             a.set('rot', f'R{rs}')
@@ -1403,6 +1417,24 @@ def _emit_deco(plain_el, el):
                 w_el.set('width', outline_mm); w_el.set('layer', shape_layer)
 
 
+# IR frame attribute naming the page (ir_schema.md, Altium `>SHEET`). Eagle
+# has a FIRST-CLASS home for it — `<sheet><description>`, which is what the
+# sheet tabs and the sheet list actually show — so unlike >TITLE/>REV it is
+# NOT drawn as a title-block text on the canvas: that would be a second,
+# redundant copy of something Eagle already displays properly.
+_SHEET_NAME_ATTR = 'sheet'
+
+
+def _sheet_description(bbox_inst, comp_by_name, pool):
+    """Page name for one frame -> the text of its Eagle `<sheet>`'s
+    `<description>`, or None when the frame carries no sheet name."""
+    _bbox, inst_el = bbox_inst
+    comp_el = comp_by_name[inst_el.get('component')]
+    if comp_el.get('synth') != 'frame':
+        return None
+    return _resolved_attrs(comp_el, inst_el).get(_SHEET_NAME_ATTR) or None
+
+
 def _emit_frame(plain_el, bbox, inst_el, comp_el, pool):
     """One frame-bearing IR instance -> Eagle <frame> in <plain> + resolved
     title-block texts — shared by the top-level sheets (which ALSO use the
@@ -1419,6 +1451,8 @@ def _emit_frame(plain_el, bbox, inst_el, comp_el, pool):
         placeholder = (t.text or '')
         if not placeholder.startswith('>'):
             continue
+        if placeholder[1:].lower() == _SHEET_NAME_ATTR:
+            continue   # goes to <sheet><description>, see _sheet_description
         val = attrs.get(placeholder[1:].lower())
         if not val:
             continue
@@ -1655,7 +1689,15 @@ def export_schematic(ir_path, output_path=None):
             symbols_el.append(export_symbol(pool[sname], sname,
                                             coerce_sup=sname in sup_only))
 
-    ET.SubElement(schematic_el, 'attributes')
+    # Schematic-level (project-wide) variables — IR <schematic><attributes>
+    # maps straight onto Eagle's own global attributes, the thing a `>NAME`
+    # text on the canvas resolves against. Emitted even when empty: every
+    # real Eagle file writes the element.
+    sch_attrs_el = ET.SubElement(schematic_el, 'attributes')
+    for attr_el in (schem_el.find('attributes') or []):
+        ET.SubElement(sch_attrs_el, 'attribute',
+                      name=_eagle_designator(attr_el.get('name')),
+                      value=attr_el.get('value', ''))
     ET.SubElement(schematic_el, 'variantdefs')
     classes_el = ET.SubElement(schematic_el, 'classes')
     ET.SubElement(classes_el, 'class', number='0', name='default', width='0', drill='0')
@@ -1725,6 +1767,12 @@ def export_schematic(ir_path, output_path=None):
 
     sheets_el = ET.SubElement(schematic_el, 'sheets')
     sheet_els = [ET.SubElement(sheets_el, 'sheet') for _ in range(n_sheets)]
+    # <description> is the FIRST child of <sheet> (eagle.dtd) — written
+    # before <plain> so the element order is valid without a later reorder.
+    for i, sheet_el in enumerate(sheet_els):
+        desc = _sheet_description(frames[i], comp_by_name, pool) if frames else None
+        if desc:
+            ET.SubElement(sheet_el, 'description').text = desc
     plain_els = [ET.SubElement(s, 'plain') for s in sheet_els]
     # <moduleinsts> sits between <plain> and <instances> (ground truth
     # outputs/multigate.sch); omitted for module-less projects, same

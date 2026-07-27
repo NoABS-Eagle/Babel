@@ -1,0 +1,59 @@
+# Altium <-> IR layer projection — WORKING copy — edit me.
+#
+# The code operates on the WORKING copy (altium_layers.tsv); if that is
+# missing or unparseable, it falls back to THIS file.
+#
+# The layer mapping is a property of the Altium importer/exporter, not of the
+# IR, which is why it lives in data you can edit rather than in code.
+#
+# Columns (whitespace-separated):   IR   ALTIUM
+#   IR      : IR layer number. A "_TOP" Altium key is PAIRED — the code
+#             derives the bottom side automatically ("_BOTTOM" <-> -IR), so
+#             list only the top row. Standalone keys have no side.
+#   ALTIUM  : either a fixed layer NAME (Top, Bottom, TopOverlay, ...) or a
+#             MechanicalLayerKind enum name (ASSEMBLY_TOP, COURTYARD_TOP...).
+#
+# WHY KINDS AND NOT NUMBERS. Altium's mechanical layers are numbered 57..72
+# (Mechanical 1..16) but what each one MEANS is chosen per project — one
+# design puts Assembly on Mechanical 2, another on Mechanical 13. The
+# meaning is DECLARED in the file (PcbLib/PcbDoc `mechanical_layer_kinds`),
+# so it is read, never guessed from the number. An earlier version of this
+# mapping keyed off the number's PARITY (odd -> fab, even -> courtyard) and
+# put BC2087's Assembly Top (Mechanical 2, an even number) onto tKeepout
+# together with the real courtyard — the exact failure this table exists to
+# prevent.
+#
+# A mechanical layer whose kind the source does not declare, or a kind with
+# no row here, is carried onto a plain user layer and logged — never
+# silently guessed onto a semantic layer.
+
+# --- fixed (non-mechanical) layers, stable ids ---
+1     Top
+121   TopOverlay
+131   TopPaste
+129   TopSolder
+
+# --- mechanical layers, addressed by DECLARED kind ---
+151   ASSEMBLY_TOP            # assembly drawing -> tDocu 51 / F.Fab
+139   COURTYARD_TOP           # placement outline -> tKeepout 39 / F.CrtYd
+151   COMPONENT_OUTLINE_TOP   # body outline is assembly-drawing content too
+151   ASSEMBLY_NOTES          # no side
+120   BOARD                   # board outline -> Dimension 20
+120   BOARD_SHAPE
+148   FAB_NOTES               # Document 48
+148   DIMENSIONS              # dimension annotation, no side
+
+# --- parked on plain user layers, deliberately NOT given a semantic home ---
+# Both are real drawn content, so they are carried; neither gets guessed onto
+# a semantic layer. Declared here rather than left to the unmapped fallback
+# so their numbers are STABLE: the fallback derives the number from the
+# Mechanical SLOT, and the same kind sits on different slots per project
+# (COMPONENT_CENTER_TOP = Mechanical 4 on BC2087, Mechanical 16 on RoXY).
+#   BODY_3D_*        : 3D body outline. Arguably assembly-drawing content
+#                      (user, 2026-07-27) — move to 151 if that settles.
+#   COMPONENT_CENTER_*: an Altium workaround for not showing the footprint
+#                      origin. IR HAS a real origin, so this carries no
+#                      information for us (user) — kept only so nothing is
+#                      silently dropped.
+216   BODY_3D_TOP
+217   COMPONENT_CENTER_TOP

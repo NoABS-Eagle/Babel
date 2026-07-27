@@ -3,7 +3,8 @@
     "allow": [
       "Bash",
       "PowerShell",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -m babel.altium_project_parser testData/altium/IND/IND80S28.PrjPcb outputs/IND80S28.swprj)"
     ]
   }
 }

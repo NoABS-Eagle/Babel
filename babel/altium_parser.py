@@ -9,10 +9,41 @@ from xml.dom import minidom
 from pathlib import Path
 
 from altium_monkey import AltiumIntLib, AltiumSchLib, AltiumPcbLib
-from babel.ir_util import sanitize_filename, clean_attr_name, arc_endpoints
+from babel.ir_util import sanitize_filename, clean_attr_name, arc_endpoints, place_layer
 from babel.altium_exporter import _um_lw
+from babel import import_log
+from babel import altium_layers
 
 _MILS_TO_UM = 25.4   # 1 mil = 25.4 µm
+
+
+def _altium_overbar_to_eagle(text):
+    """Altium's overbar notation -> IR/Eagle `!TEXT!` toggle (ir_schema.md
+    "Надчёркивание"): a backslash AFTER a character overlines that ONE
+    character (confirmed directly via altium_sch_svg_renderer.
+    render_text_with_overline, not a guess) — `R\\E\\S\\E\\T\\` overlines
+    "RESET" entirely, one backslash needed per character. Consecutive
+    overlined characters are grouped into a single `!...!` run, same as
+    _kicad_overbar_to_eagle's grouping (different source notation, same
+    target)."""
+    out = []
+    overlined = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        has_bar = i + 1 < n and text[i + 1] == '\\'
+        if has_bar and not overlined:
+            out.append('!')
+            overlined = True
+        elif not has_bar and overlined:
+            out.append('!')
+            overlined = False
+        out.append(ch)
+        i += 2 if has_bar else 1
+    if overlined:
+        out.append('!')
+    return ''.join(out)
 
 
 def _pt_to_um(pt):
@@ -80,20 +111,24 @@ _FLIP_VERT = {
 # (numbering used by altium-monkey's PcbLayer enum)
 # 1=Top, 32=Bottom, 33=TopOverlay, 34=BottomOverlay, 35=TopPaste, 36=BottomPaste,
 # 57-72=Mechanical1-16, 74=Multi-Layer
-_LAYER_MAP = {
-    1:  '1',
-    32: '-1',
-    33: '121',
-    34: '-121',
-    35: '131',
-    36: '-131',
-    74: '1',             # Multi-Layer (TH pads through all layers)
-}
-for _i in range(57, 73):
-    _LAYER_MAP[_i] = '151' if (_i % 2 == 1) else '139'   # fab / courtyard
-_LAYER_MAP[67] = '139'   # Mech 11 — IPC courtyard convention
-_LAYER_MAP[69] = '139'   # Mech 13
-_LAYER_MAP[71] = '139'   # Mech 15
+# Mechanical 1..16 that resolve to no table row land here (+ layer index),
+# the same "carry it as a plain user layer, don't guess" convention
+# eagle_parser uses for unknown Eagle layers.
+_USER_LAYER_BASE = 200
+_unmapped_mech_seen = set()
+
+
+def _log_unmapped_mech(fp_el, lid, kind):
+    """One log line per (layer, kind) across a whole run — a library repeats
+    the same undeclared mechanical layer on every one of its footprints."""
+    key = (lid, kind)
+    if key in _unmapped_mech_seen:
+        return
+    _unmapped_mech_seen.add(key)
+    what = f'declared kind {kind}' if kind else 'no declared kind'
+    import_log.log(f'Mechanical {lid - 56} ({what}) has no row in '
+                    f'babel/data/altium_layers.tsv -> carried as user layer '
+                    f'{_USER_LAYER_BASE + (lid - 57)}')
 
 
 def _um(mils):
@@ -142,6 +177,108 @@ def _iter_named_pins(sym, part_id=None):
         yield (pname if n == 1 else f'{pname}@{n}', pin)
 
 
+def _id_xform(x, y):
+    return x, y
+
+
+def emit_rect_geometry(sym_el, rect, xform=_id_xform):
+    """Shared with altium_project_parser.py (placed-instance path) — see
+    that module's docstring for why the two importers must agree on this
+    geometry math rather than keep two independent implementations."""
+    x1, y1 = xform(rect.location_mils.x_mils, rect.location_mils.y_mils)
+    x2, y2 = xform(rect.corner_mils.x_mils, rect.corner_mils.y_mils)
+    x1, y1, x2, y2 = _um(x1), _um(y1), _um(x2), _um(y2)
+    w = str(_um_lw(rect.line_width))
+    for ax1, ay1, ax2, ay2 in [(x1,y1,x2,y1),(x2,y1,x2,y2),(x2,y2,x1,y2),(x1,y2,x1,y1)]:
+        ET.SubElement(sym_el, 'line', x1=ax1, y1=ay1, x2=ax2, y2=ay2, width=w)
+
+
+def emit_polyline_geometry(sym_el, pl, xform=_id_xform):
+    pts = [xform(p.x_mils, p.y_mils) for p in pl.points_mils]
+    w = str(_um_lw(pl.line_width))
+    for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+        ET.SubElement(sym_el, 'line',
+                      x1=_um(ax), y1=_um(ay), x2=_um(bx), y2=_um(by), width=w)
+
+
+def emit_line_geometry(sym_el, ln, xform=_id_xform):
+    x1, y1 = xform(ln.location_mils.x_mils, ln.location_mils.y_mils)
+    x2, y2 = xform(ln.corner_mils.x_mils, ln.corner_mils.y_mils)
+    ET.SubElement(sym_el, 'line',
+                  x1=_um(x1), y1=_um(y1), x2=_um(x2), y2=_um(y2),
+                  width=str(_um_lw(ln.line_width)))
+
+
+def emit_arc_geometry(sym_el, arc, xform=_id_xform):
+    """AltiumSchEllipticalArc is a subclass of AltiumSchArc and adds a
+    second, minor-axis radius. IR has no ellipse-arc primitive, so collapse
+    to a circular arc using the smaller of the two radii — stays inside the
+    original ellipse. Altium's native arc form is the CENTER one — the
+    endpoint-canon conversion (ir_util's arc-math block) happens here, at
+    the Altium boundary; full circles are <shape roundness=100>, not arcs."""
+    lx, ly = xform(arc.location_mils.x_mils, arc.location_mils.y_mils)
+    radius_mils = arc.radius_mils
+    secondary_mils = getattr(arc, 'secondary_radius_mils', None)
+    if secondary_mils is not None:
+        radius_mils = min(radius_mils, secondary_mils)
+    sweep = (arc.end_angle - arc.start_angle) % 360 or 360
+    if sweep >= 360:
+        ET.SubElement(sym_el, 'shape',
+                      x=_um(lx), y=_um(ly),
+                      w=_um(radius_mils * 2), h=_um(radius_mils * 2),
+                      roundness='100', rot='0',
+                      outline=str(_um_lw(arc.line_width)))
+    else:
+        x1, y1, x2, y2, curve = arc_endpoints(
+            float(lx), float(ly), float(radius_mils),
+            float(arc.start_angle), sweep)
+        ET.SubElement(sym_el, 'arc',
+                      x1=_um(x1), y1=_um(y1), x2=_um(x2), y2=_um(y2),
+                      curve=_f(curve),
+                      width=str(_um_lw(arc.line_width)))
+
+
+def emit_ellipse_geometry(sym_el, ell, xform=_id_xform):
+    """Same min-radius collapse as elliptical arcs, as a full circle."""
+    lx, ly = xform(ell.location_mils.x_mils, ell.location_mils.y_mils)
+    radius_mils = min(ell.radius_mils, ell.secondary_radius_mils)
+    ET.SubElement(sym_el, 'shape',
+                  x=_um(lx), y=_um(ly),
+                  w=_um(radius_mils * 2), h=_um(radius_mils * 2),
+                  roundness='100', rot='0',
+                  outline=str(_um_lw(ell.line_width)))
+
+
+def emit_polygon_geometry(sym_el, pol, xform=_id_xform):
+    """Line-loop, NOT IR <polygon fill=...> — established convention for
+    the schematic-symbol domain (fill has no defined rendering meaning
+    there); do not diverge per-importer, see module docstring for why."""
+    pts = [xform(p.x_mils, p.y_mils) for p in pol.points_mils]
+    w = str(_um_lw(pol.line_width))
+    for (ax, ay), (bx, by) in zip(pts, pts[1:] + pts[:1]):
+        ET.SubElement(sym_el, 'line',
+                      x1=_um(ax), y1=_um(ay), x2=_um(bx), y2=_um(by), width=w)
+
+
+def emit_label_geometry(sym_el, lbl, xform=_id_xform, layer='SYMBOLS'):
+    """Free text (AltiumSchLabel) -> IR <text>. Returns the element, or None
+    for a hidden/empty label. `layer` differs by domain — SYMBOLS for symbol
+    body text, GRAPHIC for a sheet-level annotation (altium_project_parser's
+    decorative-canvas path) — the geometry math itself is the same and must
+    not be duplicated, same rule as the shape emitters above."""
+    if lbl.is_hidden or not lbl.text:
+        return None
+    lx, ly = xform(lbl.location.x_mils, lbl.location.y_mils)
+    lalign = _JUSTIFICATION.get(lbl.justification.value if hasattr(lbl.justification, 'value') else 0, 'bottom-left')
+    lrot   = _ORIENT_TO_ROT.get(lbl.orientation.value if hasattr(lbl.orientation, 'value') else 0, 0)
+    lsz    = str(_pt_to_um(lbl.font.size)) if lbl.font else '1270'
+    el = ET.SubElement(sym_el, 'text',
+                       x=_um(lx), y=_um(ly), size=lsz, rot=str(lrot),
+                       align=lalign, layer=layer)
+    el.text = lbl.text
+    return el
+
+
 def _convert_symbol(sym, sym_name, part_id=None):
     """Build a pool-ready <symbol name=...> from an altium-monkey symbol.
 
@@ -161,81 +298,17 @@ def _convert_symbol(sym, sym_name, part_id=None):
     sym_el = ET.Element('symbol', name=sym_name)
 
     for rect in filter(_keep, sym.rectangles):
-        loc = rect.location_mils
-        cor = rect.corner_mils
-        x1  = _um(loc.x_mils); y1 = _um(loc.y_mils)
-        x2  = _um(cor.x_mils); y2 = _um(cor.y_mils)
-        w   = str(_um_lw(rect.line_width))
-        for ax1, ay1, ax2, ay2 in [(x1,y1,x2,y1),(x2,y1,x2,y2),(x2,y2,x1,y2),(x1,y2,x1,y1)]:
-            ET.SubElement(sym_el, 'line',
-                          x1=ax1, y1=ay1, x2=ax2, y2=ay2, width=w)
-
+        emit_rect_geometry(sym_el, rect)
     for pl in filter(_keep, sym.polylines):
-        pts = list(pl.points_mils)
-        w   = str(_um_lw(pl.line_width))
-        for a, b in zip(pts, pts[1:]):
-            ET.SubElement(sym_el, 'line',
-                          x1=_um(a.x_mils), y1=_um(a.y_mils),
-                          x2=_um(b.x_mils), y2=_um(b.y_mils),
-                          width=w)
-
+        emit_polyline_geometry(sym_el, pl)
     for ln in filter(_keep, sym.lines):
-        loc = ln.location_mils
-        cor = ln.corner_mils
-        ET.SubElement(sym_el, 'line',
-                      x1=_um(loc.x_mils), y1=_um(loc.y_mils),
-                      x2=_um(cor.x_mils), y2=_um(cor.y_mils),
-                      width=str(_um_lw(ln.line_width)))
-
+        emit_line_geometry(sym_el, ln)
     for arc in filter(_keep, sym.arcs):
-        loc = arc.location_mils
-        radius_mils = arc.radius_mils
-        # AltiumSchEllipticalArc is a subclass of AltiumSchArc (so it's
-        # already included here) and adds a second, minor-axis radius. IR has
-        # no ellipse-arc primitive, so collapse to a circular arc using the
-        # smaller of the two radii — stays inside the original ellipse.
-        secondary_mils = getattr(arc, 'secondary_radius_mils', None)
-        if secondary_mils is not None:
-            radius_mils = min(radius_mils, secondary_mils)
-        # Same '% 360 or 360' fallback as the PCB arc loop below: a full
-        # circle drawn as start=0/end=360 must not collapse to a 0° sweep.
-        # Altium's native arc form is the CENTER one — the endpoint-canon
-        # conversion (ir_util's arc-math block) happens here, at the Altium
-        # boundary; full circles are <shape roundness=100>, not arcs.
-        sweep = (arc.end_angle - arc.start_angle) % 360 or 360
-        if sweep >= 360:
-            ET.SubElement(sym_el, 'shape',
-                          x=_um(loc.x_mils), y=_um(loc.y_mils),
-                          w=_um(radius_mils * 2), h=_um(radius_mils * 2),
-                          roundness='100', rot='0',
-                          outline=str(_um_lw(arc.line_width)))
-        else:
-            x1, y1, x2, y2, curve = arc_endpoints(
-                float(loc.x_mils), float(loc.y_mils), float(radius_mils),
-                float(arc.start_angle), sweep)
-            ET.SubElement(sym_el, 'arc',
-                          x1=_um(x1), y1=_um(y1), x2=_um(x2), y2=_um(y2),
-                          curve=_f(curve),
-                          width=str(_um_lw(arc.line_width)))
-
+        emit_arc_geometry(sym_el, arc)
     for ell in filter(_keep, sym.ellipses):
-        # Same min-radius collapse as elliptical arcs, as a full circle.
-        loc = ell.location_mils
-        radius_mils = min(ell.radius_mils, ell.secondary_radius_mils)
-        ET.SubElement(sym_el, 'shape',
-                      x=_um(loc.x_mils), y=_um(loc.y_mils),
-                      w=_um(radius_mils * 2), h=_um(radius_mils * 2),
-                      roundness='100', rot='0',
-                      outline=str(_um_lw(ell.line_width)))
-
+        emit_ellipse_geometry(sym_el, ell)
     for pol in filter(_keep, sym.polygons):
-        pts = list(pol.points_mils)
-        w   = str(_um_lw(pol.line_width))
-        for a, b in zip(pts, pts[1:] + [pts[0]]):
-            ET.SubElement(sym_el, 'line',
-                          x1=_um(a.x_mils), y1=_um(a.y_mils),
-                          x2=_um(b.x_mils), y2=_um(b.y_mils),
-                          width=w)
+        emit_polygon_geometry(sym_el, pol)
 
     for ir_pin_name, pin in _iter_named_pins(sym, part_id):
         direction = _ELECTRICAL.get(pin.electrical_name, 'pas')
@@ -257,16 +330,7 @@ def _convert_symbol(sym, sym_name, part_id=None):
                       padvis='1' if pin.show_designator else '0')
 
     for lbl in filter(_keep, sym.labels):
-        if lbl.is_hidden or not lbl.text:
-            continue
-        lx    = _um(lbl.location.x_mils)
-        ly    = _um(lbl.location.y_mils)
-        lalign = _JUSTIFICATION.get(lbl.justification.value if hasattr(lbl.justification, 'value') else 0, 'bottom-left')
-        lrot   = _ORIENT_TO_ROT.get(lbl.orientation.value if hasattr(lbl.orientation, 'value') else 0, 0)
-        lsz    = str(_pt_to_um(lbl.font.size)) if lbl.font else '1270'
-        ET.SubElement(sym_el, 'text',
-                      x=lx, y=ly, size=lsz, rot=str(lrot),
-                      align=lalign, layer='SYMBOLS').text = lbl.text
+        emit_label_geometry(sym_el, lbl)
 
     # >NAME from designator
     desgns = list(filter(_keep, sym.designators))
@@ -341,16 +405,75 @@ _INTERNAL_PER_MIL = 10000.0   # altium-monkey internal units per mil (for pad he
 _INTERNAL_TO_UM   = 25.4 / 10000.0   # internal units → µm (0.00254 µm/unit)
 
 
-def _convert_footprint(fp, fp_el):
-    """Append footprint geometry to fp_el from altium-monkey AltiumPcbFootprint.
+def _mech_layer_kinds(owner):
+    """{Altium layer id -> MechanicalLayerKind NAME} declared by a PcbLib or
+    PcbDoc, or {} when it declares none. What each Mechanical 1..16 layer
+    MEANS is per-project data Altium stores in the file — read it, never
+    infer it from the layer number (see babel/altium_layers.py)."""
+    raw = getattr(owner, 'mechanical_layer_kinds', None) or {}
+    out = {}
+    for lid, kind in raw.items():
+        try:
+            lid = int(lid)
+        except (TypeError, ValueError):
+            continue
+        if 57 <= lid <= 72:
+            out[lid] = getattr(kind, 'name', str(kind))
+    return out
+
+
+def _convert_footprint(fp, fp_el, xform=_id_xform, bottom=False, rot_offset=0.0,
+                        mech_kinds=None):
+    """Append footprint geometry to fp_el from an object exposing .pads/
+    .tracks/.arcs/.texts — an altium-monkey AltiumPcbFootprint (library,
+    xform=identity, bottom=False: pads/tracks/etc. are already footprint-
+    local by construction) OR the same-shaped collections filtered off a
+    PLACED AltiumPcbDoc component (project import — same record classes,
+    see altium_project_parser.py, which supplies xform=inverse-placement
+    and bottom=<is this instance mounted on the bottom side>). One
+    implementation, two callers — do not fork a second footprint converter.
 
     Geometry goes in as DIRECT children of <footprint> with a layer="N"
     attribute (unified board/footprint layer model, ir_schema.md "Плата
     (Board IR)"); <smd>/<pad> carry no layer (copper by construction,
     far-side smd gets an explicit layer="-1").
+
+    Layer projection is the user-editable table in babel/data (see
+    babel/altium_layers.py): FIXED layers resolve by their stable id, while
+    a MECHANICAL layer (57..72) resolves through the KIND its own source
+    file declares for it (`mech_kinds`, from _mech_layer_kinds). The number
+    itself means nothing — Assembly sits on Mechanical 2 in one design and
+    Mechanical 13 in another. An undeclared mechanical layer, or a kind the
+    table doesn't carry, becomes a plain user layer and is logged, rather
+    than being guessed onto a semantic one.
+
+    The table encodes each layer as if the owning object were on the TOP
+    side (IR's own fixed sign convention). For a library footprint that's
+    already correct (no such thing as "placed bottom" in a library). For a
+    PLACED instance, `pad.layer`/`track.layer`/etc. carry the objects' true
+    ABSOLUTE side — `ir_util.place_layer(ln, bottom)` (same sign-toggle used
+    board-wide for placement) converts that absolute reading into the
+    footprint-LOCAL, mount-side-relative sign IR wants; it's a no-op when
+    bottom=False, so the library call path is unaffected.
     """
+    mech_kinds = mech_kinds or {}
+
     def _layer_n(lyr_id):
-        return _LAYER_MAP.get(int(lyr_id))
+        lid = int(lyr_id)
+        if 57 <= lid <= 72:
+            kind = mech_kinds.get(lid)
+            ln = altium_layers.altium_to_ir(kind) if kind else None
+            if ln is None:
+                ln = _USER_LAYER_BASE + (lid - 57)
+                _log_unmapped_mech(fp_el, lid, kind)
+            ln = str(ln)
+        else:
+            name = altium_layers.FIXED_LAYER_NAME.get(lid)
+            ln = altium_layers.altium_to_ir(name) if name else None
+            if ln is None:
+                return None
+            ln = str(ln)
+        return place_layer(ln, bottom)
 
     # Non-electrical pads (fiducials, mounting holes) carry an empty Altium
     # designator. Eagle requires a non-empty smd/pad name, so number them,
@@ -358,21 +481,46 @@ def _convert_footprint(fp, fp_el):
     used_names = {str(p.designator).strip() for p in fp.pads if str(p.designator).strip()}
     anon_n = 0
 
+    # IR requires a unique name per pad, and an SMD pad lives on exactly one
+    # layer (ir_schema.md) — but Altium genuinely stores two independent pad
+    # records under the SAME designator for a part that has copper on both
+    # Top and Bottom under one logical pin (ground-truth: 8AO-VI's "ME BUS FE
+    # CONTACT" connector, designator "1" on layer Top and layer Bottom —
+    # confirmed by the user looking at the real footprint in Altium: "два
+    # физически разных пада, но у них совпадает дезигнатор" — the shared
+    # designator is how Altium associates both with the one schematic pin).
+    # Same disambiguation convention as kicad_parser.py's own duplicate-pad-
+    # number handling (raw name, then raw+'a', raw+'b', ...) — pad_name_groups
+    # maps the original Altium designator to every synthesized IR name sharing
+    # it, so the caller can map one schematic pin to all of them.
+    pad_name_groups = {}
+
     for pad in fp.pads:
         ln = _layer_n(pad.layer)
         if ln not in ('1', '-1'):
             continue
-        x    = _um(pad.x_mils)
-        y    = _um(pad.y_mils)
+        px, py = xform(pad.x_mils, pad.y_mils)
+        x    = _um(px)
+        y    = _um(py)
         w    = _um(pad.width_mils)
         h    = str(round(float(pad.height) * _INTERNAL_TO_UM))
-        name = str(pad.designator).strip()
-        if not name:
+        raw_name = str(pad.designator).strip()
+        if raw_name:
+            dup_n = len(pad_name_groups.get(raw_name, []))
+            name = raw_name if dup_n == 0 else f'{raw_name}{chr(ord("a") + dup_n - 1)}'
+            pad_name_groups.setdefault(raw_name, []).append(name)
+            if dup_n:
+                import_log.log(f'{fp_el.get("name")}: pad "{raw_name}" appears '
+                                f'{dup_n + 1} times (same designator, different '
+                                f'layers) -> disambiguated as "{name}"')
+        else:
             anon_n += 1
             while str(anon_n) in used_names:
                 anon_n += 1
             name = str(anon_n)
             used_names.add(name)
+            import_log.log(f'{fp_el.get("name")}: blank pad designator '
+                            f'(fiducial/mounting hole) -> synthesized "{name}"')
         shape_id = int(pad.effective_top_shape)
 
         if not pad.is_smt:
@@ -400,17 +548,19 @@ def _convert_footprint(fp, fp_el):
             el.set('x', x); el.set('y', y)
             el.set('width', w); el.set('height', h)
             el.set('roundness', roundness)
-            rot = float(pad.rotation or 0)
+            rot = (float(pad.rotation or 0) - rot_offset) % 360
             if rot:
-                el.set('rot', _f(rot % 360))
+                el.set('rot', _f(rot))
 
     for track in fp.tracks:
         ln = _layer_n(track.layer)
         if ln is None:
             continue
+        x1, y1 = xform(track.start_x_mils, track.start_y_mils)
+        x2, y2 = xform(track.end_x_mils, track.end_y_mils)
         el = ET.SubElement(fp_el, 'line')
-        el.set('x1', _um(track.start_x_mils)); el.set('y1', _um(track.start_y_mils))
-        el.set('x2', _um(track.end_x_mils));   el.set('y2', _um(track.end_y_mils))
+        el.set('x1', _um(x1)); el.set('y1', _um(y1))
+        el.set('x2', _um(x2)); el.set('y2', _um(y2))
         el.set('width', _um(track.width_mils))
         el.set('layer', ln)
 
@@ -418,21 +568,22 @@ def _convert_footprint(fp, fp_el):
         ln = _layer_n(arc.layer)
         if ln is None:
             continue
-        start = float(arc.start_angle)
-        end   = float(arc.end_angle)
+        cx, cy = xform(arc.center_x_mils, arc.center_y_mils)
+        start = float(arc.start_angle) - rot_offset
+        end   = float(arc.end_angle) - rot_offset
         sweep = (end - start) % 360 or 360
         if sweep >= 360:
             el = ET.SubElement(fp_el, 'shape')
             el.set('layer', ln)
-            el.set('x', _um(arc.center_x_mils)); el.set('y', _um(arc.center_y_mils))
+            el.set('x', _um(cx)); el.set('y', _um(cy))
             el.set('w', _um(float(arc.radius_mils) * 2))
             el.set('h', _um(float(arc.radius_mils) * 2))
             el.set('roundness', '100'); el.set('rot', '0')
             el.set('outline', _um(arc.width_mils))
         else:
             x1, y1, x2, y2, curve = arc_endpoints(
-                float(arc.center_x_mils), float(arc.center_y_mils),
-                float(arc.radius_mils), start, sweep)
+                float(cx), float(cy),
+                float(arc.radius_mils), start % 360, sweep)
             el = ET.SubElement(fp_el, 'arc')
             el.set('layer', ln)
             el.set('x1', _um(x1)); el.set('y1', _um(y1))
@@ -445,20 +596,45 @@ def _convert_footprint(fp, fp_el):
         if ln is None:
             continue
         content = txt.text_content or ''
-        if content == '.Designator':
+        # Library footprint text stores the literal template token
+        # ('.Designator'/'.Comment'); a PLACED PcbDoc text object instead
+        # carries the string ALREADY resolved to that instance's real
+        # designator/comment ("X1"/"MEPLC40MT-PCB-6") — using the string
+        # check alone would bake one instance's literal designator into the
+        # shared pool footprint. `is_designator`/`is_comment` are reliable
+        # in both cases (confirmed empirically on a placed IND80S28 board
+        # text pair: is_designator=True/'X1' and is_comment=True/
+        # 'MEPLC40MT-PCB-6' — the library string form was never actually
+        # exercised by real test data, so it stays only as a fallback).
+        # A special string embedded in a longer PCB string is wrapped in
+        # apostrophes (Altium's concatenation syntax: "Rev '.Comment'");
+        # a string that IS just one special string may come either bare or
+        # quoted ("'.Designator'" — degenerate one-element concatenation),
+        # so strip a matching apostrophe pair before comparing.
+        bare = content[1:-1] if len(content) > 2 and content[0] == "'" and content[-1] == "'" else content
+        if getattr(txt, 'is_designator', False) or bare == '.Designator':
             content = '>NAME'
-        elif content == '.Comment':
+        elif getattr(txt, 'is_comment', False) or bare == '.Comment':
             content = '>VALUE'
+        elif re.search(r"'\.[A-Za-z_][A-Za-z0-9_]*'", content):
+            # Mixed concatenation or some other quoted special string —
+            # not resolved, kept literal; surface it instead of hiding it.
+            import_log.log(f'{fp_el.get("name")}: unresolved Altium special '
+                           f'string in footprint text {content!r} — kept as '
+                           f'literal text')
         j     = txt.effective_justification
         jval  = j.value if hasattr(j, 'value') else int(j)
         align = _PCB_JUST.get(jval, 'bottom-left')
+        tx, ty = xform(txt.x_mils, txt.y_mils)
         el = ET.SubElement(fp_el, 'text')
         el.set('layer', ln)
-        el.set('x', _um(txt.x_mils)); el.set('y', _um(txt.y_mils))
+        el.set('x', _um(tx)); el.set('y', _um(ty))
         el.set('size', _um(txt.height_mils) if txt.height_mils else '1000')
-        el.set('rot', _f(float(txt.rotation or 0) % 360))
+        el.set('rot', _f((float(txt.rotation or 0) - rot_offset) % 360))
         el.set('align', align)
         el.text = content
+
+    return pad_name_groups
 
 
 
@@ -555,6 +731,21 @@ def _is_param_alias(par, all_params):
     return any(p.name == ref_name for p in all_params)
 
 
+# Parameter names that mark a component as a VALUE-PARAMETRIZED catalog row
+# of a generic device family (one IntLib row per catalog value, all sharing a
+# symbol) — the generic-merge trigger in _convert_component. A hand-drawn
+# SchLib part uses the literal 'Value' parameter; catalog/Vault libraries
+# (ground truth BC2087, Luxonis) instead name the parameter after the
+# physical quantity: Resistance (R rows), Capacitance (C), Inductance (L),
+# Impedance (ferrite beads; a bead row can carry Inductance AND Impedance).
+# The original Value-only trigger left 28 CRCW/RC0402 resistor rows and a
+# dozen GRM/CL capacitor rows as separate one-value "devices" in the
+# converted library while their shared-symbol dedup had already proven them
+# one family (caught by the user reading BC2087.lbr).
+_GENERIC_VALUE_PARAMS = ('Value', 'Resistance', 'Capacitance', 'Inductance',
+                         'Impedance')
+
+
 def _register_symbol(pool, symbols_el, geom_pool, sym, name, part_id=None):
     """Build (if needed) and register one symbol — or one part of a
     multi-part symbol — in the library pool. Dedups by exact name first
@@ -569,13 +760,102 @@ def _register_symbol(pool, symbols_el, geom_pool, sym, name, part_id=None):
         if ghash in geom_pool:
             pool[name] = pool[geom_pool[ghash]]
         else:
+            # The ELEMENT name must stay unique in <symbols> even though the
+            # pool key (this catalog row's name) is already unique: the
+            # generic-merge block renames a family's pooled symbol to the
+            # bare PREFIX ('R'), and a later, geometrically different row
+            # whose own catalog name is literally that prefix would
+            # otherwise register a second <symbol name="R"> — two same-named
+            # symbols make every by-name lookup downstream silently pick
+            # one (the exact failure mode of the 8AO-VI <component name="C">
+            # collision, one level down).
+            el_name, n = name, 1
+            while symbols_el.find(f'symbol[@name="{el_name}"]') is not None:
+                el_name = f'{name}@{n}'
+                n += 1
+            sym_el.set('name', el_name)
             geom_pool[ghash] = name
             pool[name] = sym_el
             symbols_el.append(sym_el)
     return pool[name]
 
 
-def _convert_component(comp, schlib_cache, pcblib_cache, pool, symbols_el, geom_pool):
+def _explicit_pin_map(sym, fp_name):
+    """{pin designator -> [raw pad designators]} from the symbol's own
+    MAP_DEFINER records for one footprint implementation, or {} if it
+    declares none.
+
+    Altium stores an explicit pin<->pad map per (symbol, footprint) pairing
+    as AltiumSchMapDefiner children of the implementation — the same records
+    altium_exporter.py already WRITES (`designator_interface` = schematic pin
+    designator, `implementation_designators` = pad name list). It is a
+    PARTIAL override: only pins whose mapping isn't plain designator-equals-
+    pad-name are listed, everything else falls through to name matching.
+    Ground truth (RoXY_Motherboard, AMS1117 -> SOT89): the symbol has 4 pins
+    (1/2/3/4, two of them named VOUT) against a 3-pad package, and a single
+    MapDefiner '4' -> ['2'] carries the whole story; without reading it, pin
+    4 found no pad "4" and was dropped with a warning.
+    A pad list of ['null'] (or an empty designator_interface) is Altium's
+    "connects to nothing" marker — recorded as an explicit EMPTY list so the
+    caller suppresses the pin instead of falling back to name matching.
+    Rare but real: 3 implementations across the three test projects, 0 in
+    IND80S28/8AO-VI — hence [[feedback_explicit_pin_mapping]]: read the
+    declared map, never infer it.
+    """
+    out = {}
+    for imp in getattr(sym, 'implementations', ()):
+        if getattr(imp, 'model_type', None) != 'PCBLIB':
+            continue
+        if getattr(imp, 'model_name', None) != fp_name:
+            continue
+        for k in getattr(imp, 'children', ()):
+            if type(k).__name__ != 'AltiumSchMapDefiner':
+                continue
+            pin_des = (getattr(k, 'designator_interface', '') or '').strip()
+            if not pin_des:
+                continue
+            pads = [str(p).strip() for p in (getattr(k, 'implementation_designators', None) or [])]
+            pads = [p for p in pads if p and p.lower() != 'null']
+            out[pin_des] = pads
+    return out
+
+
+def _find_pcb_footprint(pcblib_cache, name, virtual_path=None):
+    """Locate a footprint by NAME in the library's PcbLib stream(s).
+
+    `virtual_path` pins the lookup to one stream (the library path knows it
+    from the model record); without it every packaged PcbLib stream is
+    searched in order — the project path only has the bare footprint name
+    the schematic instance carries, no stream reference.
+    Exact match first, then case-insensitive: same storage-name-vs-display-
+    name drift as the SchLib '/'->'_' substitution, just case instead of a
+    character (ground truth on 8AO-VI: "RFID 13.56 MHz" declares PCB model
+    'RFID_15mm' while the compiled PcbLib stores it as 'RFID_15MM').
+    """
+    vps = [virtual_path] if virtual_path else list(pcblib_cache['paths'])
+    for vp in vps:
+        pcb_file = pcblib_cache['paths'].get(vp)
+        if pcb_file is None:
+            continue
+        if vp not in pcblib_cache['parsed']:
+            try:
+                pcblib_cache['parsed'][vp] = AltiumPcbLib.from_file(str(pcb_file))
+            except Exception:
+                continue
+        pcblib = pcblib_cache['parsed'][vp]
+        fp = pcblib.find_footprint(name)
+        if fp is None:
+            fp = next((f for f in pcblib.footprints
+                        if f.name.lower() == name.lower()), None)
+        if fp is not None:
+            # The OWNING pcblib comes back too: mechanical-layer meanings are
+            # declared per file, so the footprint alone can't be projected.
+            return fp, pcblib
+    return None, None
+
+
+def _convert_component(comp, schlib_cache, pcblib_cache, pool, symbols_el, geom_pool,
+                       footprint_names=None):
     """Convert one IntLibComponent → component info dict, or None on error.
 
     Returns {'orig_name', 'prefix', 'is_generic', 'is_multi_gate', 'symbol_name',
@@ -598,7 +878,14 @@ def _convert_component(comp, schlib_cache, pcblib_cache, pool, symbols_el, geom_
             return None
     schlib = schlib_cache['parsed'][vp]
 
+    # OLE compound-file storage/stream names can't contain '/', so Altium
+    # substitutes '_' in the symbol's own stored name while the IntLib
+    # component list keeps the original '/' (e.g. "M24LR04E-RMN6T/2" vs
+    # storage name "M24LR04E-RMN6T_2") — not a naming clash with some other
+    # part, ground-truth verified on 8AO-VI's IntLib.
     sym = next((s for s in schlib.symbols if s.name == comp.name), None)
+    if sym is None and '/' in comp.name:
+        sym = next((s for s in schlib.symbols if s.name == comp.name.replace('/', '_')), None)
     if sym is None:
         return None
 
@@ -624,58 +911,96 @@ def _convert_component(comp, schlib_cache, pcblib_cache, pool, symbols_el, geom_
     # Generic value-parametrized merging (R/C/...) doesn't make sense for a
     # multi-gate part (an LED pair isn't "the same device at a different
     # catalog value"), so it's never treated as a merge candidate.
-    is_generic = (not is_multi_gate) and any(p.name == 'Value' for p in all_params)
+    is_generic = (not is_multi_gate) and any(p.name in _GENERIC_VALUE_PARAMS
+                                              for p in all_params)
+
+    # Which footprints belong to this component.
+    #
+    # `footprint_names` (project import) = the names the SCHEMATIC actually
+    # associates with this device. Altium has no real library-level "device"
+    # concept (same as KiCad — the symbol<->footprint association lives on
+    # the schematic instance, not in the library), so on the project path
+    # the association is read from the schematic and only the SYMBOLS and
+    # FOOTPRINTS themselves come out of the IntLib. Per the user:
+    # "при импорте альтиум проекта мы должны брать СИМВОЛЫ и футпринты из
+    # интлиб, а вот их ассоциацию смотреть непосредственно в схеме".
+    # Ground truth for why the library's own list can't be trusted:
+    # RoXY_Motherboard's SN74LVC2G14DCKRE4 has an EMPTY IntLib model list
+    # while its SchLib symbol implementation and both placed instances
+    # (U2/U4) name a real, packaged footprint 'SOT65P210X110-6N'.
+    #
+    # `footprint_names is None` (pure library import, convert()) keeps the
+    # library's own model list — there's no schematic to ask.
+    if footprint_names is None:
+        wanted = [(m.name, m.virtual_path.lstrip(':\\').replace('\\', '/'))
+                  for m in comp.models if m.model_type == 'PCBLIB']
+    else:
+        wanted = [(n, None) for n in sorted(footprint_names)]
 
     footprints = []
-    for model in comp.models:
-        if model.model_type != 'PCBLIB':
-            continue
-        mvp = model.virtual_path.lstrip(':\\').replace('\\', '/')
-        pcb_file = pcblib_cache['paths'].get(mvp)
-        if pcb_file is None:
-            continue
-
-        if mvp not in pcblib_cache['parsed']:
-            try:
-                pcblib_cache['parsed'][mvp] = AltiumPcbLib.from_file(str(pcb_file))
-            except Exception:
-                continue
-        pcblib = pcblib_cache['parsed'][mvp]
-
-        fp = pcblib.find_footprint(model.name)
+    for fp_name, mvp in wanted:
+        fp, owning_pcblib = _find_pcb_footprint(pcblib_cache, fp_name, mvp)
         if fp is None:
             continue
 
-        fp_el = ET.Element('footprint', name=model.name)
-        _convert_footprint(fp, fp_el)
+        fp_el = ET.Element('footprint', name=fp_name)
+        pad_name_groups = _convert_footprint(
+            fp, fp_el, mech_kinds=_mech_layer_kinds(owning_pcblib))
 
-        # Pin → pad mapping by matching designators
-        pad_des = {str(p.designator) for p in fp.pads}
+        # Pin -> pad mapping by matching designators. pad_name_groups (from
+        # _convert_footprint) maps the raw Altium pad designator to every
+        # disambiguated IR pad name sharing it — usually one, but see the
+        # "ME BUS FE CONTACT" case above for a designator shared by two
+        # physical pads (one per layer): all of them go on the SAME <map>,
+        # space-separated, exactly the multi-pad-per-pin convention
+        # kicad_parser.py's own _pin_mapping already uses and
+        # altium_project_parser.py's pad_to_pin builder already consumes
+        # (`for pad in m.get('pad', '').split(): ...`).
+        # Explicit MAP_DEFINER first (the declared truth), implicit
+        # designator==pad-name matching only for pins it doesn't cover.
+        explicit = _explicit_pin_map(sym, fp_name)
+
+        def _pads_for(pin):
+            des = str(pin.designator)
+            if des in explicit:
+                # Declared mapping — translate the raw Altium pad
+                # designators through pad_name_groups so a pad whose name
+                # got disambiguated (one designator, several physical pads)
+                # resolves to the same IR names the <smd>/<pad> elements use.
+                out = []
+                for raw in explicit[des]:
+                    out.extend(pad_name_groups.get(raw, ()))
+                return out
+            return pad_name_groups.get(des, ())
+
         pm_el = ET.SubElement(fp_el, 'pin-mapping')
         if is_multi_gate:
             for part_idx in range(1, sym.part_count + 1):
                 gate_name = _part_letter(part_idx)
                 for ir_name, pin in _iter_named_pins(sym, part_idx):
-                    des = str(pin.designator)
-                    if des in pad_des:
-                        ET.SubElement(pm_el, 'map', pin=f'{gate_name}.{ir_name}', pad=des)
+                    names = _pads_for(pin)
+                    if names:
+                        ET.SubElement(pm_el, 'map', pin=f'{gate_name}.{ir_name}',
+                                      pad=' '.join(names))
         else:
             for ir_name, pin in _iter_named_pins(sym):
-                des = str(pin.designator)
-                if des in pad_des:
-                    ET.SubElement(pm_el, 'map', pin=ir_name, pad=des)
+                names = _pads_for(pin)
+                if names:
+                    ET.SubElement(pm_el, 'map', pin=ir_name, pad=' '.join(names))
 
-        footprints.append((model.name, fp_el))
+        footprints.append((fp_name, fp_el))
 
     attrs = []
     for par in all_params:
         if par.name == 'Designator':
             continue
-        # Value/Comment are per-instance catalog data for generic parts
-        # (R/C/...) — they live on the schematic placement, not on the device
-        # record (Comment is Altium's schematic-visible "value" field, see
-        # the >VALUE mapping above).
-        if is_generic and par.name in ('Value', 'Comment'):
+        # The value-bearing parameter and Comment are per-instance catalog
+        # data for generic parts (R/C/...) — they live on the schematic
+        # placement, not on the device record (Comment is Altium's
+        # schematic-visible "value" field, see the >VALUE mapping above).
+        # Baking the first catalog row's Resistance into the merged family
+        # would stamp every variant "39.2k".
+        if is_generic and par.name in ('Comment',) + _GENERIC_VALUE_PARAMS:
             continue
         if _is_param_alias(par, all_params):
             continue
@@ -688,6 +1013,24 @@ def _convert_component(comp, schlib_cache, pcblib_cache, pool, symbols_el, geom_
         key = 'value' if pname.lower() in ('value', 'comment') else pname.lower()
         attrs.append((key, par.text or ''))
 
+    # pin DESIGNATOR -> IR pin name, straight off the authoritative symbol
+    # via the same _iter_named_pins used to name pins everywhere else. A
+    # project importer gets a pin's designator from the netlist terminal and
+    # needs the IR name; it must not re-derive the '@N' dedup numbering
+    # itself (that would be a second implementation free to drift), nor go
+    # via the pad name — pin designator and pad name are only incidentally
+    # equal, and an explicit MAP_DEFINER breaks that equality outright
+    # (AMS1117 pin '4' -> pad '2', see _explicit_pin_map).
+    pin_designators = {}
+    if is_multi_gate:
+        for part_idx in range(1, sym.part_count + 1):
+            gate_name = _part_letter(part_idx)
+            for ir_name, pin in _iter_named_pins(sym, part_idx):
+                pin_designators[str(pin.designator)] = f'{gate_name}.{ir_name}'
+    else:
+        for ir_name, pin in _iter_named_pins(sym):
+            pin_designators[str(pin.designator)] = ir_name
+
     return {
         'orig_name': comp.name,
         'prefix': _designator_prefix(sym),
@@ -698,12 +1041,33 @@ def _convert_component(comp, schlib_cache, pcblib_cache, pool, symbols_el, geom_
         'gates': gates,
         'description': comp.description,
         'footprints': footprints,
+        'pin_designators': pin_designators,
         'attrs': attrs,
     }
 
 
-def convert(intlib_path: str, output_path: str):
-    """Convert .IntLib to IR XML. Returns output_path."""
+def convert_to_tree(intlib_path: str, models_dir, footprint_usage=None):
+    """Parse .IntLib -> (lib_el, orig_to_compel) in memory, no file I/O for
+    the XML itself (models are still extracted to `models_dir`, same as
+    convert()). `orig_to_compel` maps the ORIGINAL IntLib component name to
+    its <component> Element — this is exactly the by-name resolution table
+    a project importer needs to look components up against (and hard-reject
+    on a schematic reference that isn't in it, see
+    [[project_altium_project_import]] "библиотека — единственный источник
+    истины после Make Integrated Library"). Split out of convert() so a
+    project importer can embed the SAME components/symbols this function
+    builds, instead of re-parsing the serialized .swlib text back or
+    building a second, divergent library representation.
+
+    `footprint_usage` (project path only): {component name -> {footprint
+    names}} collected from the SCHEMATIC. Altium keeps the symbol<->footprint
+    association on the schematic instance, not in the library (no real
+    library-level "device" concept, same as KiCad) — so a project import
+    takes symbols and footprints from the IntLib but their PAIRING from the
+    schematic. Keyed by BOTH `library_ref` and `design_item_id` by the
+    caller, since which one the IntLib stores a component under varies (see
+    [[project_altium_design_item_id]]). Omit it (pure library import) to use
+    each component's own declared model list instead."""
     lib_path = Path(intlib_path)
     intlib   = AltiumIntLib(str(lib_path))
 
@@ -732,10 +1096,13 @@ def convert(intlib_path: str, output_path: str):
     # (post-rename) sharing the same aliased symbol Element.
     generic_groups: dict = {}      # (prefix, id(symbol_el)) -> (comp_el, {fp_name: fp_el})
     orig_to_compel: dict = {}      # original IntLib component name -> its <component> Element
+    pin_des_by_comp: dict = {}     # same key -> {pin designator: IR pin name}
 
     for comp in intlib.components:
         info = _convert_component(comp, schlib_cache, pcblib_cache,
-                                   pool, symbols_el, geom_pool)
+                                   pool, symbols_el, geom_pool,
+                                   footprint_names=(footprint_usage.get(comp.name)
+                                                     if footprint_usage is not None else None))
         if info is None:
             continue
 
@@ -763,6 +1130,7 @@ def convert(intlib_path: str, output_path: str):
                               type='general')
             lib_el.append(comp_el)
             orig_to_compel[info['orig_name']] = comp_el
+            pin_des_by_comp[info['orig_name']] = info['pin_designators']
         elif info['is_generic']:
             sym_el = info['symbol_el']
             prefix = info['prefix']
@@ -770,11 +1138,23 @@ def convert(intlib_path: str, output_path: str):
             if key not in generic_groups:
                 # Rename the pooled symbol from its catalog-row name (R0603)
                 # to the generic device name (R) — unless that name is
-                # already taken by some unrelated symbol.
+                # already taken by some unrelated symbol. A genuinely
+                # different symbol under the same prefix (ground truth:
+                # 8AO-VI's "C" — polarized vs non-polarized capacitor
+                # bodies, real different geometry, not a dedup miss per the
+                # user) can't ALSO claim the bare prefix as its <component
+                # name> — that produced two same-named <component name="C">
+                # elements, and every by-name lookup downstream silently
+                # picked only one, dropping the other's instances' real
+                # device. Per the user: keep such a component under its own
+                # first catalog row's name instead of forcing the prefix.
                 clash = symbols_el.find(f'symbol[@name="{prefix}"]')
                 if clash is None or clash is sym_el:
                     sym_el.set('name', prefix)
-                comp_el = ET.Element('component', name=prefix,
+                    comp_name = prefix
+                else:
+                    comp_name = info['orig_name']
+                comp_el = ET.Element('component', name=comp_name,
                                       prefix=prefix, symbol=sym_el.get('name'))
                 attrs_el = ET.SubElement(comp_el, 'attributes')
                 if info['description']:
@@ -791,6 +1171,7 @@ def convert(intlib_path: str, output_path: str):
                     comp_el.append(fp_el)
                     fp_map[fp_name] = fp_el
             orig_to_compel[info['orig_name']] = comp_el
+            pin_des_by_comp[info['orig_name']] = info['pin_designators']
         else:
             comp_el = ET.Element('component', name=info['orig_name'],
                                   prefix=info['prefix'], symbol=info['symbol_name'])
@@ -805,9 +1186,17 @@ def convert(intlib_path: str, output_path: str):
                               type='general')
             lib_el.append(comp_el)
             orig_to_compel[info['orig_name']] = comp_el
+            pin_des_by_comp[info['orig_name']] = info['pin_designators']
 
-    models_dir = Path(output_path).parent / lib_path.stem
     _do_model_extraction(orig_to_compel, intlib, pcblib_cache, models_dir)
+    return lib_el, orig_to_compel, pin_des_by_comp
+
+
+def convert(intlib_path: str, output_path: str):
+    """Convert .IntLib to IR XML file. Returns output_path."""
+    lib_path = Path(intlib_path)
+    models_dir = Path(output_path).parent / lib_path.stem
+    lib_el, orig_to_compel, _pin_des = convert_to_tree(intlib_path, models_dir)
 
     raw   = minidom.parseString(ET.tostring(lib_el, encoding='unicode')).toprettyxml(indent='  ')
     clean = '\n'.join(l for l in raw.splitlines() if l.strip())

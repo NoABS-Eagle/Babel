@@ -449,7 +449,43 @@ KiCad не имеет собственного понятия слоя ни в �
 
 ### Источник → слой: Altium
 
-TODO — не составлено.
+Как и у KiCad, у Altium нет собственного понятия слоя ни в символе (`.SchLib`), ни на листе
+(`.SchDoc`) — сопоставление ниже целиком РУЧНОЕ (решение `altium_parser.py` /
+`altium_project_parser.py`). Таблица покрывает только схемную часть; плата (`.PcbDoc`) свои
+слои имеет НАСТОЯЩИЕ и переводится по номерам, см. `_layer_n`.
+
+Ключ принадлежности графического объекта на листе — `owner_index`: `0`/`-1` (запись-заголовок
+листа) значит «нарисовано прямо на холсте», любое другое значение — «часть размещённого
+компонента». Графика компонента с холста НЕ импортируется: она приходит из IntLib через
+разрешённый `<symbol>` (библиотека — истина, запечённая в инстанс копия — нет).
+
+| Altium-объект                                              | Контекст                      | IR-элемент                                                      | `layer`   |
+|------------------------------------------------------------|-------------------------------|------------------------------------------------------------------|-----------|
+| `Rectangle` / `Polyline` / `Line` / `Polygon`               | `.SchLib`, тело символа       | N×`<line>` (контур/лом.линия/петля)                              | — (у геометрии символа слоя нет) |
+| `Arc` / `EllipticalArc`                                     | `.SchLib`, тело символа       | `<arc>`, полный круг → `<shape roundness=100>`                   | —         |
+| `Ellipse`                                                   | `.SchLib`, тело символа       | `<shape roundness=100>`                                          | —         |
+| `Label` (свободный текст тела)                              | `.SchLib`, тело символа       | `<text>`                                                          | `SYMBOLS` |
+| `Designator` → `>NAME`                                      | `.SchLib`, placeholder        | `<text>`                                                          | `NAMES`   |
+| Видимый `Parameter` → `>ATTR`                               | `.SchLib`, placeholder        | `<text>`                                                          | `VALUES`  |
+| Рамка листа (размер из `get_sheet_size_mils()`)             | синтезированный символ-Frame  | `<shape>` (ровно один на символ)                                 | `FRAME`   |
+| Имя листа (имя файла `.SchDoc`) → `>SHEET`                  | синтезированный символ-Frame, placeholder | `<text>`; значение — `<attr name="sheet">` на инстансе рамки | `INFO`    |
+| `Wire`                                                      | `.SchDoc`, холст              | `<line>` внутри `<net>`/`<segment>`                              | — (принадлежность даёт контейнер `<net>`) |
+| `Junction`                                                  | `.SchDoc`, холст              | `<junction>` внутри `<net>`/`<segment>`                          | — (у элемента нет атрибута `layer`) |
+| `NetLabel` / `PowerPort` (имя цепи)                          | `.SchDoc`, холст              | `<label>` внутри `<net>`/`<segment>`                             | `NETS`    |
+| `Rectangle` / `Polyline` / `Line` / `Polygon` (`owner_index` листа) | `.SchDoc`, холст     | N×`<line>`, прямые дети `<schematic>`                            | `GRAPHIC` |
+| `Arc` / `EllipticalArc` (`owner_index` листа)                | `.SchDoc`, холст              | `<arc>` / `<shape roundness=100>`, прямые дети `<schematic>`     | `GRAPHIC` |
+| `Ellipse` (`owner_index` листа)                              | `.SchDoc`, холст              | `<shape roundness=100>`, прямой ребёнок `<schematic>`            | `GRAPHIC` |
+| `Label` (`owner_index` листа — подпись блока)                | `.SchDoc`, холст              | `<text>`, прямой ребёнок `<schematic>`                           | `GRAPHIC` |
+| `Note` / `TextFrame` (`owner_index` листа)                    | `.SchDoc`, холст              | `<note>` (+ `<shape>` рамки при `show_border`), прямые дети `<schematic>` | `GRAPHIC` (у рамки) |
+| Свободный текст вида `=имя_параметра`                        | `.SchDoc`, холст              | `<text>` со значением `>ИМЯ` (плейсхолдер); выражения `= 'A' + B` — hard reject | `GRAPHIC` |
+| `SheetSymbol` + `SheetEntry` (иерархия ПЛЮЩИТСЯ)             | `.SchDoc`, холст              | `<shape>` контура + `<text>` имён entry (структурная страница остаётся рисунком); связность — от компилятора, GLOBAL | `GRAPHIC` |
+| `SheetName` / `FileName` (подписи sheet symbol)              | `.SchDoc`, холст              | `<text>`                                                          | `GRAPHIC` |
+| `Port` (одиночный)                                           | `.SchDoc`, холст              | `<label style="passive">` в `<net>`/`<segment>` — глобальный идентификатор цепи при плющении | `NETS` |
+| `Port` (harness-типа) / `SignalHarness` / `HarnessConnector` | `.SchDoc`, холст              | — (drop + лог: связность по-сигнально уже в netlist)              | —         |
+| Повторный инстанс листа / `REPEAT(...)`-стек                 | `.SchDoc`/`.PrjPcb`           | **hard reject** — мультиканальный модуль, ветка отложена          | —         |
+| `[ParameterN]` из `.PrjPcb` (переменные проекта)             | `.PrjPcb`                     | `<schematic><attributes><attr>` — то, против чего резолвятся `>ИМЯ`   | —         |
+| `RoundRectangle`, `Bezier`, `Image`, `IEEESymbol`             | `.SchDoc`/`.SchLib`           | — (нет IR-примитива: drop + запись в import log)                 | —         |
+| Размещённый компонент                                       | `.SchDoc`, холст              | `<instance>`                                                      | — (наследует слои своей геометрии через символ) |
 
 ---
 
@@ -1036,6 +1072,10 @@ run export3d pack
     <net name="IN">...</net>
   </module>
   <schematic>
+    <attributes>                                   <!-- переменные проекта, см. ниже -->
+      <attr name="project_title" value="BC2087"/>
+      <attr name="revision" value="R1M1E1"/>
+    </attributes>
     <instance component="R" library="Device" name="R1" x="..." y="..." rot="0" mirror="0"/>
     <instance module="ChannelStrip" name="MD1" x="..." y="..." rot="0" mirror="0"/>
     <instance module="ChannelStrip" name="MD2" x="..." y="..." rot="0" mirror="0"/>
@@ -1046,6 +1086,30 @@ run export3d pack
   <layout name="main">...</layout>   <!-- 0..N плат — см. «Плата (Board IR)» ниже -->
 </project>
 ```
+
+## Классы цепей `<classes>` / `<net class=…>`
+
+Класс цепи в IR — **только факт членства плюс до трёх чисел**, не механизм правил
+(rule-engine Altium сознательно не переносится — маленький плоский DRC проще перенастроить
+руками, чем транслировать scope-выражения; решение 2026-07-27, то же, что для `<rules>`).
+
+- Пул — необязательный ребёнок корня проекта: `<classes><class name="PoE" [width=]
+  [drill=] [clearance=]/></classes>` (числа в µm; отсутствие числа = «не задано», НЕ 0).
+- Членство — атрибут `class="ИМЯ"` на схемной `<net>` (ссылка по имени в пул). Больше
+  нигде: на layout-`<signal>` класс не дублируется — «один факт — одно место», экспортёр
+  платы резолвит класс по имени цепи сам.
+- **Отсутствие атрибута = класс default.** Default в IR не материализуется ни в пуле, ни
+  на цепи (та же асимметрия с обеих сторон: Eagle-класс `0`/`default` ↔ отсутствие
+  атрибута).
+- **Одна цепь — один класс.** Altium позволяет цепи состоять в нескольких классах (там
+  класс — множество-scope для ортогональных правил); при импорте оставляем алфавитно
+  первый, остальные — детерминированная потеря с громким warning.
+- Импорт Altium: Classes6 с kind=0 и непустым членством (системные «All Nets» и все
+  прочие kind отпадают сами), только имена и членство. Импорт Eagle: номерные классы
+  разворачиваются в имена, width/drill/clearance переносятся.
+- Перспектива: по дизайну атрибутов цепи (2026-07-14) `class` — зарезервированный атрибут
+  цепи, ссылка на пул правил; сегодняшний `class=` — ровно он и есть, миграции не
+  потребуется.
 
 ## Component instance
 
@@ -1132,6 +1196,14 @@ placeable/покупаемая единица. Один резистор с се
 | `<component><attributes>` | **СХЕМА семейства** (все ключи, объединение; пустое значение = объявление) + факты семейства | `AEC-Q=""`, `POWER=""`, `description`="Resistor" |
 | `<component><footprint><attributes>` | **ЗНАЧЕНИЯ варианта** | `package`="0603", `tolerance`="1%", `fp_desc` |
 | `<instance><attr>` | **ЗНАЧЕНИЯ экземпляра** | `manf#`="RC0603FR-0710KL" (зависит от номинала!) |
+| `<schematic><attributes>` | **ПЕРЕМЕННЫЕ ПРОЕКТА** — глобальные для всего холста, ни к какому компоненту не привязаны | `project_title`="BC2087", `revision`="R1M1E1" |
+
+`<schematic><attributes>` — тот же однородный `<attr name value>`, что и везде, просто
+уровнем выше компонента: это переменные ВСЕГО документа (Altium Project Options →
+Parameters, у Eagle — родные global attributes в `<schematic><attributes>`). Против них
+резолвятся плейсхолдеры в свободном тексте холста: `<text>>PROJECT_TITLE</text>`.
+Область действия — проект целиком, поэтому посейтная переменная (Altium `SheetNumber`)
+сюда не помещается ПО ОПРЕДЕЛЕНИЮ и импорт её отвергает, а не усредняет.
 
 **Разрешение значения: инстанс > вариант > компонент.** Ключ, объявленный на
 компоненте и незаполненный ниже, — легальное пустое поле (I5/I10).

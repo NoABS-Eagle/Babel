@@ -358,8 +358,16 @@ def export_board(ir_path, output_path=None, layout_name=None):
     # --- classes: same name->number enumeration as export_schematic, so a
     # signal's class number means the same thing in both files of the pair
     classes_el = ET.SubElement(board, 'classes')
-    ET.SubElement(classes_el, 'class', number='0', name='default',
-                  width='0', drill='0')
+    class0_el = ET.SubElement(classes_el, 'class', number='0', name='default',
+                              width='0', drill='0')
+    # IR has no per-class same-class clearance concept at all (a class's
+    # own self-clearance, distinct from the global 6-number DRC core in
+    # <rules> — see _apply_ir_rules_to_designrules) — left unset, Eagle
+    # silently falls back to its own factory default (confirmed 6 mil,
+    # user's own real-Eagle check) instead of 0. Explicit 0 here for the
+    # default class every signal implicitly belongs to — same-signal
+    # copper touching is normal, never a violation.
+    ET.SubElement(class0_el, 'clearance', **{'class': '0', 'value': '0'})
     class_num = {}
     ir_classes = root.find('classes')
     if ir_classes is not None:
@@ -369,10 +377,75 @@ def export_board(ir_path, output_path=None, layout_name=None):
                                   name=_eagle_name(cl.get('name')),
                                   width=_tomm(cl.get('width', '0')),
                                   drill=_tomm(cl.get('drill', '0')))
-            if cl.get('clearance'):
-                ET.SubElement(cl_el, 'clearance', **{
-                    'class': num, 'value': _tomm(cl.get('clearance'))})
+            # Explicit 0 when the IR class carries no clearance of its own
+            # (not "leave unset") — same reasoning as class 0 above, Eagle
+            # must not fall back to its own undocumented factory default.
+            v = _tomm(cl.get('clearance')) if cl.get('clearance') else '0'
+            ET.SubElement(cl_el, 'clearance', **{'class': num, 'value': v})
             class_num[cl.get('name')] = num
+
+    # ir_schema.md "DRC-ядро" (6-number <rules> on <layout>, see
+    # altium_project_parser.py's _build_rules for the import side) -> real
+    # Eagle designrules params. Никогда не читалось экспортёром раньше
+    # (found 2026-07-22: an Altium-imported board's real DRC settings
+    # were silently dropped on export) — same gap for EVERY import path,
+    # not Altium-specific, now closed for all of them at once.
+    def _set_param(dr_el, name, value):
+        # Passthrough designrules may already carry a <param> of this name
+        # (Eagle-sourced round-trip) — replace, don't duplicate.
+        existing = dr_el.find(f'param[@name="{name}"]')
+        if existing is not None:
+            existing.set('value', value)
+        else:
+            ET.SubElement(dr_el, 'param', name=name, value=value)
+
+    def _dr_mm(um):
+        # designrules <param> values need an explicit unit suffix (real
+        # Eagle files, e.g. testData/luminoso.brd's "0.15mm"/"6mil" —
+        # unlike a plain XML coordinate attribute, which is always bare
+        # mm). _tomm() alone (used for coordinates elsewhere in this file)
+        # would omit it; the pre-existing mtCopper/mtIsolate synthesis a
+        # few lines below already hardcodes the same "mm" suffix.
+        return _tomm(um) + 'mm'
+
+    def _apply_ir_rules_to_designrules(dr_el):
+        # SMD pads are allowed to butt against other copper with NO
+        # clearance requirement — user's explicit call, unconditional (not
+        # tied to whether IR <rules> exists at all): SMD-to-pad, SMD-to-
+        # via, SMD-to-SMD clearance are always 0.
+        for name in ('mdSmdPad', 'mdSmdVia', 'mdSmdSmd'):
+            _set_param(dr_el, name, '0mil')
+
+        rules_el = layout.find('rules')
+        if rules_el is None:
+            return
+        clearance = rules_el.get('clearance')
+        if clearance:
+            # Eagle's mdWireWire/mdWirePad/mdWireVia/mdPadPad/mdPadVia/
+            # mdViaVia are inherently DIFFERENT-NET clearance by definition
+            # (same-net copper touching is never a DRC violation in Eagle,
+            # no separate "same net" param exists to zero out) — user
+            # confirmed this reading, one broadcast value covers all six.
+            v = _dr_mm(clearance)
+            for name in ('mdWireWire', 'mdWirePad', 'mdWireVia',
+                         'mdPadPad', 'mdPadVia', 'mdViaVia'):
+                _set_param(dr_el, name, v)
+        if rules_el.get('edge_clearance'):
+            _set_param(dr_el, 'mdCopperDimension', _dr_mm(rules_el.get('edge_clearance')))
+        if rules_el.get('min_width'):
+            _set_param(dr_el, 'msWidth', _dr_mm(rules_el.get('min_width')))
+        if rules_el.get('min_drill'):
+            _set_param(dr_el, 'msDrill', _dr_mm(rules_el.get('min_drill')))
+        if rules_el.get('min_drill_web'):
+            _set_param(dr_el, 'mdDrill', _dr_mm(rules_el.get('min_drill_web')))
+        if rules_el.get('min_annular'):
+            # User: min_annular applies to every pad AND via, on every
+            # layer/side — broadcast to all five Eagle ring-minimum params,
+            # not just rlMinViaOuter (Eagle keeps pad/via and top/inner/
+            # bottom separate, confirmed real: testData/luminoso.brd).
+            v = _dr_mm(rules_el.get('min_annular'))
+            for kind in ('PadTop', 'PadInner', 'PadBottom', 'ViaOuter', 'ViaInner'):
+                _set_param(dr_el, f'rlMin{kind}', v)
 
     # --- passthrough: designrules/autorouter now, errors after signals
     pt = layout.find("passthrough[@tool='eagle']")
@@ -384,6 +457,7 @@ def export_board(ir_path, output_path=None, layout_name=None):
             if src_el is not None:
                 if tag == 'designrules':
                     _apply_stack_to_designrules(src_el, stack, layout)
+                    _apply_ir_rules_to_designrules(src_el)
                     have_dr = True
                 board.append(src_el)
         errors_el = pt.find('errors')
@@ -406,6 +480,7 @@ def export_board(ir_path, output_path=None, layout_name=None):
         ET.SubElement(dr, 'param', name='mtCopper', value=' '.join(['0.035mm'] * 16))
         ET.SubElement(dr, 'param', name='mtIsolate', value=' '.join(['0.15mm'] * 15))
         _apply_stack_to_designrules(dr, stack, layout)
+        _apply_ir_rules_to_designrules(dr)
         import_log.log(layout.get('name'), 'designrules',
                        f'DESIGNRULES synthesized (no Eagle passthrough): '
                        f'layerSetup {setup} + stack thicknesses; lamination '
