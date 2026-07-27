@@ -30,15 +30,14 @@ from altium_monkey.altium_record_sch__junction import AltiumSchJunction
 from altium_monkey.altium_record_sch__net_label import AltiumSchNetLabel
 from altium_monkey.altium_record_sch__power_port import AltiumSchPowerPort
 from altium_monkey.altium_record_sch__label import AltiumSchLabel
+from altium_monkey.altium_record_sch__parameter import AltiumSchParameter
 from altium_monkey.altium_record_sch__polyline import AltiumSchPolyline
 from altium_monkey.altium_sch_enums import PowerObjectStyle, TextOrientation
 from altium_monkey.altium_symbol_transform import generate_unique_id
 
 from babel import import_log
-from babel.altium_exporter import (
-    _export_schlib_symbol, _export_schlib_multipart, _mils, _lw, _justif,
-    _orient,
-)
+from babel import altium_exporter
+from babel.altium_exporter import _mils, _lw, _justif, _orient
 from babel.ir_util import (component_gates, is_multi_gate, resolved_attrs)
 from babel.kicad_project_exporter import _collinear_between
 
@@ -179,8 +178,82 @@ def _page_for_point(pages, x_um, y_um, label):
 # Placed components
 # ---------------------------------------------------------------------------
 
+def _part_number(comp_el, inst_el):
+    """The DbLib key (xlsx "Part Number" column) for this instance.
+
+    Mirrors altium_exporter._build_component_rows: a component with a single
+    footprint is one row keyed by its name; with several, one row per
+    footprint variant keyed `{name}_{footprint}`.
+    """
+    cname = comp_el.get('name', '')
+    fp_els = comp_el.findall('footprint')
+    if len(fp_els) <= 1:
+        return cname
+    want = inst_el.get('footprint')
+    names = [f.get('name', '') for f in fp_els]
+    if want not in names:
+        raise ValueError(
+            f'instance {inst_el.get("name")}: component "{cname}" has '
+            f'{len(fp_els)} footprints {names}, instance footprint='
+            f'{want!r} matches none — cannot pick a DbLib row')
+    return f'{cname}_{want}'
+
+
+def _link_to_database(comp, part_num, table_name, schlib_name):
+    """Point a placed component at its DbLib row instead of baking a library.
+
+    The parameter values still live in the sheet (Altium caches them there),
+    but the DB link is what makes "Update from Libraries" authoritative — the
+    xlsx row is the single home of the fact, per the DbLib decision.
+    """
+    comp.database_table_name = table_name
+    comp.use_db_table_name = True
+    comp.design_item_id = part_num
+    comp.source_library_name = schlib_name
+
+
+def _xlsx_columns(xlsx_path):
+    """Header row of the DbLib table — the names the database actually owns."""
+    import openpyxl
+    ws = openpyxl.load_workbook(xlsx_path, read_only=True).active
+    return {c.value for c in next(ws.iter_rows(max_row=1)) if c.value}
+
+
+def _set_parameter(page, comp, name, text, db_owned):
+    """Add or update one parameter on a placed component.
+
+    The SchLib entry only carries placeholders, so an IR attribute with no
+    matching placeholder used to be dropped silently — every attribute is
+    written here instead, and marked DB-synchronizable.
+    """
+    # Case-insensitive: SchLib placeholders inherit Eagle's uppercase spelling
+    # (PACKAGE) while the IR attribute is lowercase (package) — matching
+    # exactly would leave both, i.e. one fact in two places.
+    for obj in _component_children(page.doc, comp):
+        if (type(obj).__name__ == 'AltiumSchParameter'
+                and obj.name.lower() == name.lower()):
+            # Adopt the IR spelling: the xlsx has exactly one column, so a
+            # stray placeholder spelling would never match on DB sync.
+            obj.name = name
+            obj.text = text
+            obj.allow_database_synchronize = db_owned
+            return obj
+    p = AltiumSchParameter()
+    p.owner_index = page.doc.all_objects.index(comp)
+    p.owner_part_id = comp.current_part_id
+    p.name = name
+    p.text = text
+    p.location = comp.location
+    p.font_id = _font(page.doc, 1778)
+    p.is_hidden = True
+    p.allow_database_synchronize = db_owned
+    p.unique_id = generate_unique_id()
+    page.doc.add_object(p)
+    return p
+
+
 def _place_instance(page, inst_el, comp_el, schlib_path, part_id, value,
-                    attrs):
+                    attrs, table_name, db_cols):
     """One IR <instance> -> placed AltiumSchComponent (geometry cloned from
     the SchLib entry by altium_monkey's own insert helper)."""
     x, y = page.pt(inst_el.get('x', '0'), inst_el.get('y', '0'))
@@ -195,15 +268,23 @@ def _place_instance(page, inst_el, comp_el, schlib_path, part_id, value,
         is_mirrored=inst_el.get('mirror') == '1',
         part_id=part_id,
     )
-    # Fill parameter values: Comment carries the instance's resolved value;
-    # any other cloned parameter whose name matches a resolved attr gets
-    # that attr's value (clone leaves the SchLib placeholder literal).
+    _link_to_database(comp, _part_number(comp_el, inst_el), table_name,
+                      Path(schlib_path).name)
+
+    # Comment carries the instance's resolved value; every other resolved
+    # attribute becomes a parameter whether or not the SchLib had a
+    # placeholder for it. 'value'/'description' have their own homes.
     for obj in _component_children(page.doc, comp):
-        if type(obj).__name__ == 'AltiumSchParameter':
-            if obj.name == 'Comment':
-                obj.text = value or ''
-            elif obj.name in attrs:
-                obj.text = attrs[obj.name]
+        if type(obj).__name__ == 'AltiumSchParameter' and obj.name == 'Comment':
+            obj.text = value or ''
+            obj.allow_database_synchronize = True
+    # An attribute the xlsx has no column for is instance-level (e.g. board
+    # attrs merged onto the instance): it must NOT be DB-synchronized, or
+    # Altium wipes it on the next "Update from Database".
+    for name, text in attrs.items():
+        if name.lower() in ('value', 'description'):
+            continue
+        _set_parameter(page, comp, name, text, name in db_cols)
     return comp
 
 
@@ -256,8 +337,12 @@ def _place_power_port(page, inst_el, comp_el, pool, net_name):
     pp.text = _eagle_overbar_to_altium(net_name)
     pp.style = _power_style(net_name)
     pp.show_net_name = True
-    pp.orientation = TextOrientation((round(float(inst_el.get('rot', '0')))
-                                      // 90) % 4)
+    # Altium draws the port body pointing away from its connect point, while
+    # IR's rot is the symbol's own rotation: GND-family bars sit 270 deg off,
+    # every other supply 90 deg off (checked visually on tolmach).
+    bump = 270 if pp.style is PowerObjectStyle.BAR else 90
+    steps = round(float(inst_el.get('rot', '0'))) // 90 + bump // 90
+    pp.orientation = TextOrientation(steps % 4)
     pp.font_id = _font(page.doc, 1778)
     pp.unique_id = generate_unique_id()
     page.doc.add_object(pp)
@@ -456,19 +541,13 @@ def export_project(swprj_path, output_dir):
     if sch_el is None:
         raise ValueError(f'{swprj_path}: no <schematic> — nothing to export')
 
-    # 1. SchLib — geometry source for placement (reuses the library exporter)
-    schlib = AltiumSchLib()
-    schlib._ensure_font_manager()
-    from babel.altium_exporter import _sym_used_standalone
-    for sym_el in pool.values():
-        if _sym_used_standalone(sym_el.get('name', ''), ir_root):
-            _export_schlib_symbol(sym_el, schlib, ir_root)
-    for comp_el in ir_root.findall('component'):
-        if is_multi_gate(comp_el):
-            _export_schlib_multipart(comp_el, pool, schlib)
+    # 1. Libraries: the DbLib set (SchLib + PcbLib + xlsx + DbLib), written by
+    # the library exporter itself. The project links components to xlsx rows —
+    # it never bakes a fat library of its own (user decision: DBLib target).
+    altium_exporter.export(swprj_path, out_dir)
     schlib_path = out_dir / f'{proj_name}.SchLib'
-    schlib.save(schlib_path)
-    print(f'Written: {schlib_path}')
+    table_name = 'Components'
+    db_cols = _xlsx_columns(out_dir / f'{proj_name}.xlsx')
 
     # 2. Pages from FRAME instances
     pages = []
@@ -539,7 +618,7 @@ def export_project(swprj_path, output_dir):
                                  f'component "{comp_el.get("name")}"')
             part_id = gate_names.index(g) + 1
         comp = _place_instance(page, inst_el, comp_el, schlib_path, part_id,
-                               value, attrs)
+                               value, attrs, table_name, db_cols)
         _apply_text_overrides(page, inst_el, comp)
         n_parts += 1
 
