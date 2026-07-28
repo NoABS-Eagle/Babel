@@ -19,6 +19,8 @@ ids and are keyed by name as usual.
 """
 from pathlib import Path
 
+from babel.ir_util import is_paired_layer, parse_layer
+
 _DATA = Path(__file__).parent / 'data'
 _WORKING = _DATA / 'altium_layers.tsv'
 _REFERENCE = _DATA / 'altium_layers.reference.tsv'
@@ -33,16 +35,24 @@ def _parse(path):
         parts = line.split()
         ir = int(parts[0])
         key = parts[1]
-        paired = key.endswith('_TOP') or key == 'Top'
-        fwd[ir] = key
-        if paired:
-            bottom = 'Bottom' if key == 'Top' else key[:-4] + '_BOTTOM'
-            fwd[-ir] = bottom
-        # reverse: first row naming a key wins (setdefault); later rows with
-        # the same key are collapsing aliases, IR->Altium only
+        # A key names a SIDE when it is a "..._TOP" kind or a fixed layer whose
+        # name starts with Top (Top, TopOverlay, TopSolder, TopPaste) — the
+        # opposite side is derived, so the table lists the top row only.
+        if key.endswith('_TOP'):
+            bottom = key[:-4] + '_BOTTOM'
+        elif key.startswith('Top'):
+            bottom = 'Bottom' + key[3:]
+        else:
+            bottom = None
+        # BOTH directions take the FIRST row naming a thing (setdefault):
+        # later rows with the same IR number are collapsing aliases (several
+        # Altium kinds landing on one IR layer), and the first one is the
+        # canonical spelling to write back out.
+        fwd.setdefault(ir, key)
         rev.setdefault(key, ir)
-        if paired:
-            rev.setdefault('Bottom' if key == 'Top' else key[:-4] + '_BOTTOM', -ir)
+        if bottom:
+            fwd.setdefault(-ir, bottom)
+            rev.setdefault(bottom, -ir)
     if not fwd:
         raise ValueError('empty layer table')
     return fwd, rev
@@ -81,3 +91,101 @@ def altium_to_ir(key):
 def ir_to_altium(n):
     """IR layer number -> table key, or None if not carried."""
     return _FWD.get(n)
+
+
+# ---------------------------------------------------------------------------
+# WRITING side: IR layer -> a concrete Altium layer id
+#
+# Reading resolves a mechanical layer's meaning from the KIND the source file
+# declares. Writing has to do the inverse: pick a mechanical SLOT for each
+# kind we need and declare that kind in the file we emit — so the file says
+# what its own mechanical layers mean, and our own importer reads it back
+# through the very same table. Slots are handed out in a deterministic order
+# (sorted IR number), and the PcbLib and the PcbDoc are planned from the SAME
+# input, so a footprint's mechanical layer means the same thing on the board.
+# ---------------------------------------------------------------------------
+
+# Fixed layers: table key -> Altium layer id (PcbLayer values, kept as plain
+# ints so this module stays free of altium_monkey imports).
+FIXED_LAYER_ID = {
+    'Top': 1, 'Bottom': 32,
+    'TopOverlay': 33, 'BottomOverlay': 34,
+    'TopPaste': 35, 'BottomPaste': 36,
+    'TopSolder': 37, 'BottomSolder': 38,
+}
+
+_MECH_FIRST, _MECH_LAST = 57, 72          # Mechanical 1..16
+
+
+def layers_used(ir_root):
+    """Every IR layer number that any drawable in the project sits on —
+    footprints and board alike. Both exporters plan from this same set.
+
+    A footprint layer WITH A SIDE is counted on both sides: the file stores
+    the top-relative number, and it is the placement of the footprint on the
+    bottom that negates it (ir_util.place_layer). Altium flips a bottom
+    component's mechanical geometry through the layer PAIRS the file
+    declares, so both slots have to exist for that to work at all.
+    """
+    used = set()
+    for el in ir_root.iter():
+        raw = el.get('layer') if hasattr(el, 'get') else None
+        if raw is None:
+            continue
+        try:
+            anti, n = parse_layer(raw)
+        except (TypeError, ValueError):
+            continue
+        if not anti:
+            used.add(n)
+    return used | {-n for n in used if is_paired_layer(n)}
+
+
+def plan(ir_layers):
+    """{IR layer -> (altium_layer_id, MechanicalLayerKind name or None,
+    display name)} plus the top/bottom slot pairs, as (plan, pairs).
+
+    An IR layer with no row in the table is NOT dropped and NOT guessed onto
+    a semantic layer (this module's docstring): it gets a plain mechanical
+    slot named after itself, and the caller logs it.
+    """
+    out, pairs = {}, []
+    by_key = {}
+    next_slot = _MECH_FIRST
+    for n in sorted(ir_layers, key=lambda v: (abs(v), v)):
+        key = _FWD.get(n)
+        if key in FIXED_LAYER_ID:
+            out[n] = (FIXED_LAYER_ID[key], None, key)
+            continue
+        name = key.replace('_', ' ').title() if key else f'IR layer {n}'
+        if name in by_key:                # an alias of a kind already placed
+            out[n] = by_key[name]
+            continue
+        if next_slot > _MECH_LAST:
+            out[n] = None                 # out of mechanical layers
+            continue
+        out[n] = by_key[name] = (next_slot, key, name)
+        next_slot += 1
+    # Pairing is a MECHANICAL-layer notion (it is what makes Altium flip a
+    # bottom-placed footprint's mechanical geometry); the fixed layers already
+    # know their own opposite side.
+    for n, slot in list(out.items()):
+        other = out.get(-n)
+        if (n > 0 and slot is not None and other is not None
+                and other != slot and slot[0] >= _MECH_FIRST):
+            pairs.append((slot[0], other[0]))
+    return out, pairs
+
+
+def declare(target, layer_plan, pairs):
+    """Write the plan into the file being built (AltiumPcbLib or
+    PcbDocBuilder — both carry the same three setters)."""
+    for slot in {s for s in layer_plan.values() if s is not None}:
+        layer_id, kind, name = slot
+        if layer_id < _MECH_FIRST:
+            continue                       # fixed layer: nothing to declare
+        target.set_mechanical_layer(layer_id, name=name, enabled=True)
+        if kind:
+            target.set_mechanical_layer_kind(layer_id, kind)
+    for top, bottom in pairs:
+        target.set_mechanical_layer_pair(top, bottom)

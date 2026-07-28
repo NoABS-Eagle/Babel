@@ -28,8 +28,12 @@
 # silently guessed onto a semantic layer.
 
 # --- fixed (non-mechanical) layers, stable ids ---
+# The bottom side of every row here is derived (Top... -> Bottom...), so only
+# the top row is listed.
 1     Top
 121   TopOverlay
+125   TopOverlay              # Eagle tNames — silkscreen text, one overlay
+127   TopOverlay              # Eagle tValues, likewise
 131   TopPaste
 129   TopSolder
 

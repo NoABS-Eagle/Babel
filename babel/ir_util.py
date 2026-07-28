@@ -176,6 +176,75 @@ CHANNEL_DRILLS = 905      # ALL drill renderings (pad/via/hole `drill` attrs).
 _CANON_PAIRED = {1, 121, 125, 127, 129, 131, 139, 151}
 
 
+def chain_loops(segments, tol_um=1.0):
+    """[(x1, y1, x2, y2, curve), ...] -> ([closed loop, ...], [leftover, ...]).
+
+    Walks endpoint to endpoint; a segment traversed backwards has its curve
+    negated (the endpoint form's own inverse). Each loop comes back wound
+    CCW so the output is a property of the geometry, not of the source's
+    order. The one home of contour assembly: the board outline needs exactly
+    one loop, a footprint's milling contour may bring several.
+    """
+    def near(ax, ay, bx, by):
+        return math.hypot(ax - bx, ay - by) <= tol_um
+
+    remaining = list(segments)
+    loops, leftover = [], []
+    while remaining:
+        loop = [remaining.pop(0)]
+        while True:
+            cx, cy = loop[-1][2], loop[-1][3]
+            if near(cx, cy, loop[0][0], loop[0][1]):
+                break                                   # closed
+            for i, s in enumerate(remaining):
+                if near(cx, cy, s[0], s[1]):
+                    loop.append(remaining.pop(i))
+                    break
+                if near(cx, cy, s[2], s[3]):
+                    x1, y1, x2, y2, c = remaining.pop(i)
+                    loop.append((x2, y2, x1, y1, -c))
+                    break
+            else:
+                leftover.extend(loop)                   # never closed
+                loop = None
+                break
+        if loop is None:
+            continue
+        if contour_area([(x1, y1, c) for x1, y1, _, _, c in loop]) < 0:
+            loop = [(x2, y2, x1, y1, -c) for x1, y1, x2, y2, c in reversed(loop)]
+        loops.append(loop)
+    return loops, leftover
+
+
+def flatten_loop(loop, sag_um=6.0):
+    """Closed loop of (x1, y1, x2, y2, curve) -> [(x, y), ...] vertices, arcs
+    approximated so the chord never departs from the true arc by more than
+    sag_um. For consumers whose contour is polygonal only (an Altium region)."""
+    pts = []
+    for x1, y1, x2, y2, curve in loop:
+        pts.append((x1, y1))
+        p = arc_params(x1, y1, x2, y2, curve) if curve else None
+        if p is None:
+            continue
+        cx, cy, r, start, sweep = p
+        # sagitta of one step: r*(1 - cos(step/2)) <= sag  ->  step
+        if r <= sag_um:
+            continue
+        step = 2 * math.degrees(math.acos(max(-1.0, 1 - sag_um / r)))
+        n = max(1, int(math.ceil(abs(sweep) / max(step, 1e-6))))
+        for i in range(1, n):
+            a = math.radians(start + sweep * i / n)
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    return pts
+
+
+def is_paired_layer(n):
+    """Does this IR layer number have a top/bottom PAIR (so a bottom-side
+    placement negates it)? The one home of that fact — place_layer below and
+    the Altium layer planner both ask here."""
+    return abs(int(n)) in _CANON_PAIRED
+
+
 def place_layer(ln, bottom):
     """Footprint-space layer attr (side-relative sign) -> board-space layer
     attr for an element on the given side. Sign arithmetic per ir_schema.md:
@@ -934,8 +1003,14 @@ def resolve_model3d_file(fp_el, search_dir):
     """
     if fp_el.find('model3d') is None:
         return None
+    return model3d_file_for_name(fp_el.get('name', ''), search_dir)
+
+
+def model3d_file_for_name(fp_name, search_dir):
+    """The sidecar model file for a footprint NAME, without requiring the
+    footprint to already declare <model3d> — which is how a model the user
+    dropped in for a package Eagle never annotated gets noticed at all."""
     search_dir = Path(search_dir)
-    fp_name = fp_el.get('name', '')
     names = [fp_name]
     safe = sanitize_filename(fp_name)
     if safe != fp_name:

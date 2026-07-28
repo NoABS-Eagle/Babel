@@ -3,6 +3,7 @@
 The project-level importer needs a compiled .IntLib (Altium-only), so this
 verifies the emitted document directly instead. Compact counters only.
 """
+import re
 import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path

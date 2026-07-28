@@ -5,7 +5,8 @@ import shutil
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from pathlib import Path
-from babel.ir_util import resolve_model3d_file
+from babel import import_log
+from babel.ir_util import model3d_file_for_name, resolve_model3d_file
 
 # Eagle SCHEMATIC/SYMBOL layer number → IR layer name (visual grouping,
 # ir_schema.md "Слои — единая номенклатура").
@@ -730,6 +731,8 @@ def convert(lbr_path, output_path=None):
 
     # 3D model files: attach file= attrs to <model3d> BEFORE serializing to XML
     if output_path:
+        src_dir = Path(lbr_path).parent / Path(lbr_path).stem
+        unify_model3d(lib, src_dir if src_dir.is_dir() else None)
         _copy_step_files(lib, Path(lbr_path), Path(output_path))
 
     xml_str = minidom.parseString(ET.tostring(lib, encoding='unicode')) \
@@ -743,6 +746,63 @@ def convert(lbr_path, output_path=None):
         Path(output_path).write_text(result, encoding='utf-8')
         print(f"Written: {output_path}")
     return result
+
+
+def _all_footprints(root_el):
+    """Every <footprint> in a library or project IR, wherever it hangs."""
+    return (root_el.findall('component/footprint')
+            + root_el.findall('footprint'))
+
+
+def unify_model3d(root_el, step_src):
+    """Make "does this package have a 3D model" a property of the PACKAGE,
+    not of the copy that happened to be converted first.
+
+    Two things go wrong without this, both silently:
+
+    1. Eagle loads the same library twice (rc and rc@1) and only one copy's
+       description carries the `<!--3d:{...}-->` annotation. The exporters
+       de-duplicate footprints BY NAME and keep the first — so whether the
+       model survives depends on library order. The transform belongs to the
+       package, so it is copied to every same-named footprint that lacks it.
+
+    2. A model file the user built for a package Eagle never annotated is
+       ignored entirely, because <model3d> is created from the annotation
+       alone. A file named after the footprint IS that footprint's model; with
+       no authored transform the only honest one is identity, and the fact
+       that it was assumed gets logged rather than passed off as data.
+    """
+    by_name = {}
+    for fp in _all_footprints(root_el):
+        by_name.setdefault(fp.get('name', ''), []).append(fp)
+
+    assumed, missing = [], []
+    for name, fps in sorted(by_name.items()):
+        authored = next((f.find('model3d') for f in fps
+                         if f.find('model3d') is not None), None)
+        if authored is None:
+            if step_src is None or model3d_file_for_name(name, step_src) is None:
+                continue
+            assumed.append(name)
+        elif not model3d_file_for_name(name, step_src or '.'):
+            missing.append(name)
+        for fp in fps:
+            if fp.find('model3d') is not None:
+                continue
+            m = ET.SubElement(fp, 'model3d')
+            if authored is not None:
+                m.attrib.update(authored.attrib)
+            else:
+                for a in ('tx', 'ty', 'tz', 'rx', 'ry', 'rz'):
+                    m.set(a, '0')
+    if assumed:
+        import_log.log('model3d', ','.join(assumed),
+                       'model file present but Eagle carries no 3d annotation '
+                       '— placed with an IDENTITY transform, check it in 3D')
+    if missing:
+        import_log.log('model3d', f'{len(missing)} package(s)',
+                       'ask for a 3D model but no file exists: '
+                       + ','.join(missing))
 
 
 def _copy_step_files(lib_el, lbr_path, out_path):

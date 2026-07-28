@@ -53,7 +53,7 @@ from babel.altium_parser import (
     emit_arc_geometry, emit_ellipse_geometry, emit_polygon_geometry,
     emit_label_geometry,
 )
-from babel.altium_exporter import _um_lw
+from babel.altium_exporter import DRC_RULES, _um_lw
 
 _MILS_TO_UM = 25.4
 _GAP_MILS = 500   # gap between tiled sheet frames, mils (KiCad path's _GAP_MM analog)
@@ -527,14 +527,9 @@ def _pt_on_circle(cx, cy, r, ang_deg):
 # side). No Eagle-style multi-pair clearance merge needed — Altium's own
 # generic Clearance rule (scope1=All, scope2=All) is already the single
 # value.
-_DRC_RULES = {
-    'Clearance': ('clearance', 'GAP'),
-    'BoardOutlineClearance': ('edge_clearance', 'GAP'),
-    'Width': ('min_width', 'MINLIMIT'),
-    'HoleSize': ('min_drill', 'MINLIMIT'),
-    'MinimumAnnularRing': ('min_annular', 'MINIMUMRING'),
-    'HoleToHoleClearance': ('min_drill_web', 'GAP'),
-}
+# The RULEKIND table lives in altium_exporter — one table, both directions
+# (the board exporter writes these very rules back).
+_DRC_RULES = DRC_RULES
 
 
 def _parse_dr_dim(s):

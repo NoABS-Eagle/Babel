@@ -37,7 +37,7 @@ from xml.dom import minidom
 
 from babel.eagle_parser import (
     convert_symbol, convert_package, convert_deviceset,
-    parse_rot, _um, LAYER_MAP, _copy_step_files,
+    parse_rot, _um, LAYER_MAP, _copy_step_files, unify_model3d,
 )
 from babel.eagle_exporter import _rotate_vec, _SIDE_NORMAL, _port_geometry, _PORT_PIN_LEN_UM
 from babel.ir_util import component_gates, is_multi_gate, resolved_attrs, sanitize_filename
@@ -1232,6 +1232,8 @@ def convert_project_full(src, output_path):
     # 3D sidecar: STEP files live in <src_stem>/ next to the source (same
     # convention as the library path) -> copy to <out_stem>/ next to the
     # .swprj for every project footprint that carries <model3d>.
+    step_src = Path(src).parent / Path(src).stem
+    unify_model3d(proj_el, step_src if step_src.is_dir() else None)
     _copy_step_files(proj_el, src, output_path)
 
     tree_str = ET.tostring(proj_el, encoding='unicode')

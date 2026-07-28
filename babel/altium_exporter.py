@@ -13,17 +13,38 @@ from altium_monkey import (
     AltiumSchMapDefiner, AltiumSchMapDefinerList, AltiumSchImplParams,
 )
 from altium_monkey.altium_sch_enums import PinElectrical, TextJustification, TextOrientation
-from altium_monkey.altium_pcb_enums import PadShape, PcbTextJustification
+from altium_monkey.altium_pcb_enums import (PadShape, PcbRegionKind,
+                                            PcbTextJustification)
 from altium_monkey.altium_record_types import PcbLayer, LineWidth
 from altium_monkey.altium_sch_svg_renderer import LINE_WIDTH_MILS
 
-from babel.ir_util import (component_gates, is_multi_gate, parse_layer,
-                           resolve_model3d_file, arc_params)
+from babel import import_log
+from babel import altium_layers
+from babel.ir_util import (LAYER_DIMENSION, arc_params, chain_loops,
+                           component_gates, flatten_loop, is_multi_gate,
+                           parse_layer, resolve_model3d_file)
 
 
 def _mils(v):
-    """IR µm → Altium mils (integer)."""
+    """IR µm → Altium mils (integer).
+
+    Whole mils are right for SCHEMATIC geometry (Altium's sheet grid is
+    100 mil and symbol geometry lands on it), and wrong for a footprint —
+    see _milf.
+    """
     return round(float(v) / 25.4)
+
+
+def _milf(v):
+    """IR µm → Altium mils, EXACT.
+
+    Footprint geometry does not sit on a mil grid: a 0.5 mm pad pitch is
+    19.685 mil, and rounding it to 20 moved TQFP64 pads by up to 10 µm on
+    the board (caught by verify_altium_board.py comparing every placed pad
+    against the IR's own placement math). Altium's internal unit is 1/10000
+    mil, so the fraction costs nothing.
+    """
+    return float(v) / 25.4
 
 
 _ALIGN_JUSTIFICATION = {
@@ -139,6 +160,25 @@ def _sym_add_arc(sym, x, y, radius_mils, **kwargs):
     return arc
 
 
+# IR <rules> attribute <-> Altium RULEKIND and the field carrying the number.
+# ONE table for both directions: altium_project_parser reads through it,
+# altium_board_exporter writes through it.
+DRC_RULES = {
+    'Clearance':           ('clearance',     'GAP'),
+    'BoardOutlineClearance': ('edge_clearance', 'GAP'),
+    'Width':               ('min_width',     'MINLIMIT'),
+    'HoleSize':            ('min_drill',     'MINLIMIT'),
+    'MinimumAnnularRing':  ('min_annular',   'MINIMUMRING'),
+    'HoleToHoleClearance': ('min_drill_web', 'GAP'),
+}
+
+
+# Chord tolerance when a footprint's milling arc is flattened into the
+# polygonal outline of a board-cutout region — 6 µm, well under any routing
+# tolerance.
+_CUTOUT_SAG_UM = 6.0
+
+
 # Altium's point size doesn't follow the standard 72pt/inch typographic
 # convention for rendered letter height: measured empirically, an 8pt font
 # renders ~1.2mm tall, i.e. 1pt corresponds to ~150 µm of actual height.
@@ -181,35 +221,120 @@ _DIR_TO_ELEC = {
 # special ERC-silencing behavior is lost, which Altium has no slot for
 # regardless of what we do here.
 
-# IR signed layer number (ir_schema.md "Плата (Board IR)") -> Altium PcbLayer.
-_IR_TO_PCB_LAYER = {
-    1:    PcbLayer.TOP,
-    -1:   PcbLayer.BOTTOM,
-    121:  PcbLayer.TOP_OVERLAY,
-    -121: PcbLayer.BOTTOM_OVERLAY,
-    125:  PcbLayer.TOP_OVERLAY,     # Eagle tNames/tValues text -> overlay
-    -125: PcbLayer.BOTTOM_OVERLAY,
-    127:  PcbLayer.TOP_OVERLAY,
-    -127: PcbLayer.BOTTOM_OVERLAY,
-    131:  PcbLayer.TOP_PASTE,
-    -131: PcbLayer.BOTTOM_PASTE,
-    139:  71,   # courtyard -> MECHANICAL_15
-    -139: 71,
-    151:  57,   # fab -> MECHANICAL_1
-    -151: 57,
-    148:  57,   # side-less Document notes -> MECHANICAL_1 too
-}
+# The IR->Altium layer projection lives in babel/data/altium_layers.tsv, the
+# ONE table both directions read (user, 2026-07-28). What used to sit here was
+# a second, hardcoded copy of the same fact, and the two had already drifted
+# apart — the tsv carried tStop, the code did not, so drawn mask openings were
+# silently dropped. Writing needs a concrete layer id, so a plan is computed
+# once per project (altium_layers.plan) and declared into the file itself.
 
 
-def _pcb_layer(ln):
-    """IR footprint layer attribute -> Altium PcbLayer, or None (drop)."""
+def _rot_about(pt, cx, cy, deg):
+    """Point rotated CCW by deg about (cx, cy) — a <shape>'s own centre."""
+    if not deg:
+        return pt
+    a = math.radians(deg)
+    dx, dy = pt[0] - cx, pt[1] - cy
+    return (cx + dx * math.cos(a) - dy * math.sin(a),
+            cy + dx * math.sin(a) + dy * math.cos(a))
+
+
+# Everything a keepout forbids: track, via, copper, SMD pad, TH pad (the five
+# bits of Altium's keepout mask). An IR anti-layer means "no copper here" with
+# no qualifier, so all five (user decision, 2026-07-28).
+_KEEPOUT_ALL = 0b11111
+
+
+def mark_keepout(rec):
+    """Turn an emitted primitive into a keepout.
+
+    `add_track`/`add_arc`/`add_fill` do not take the flag even though real
+    Altium records carry it (ground truth: BC2087.PcbDoc has keepout tracks,
+    arcs and fills on ordinary copper layers), so it goes on afterwards —
+    the same shape of workaround as pour_over and the polygon index.
+    """
+    rec.is_keepout = True
+    rec.keepout_restrictions = _KEEPOUT_ALL
+    return rec
+
+
+def target_layer(layer_plan, ln):
+    """IR layer attribute -> (Altium layer, is_keepout).
+
+    An ANTI-layer ('!1') is not a layer of its own: it is a keepout ON the
+    copper layer it names. Altium can also put keepouts on the Keep-Out Layer
+    (56), but that means "every layer" and would throw away the side the IR
+    knows, so the flag goes on the copper layer itself.
+    """
+    try:
+        anti, n = parse_layer(ln)
+    except (TypeError, ValueError):
+        return None, False
+    slot = layer_plan.get(n)
+    if slot is None:
+        return None, False
+    return slot[0], anti
+
+
+def npth_pad_kwargs(hole_el):
+    """IR <hole> -> the Altium object that IS a non-plated hole: a PAD with
+    no copper around it.
+
+    Altium has no separate "hole" primitive — ground truth from a real board
+    (testData/altium/IND/RLT504_117C.PcbDoc): a free pad on Multi-Layer,
+    round, unplated, empty designator, pad diameter EQUAL to the drill, so
+    there is no annular ring. Shared by the footprint and the board sides,
+    which differ only in where the position comes from.
+    """
+    d = _milf(hole_el.get('drill', 0))
+    return dict(designator='', width_mils=d, height_mils=d,
+                layer=PcbLayer.MULTI_LAYER, shape=PadShape.CIRCLE,
+                hole_size_mils=d, plated=False)
+
+
+def shape_primitives(el):
+    """IR <shape> -> the Altium primitives that draw it, in IR µm.
+
+    [('arc',   cx, cy, r, start_deg, end_deg, width),
+     ('fill',  x1, y1, x2, y2, rotation_deg),
+     ('track', x1, y1, x2, y2, width), ...]
+
+    The DECISION (circle vs rectangle, filled vs outlined, where the rotated
+    corners land) lives here once; the two callers — a footprint in a PcbLib
+    and free board geometry in a PcbDoc — only translate it to their own
+    add_* signatures, which differ in argument names for no good reason.
+    """
+    cx, cy = float(el.get('x', 0)), float(el.get('y', 0))
+    outline = float(el.get('outline', 0) or 0)
+    if int(el.get('roundness', 0)) == 100:
+        r = float(el.get('w', 0)) / 2
+        # A filled circle is drawn as a stroke of half the radius, running
+        # along the mid-circle — no separate "filled arc" exists in Altium.
+        return [('arc', cx, cy, r / 2 if not outline else r, 0, 360,
+                 r if not outline else outline)]
+    hw, hh = float(el.get('w', 0)) / 2, float(el.get('h', 0)) / 2
+    # <shape rot> turns the shape about its OWN centre (ir_schema.md).
+    rot = float(el.get('rot', 0) or 0) % 360
+    if not outline:
+        return [('fill', cx - hw, cy - hh, cx + hw, cy + hh, rot)]
+    corners = [_rot_about((cx + sx * hw, cy + sy * hh), cx, cy, rot)
+               for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+    return [('track', ax, ay, bx, by, outline or 100)
+            for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1])]
+
+
+def _pcb_layer(layer_plan, ln):
+    """IR layer attribute -> the Altium layer id this project's plan gives
+    it, or None when it has no home (anti-layer, or the mechanical slots ran
+    out). The plan comes from babel/data/altium_layers.tsv."""
     try:
         anti, n = parse_layer(ln)
     except (TypeError, ValueError):
         return None
     if anti:
         return None
-    return _IR_TO_PCB_LAYER.get(n)
+    slot = layer_plan.get(n)
+    return slot[0] if slot else None
 
 
 # ─── pin mapping helpers ─────────────────────────────────────────────────────
@@ -823,10 +948,61 @@ def _write_dblib(dblib_path, xlsx_name, all_cols):
 
 # ─── PCB footprint ────────────────────────────────────────────────────────────
 
-def _export_footprint(fp_el, pcblib, step_dir=None):
+def _board_cutouts(fp_el, fp):
+    """Closed loops on the IR dimension layer inside a FOOTPRINT are the
+    milling contour the package brings with it (a JST connector's slot).
+    Altium's native home for that is a Board Cutout region, and putting it
+    in the LIBRARY means the board inherits it through ordinary placement.
+
+    Returns the child elements consumed, so they are not also drawn as plain
+    mechanical tracks — the cutout region IS the contour.
+
+    The region outline is polygonal (Altium's own board-cutout form), so arcs
+    are flattened; _CUTOUT_SAG_UM is the chord tolerance.
+    """
+    segs, owner = [], {}
+    for child in fp_el:
+        if child.tag not in ('line', 'arc'):
+            continue
+        try:
+            if int(child.get('layer', '0')) != LAYER_DIMENSION:
+                continue
+        except ValueError:
+            continue
+        seg = (float(child.get('x1')), float(child.get('y1')),
+               float(child.get('x2')), float(child.get('y2')),
+               float(child.get('curve', 0) or 0))
+        segs.append(seg)
+        owner[seg] = child
+    if not segs:
+        return set()
+
+    loops, leftover = chain_loops(segs)
+    consumed = {id(owner[s]) for loop in loops for s in loop
+                if s in owner}          # reversed segments keep their own id
+    for loop in loops:
+        for s in loop:
+            if s not in owner:          # traversed backwards -> find the twin
+                x1, y1, x2, y2, c = s
+                consumed |= {id(owner[t]) for t in owner
+                             if t[:2] == (x2, y2) and t[2:4] == (x1, y1)}
+        fp.add_region(
+            outline_points_mils=[(_milf(x), _milf(y))
+                                 for x, y in flatten_loop(loop, _CUTOUT_SAG_UM)],
+            layer=PcbLayer.KEEPOUT,
+            kind=PcbRegionKind.BOARD_CUTOUT,
+            is_board_cutout=True,
+        )
+    return consumed
+
+
+def _export_footprint(fp_el, pcblib, layer_plan, step_dir=None):
     fp = pcblib.add_footprint(fp_el.get('name', ''))
+    cut = _board_cutouts(fp_el, fp)
 
     for child in fp_el:
+        if id(child) in cut:
+            continue
         tag = child.tag
         if tag in ('model3d', 'pin-mapping', 'description', 'attributes'):
             continue
@@ -834,7 +1010,14 @@ def _export_footprint(fp_el, pcblib, step_dir=None):
             pcb_layer = None            # pads pick their own layer below
             smd_far = child.get('layer') == '-1'
         else:
-            pcb_layer = _pcb_layer(child.get('layer'))
+            pcb_layer, keepout = target_layer(layer_plan, child.get('layer'))
+            if pcb_layer is None:
+                # Every branch below is guarded by `pcb_layer is not None`,
+                # so an IR layer missing from the table used to vanish in
+                # silence — the one thing this project does not do.
+                import_log.log(fp_el.get('name', ''), tag,
+                               'no Altium layer for IR layer',
+                               str(child.get('layer')))
 
 
         if tag == 'smd':
@@ -847,10 +1030,10 @@ def _export_footprint(fp_el, pcblib, step_dir=None):
                 shape = PadShape.RECTANGLE
             fp.add_pad(
                 designator            = child.get('name', ''),
-                position_mils         = [_mils(child.get('x', 0)),
-                                         _mils(child.get('y', 0))],
-                width_mils            = _mils(child.get('width', 0)),
-                height_mils           = _mils(child.get('height', 0)),
+                position_mils         = [_milf(child.get('x', 0)),
+                                         _milf(child.get('y', 0))],
+                width_mils            = _milf(child.get('width', 0)),
+                height_mils           = _milf(child.get('height', 0)),
                 layer                 = (PcbLayer.BOTTOM if smd_far
                                          else PcbLayer.TOP),
                 shape                 = shape,
@@ -859,29 +1042,43 @@ def _export_footprint(fp_el, pcblib, step_dir=None):
             )
 
         elif tag == 'pad':
-            drill    = _mils(child.get('drill', 0))
+            drill    = _milf(child.get('drill', 0))
             shape    = (PadShape.RECTANGLE if child.get('shape', 'round') == 'square'
                         else PadShape.CIRCLE)
-            pad_size = (_mils(child.get('diameter'))
-                        if child.get('diameter') else round(drill * 1.8))
+            pad_size = (_milf(child.get('diameter'))
+                        if child.get('diameter') else drill * 1.8)
             fp.add_pad(
                 designator    = child.get('name', ''),
-                position_mils = [_mils(child.get('x', 0)),
-                                 _mils(child.get('y', 0))],
+                position_mils = [_milf(child.get('x', 0)),
+                                 _milf(child.get('y', 0))],
                 width_mils    = pad_size,
                 height_mils   = pad_size,
                 layer         = PcbLayer.MULTI_LAYER,
                 shape         = shape,
                 hole_size_mils= drill,
+                # An IR <pad> IS the plated kind — the unplated one is <hole>,
+                # and that distinction is the whole difference between them.
+                # Altium's record defaults to unplated, so every through-hole
+                # pad we ever wrote came out with no barrel.
+                plated        = True,
             )
 
+        elif tag == 'hole':
+            # A mounting hole a footprint brings with it — dropped entirely
+            # until now, because the branch simply did not exist.
+            fp.add_pad(position_mils=[_milf(child.get('x', 0)),
+                                      _milf(child.get('y', 0))],
+                       **npth_pad_kwargs(child))
+
         elif tag == 'line' and pcb_layer is not None:
-            fp.add_track(
-                [_mils(child.get('x1')), _mils(child.get('y1'))],
-                [_mils(child.get('x2')), _mils(child.get('y2'))],
-                width_mils=_mils(child.get('width', 100)),
+            rec = fp.add_track(
+                [_milf(child.get('x1')), _milf(child.get('y1'))],
+                [_milf(child.get('x2')), _milf(child.get('y2'))],
+                width_mils=_milf(child.get('width', 100)),
                 layer=pcb_layer,
             )
+            if keepout:
+                mark_keepout(rec)
 
         elif tag == 'text' and pcb_layer is not None:
             content = child.text or ''
@@ -891,9 +1088,9 @@ def _export_footprint(fp_el, pcblib, step_dir=None):
                 fp.add_text(
                     text               = ('.Designator' if is_des else
                                           '.Comment'    if is_com else content),
-                    position_mils      = (_mils(child.get('x', '0')),
-                                          _mils(child.get('y', '0'))),
-                    height_mils        = max(_mils(child.get('size', '1000')), 20),
+                    position_mils      = (_milf(child.get('x', '0')),
+                                          _milf(child.get('y', '0'))),
+                    height_mils        = max(_milf(child.get('size', '1000')), 20),
                     layer              = pcb_layer,
                     rotation_degrees   = float(child.get('rot', '0')),
                     stroke_width_mils  = 5.0,
@@ -903,46 +1100,25 @@ def _export_footprint(fp_el, pcblib, step_dir=None):
                 )
 
         elif tag == 'shape' and pcb_layer is not None:
-            rn         = int(child.get('roundness', 0))
-            cx         = _mils(child.get('x', 0))
-            cy         = _mils(child.get('y', 0))
-            outline_um = float(child.get('outline', '0'))
-            if rn == 100:
-                r_um = float(child.get('w', '0')) / 2
-                if outline_um == 0:
-                    fp.add_arc(
-                        center_mils         = [cx, cy],
-                        radius_mils         = round(r_um / 50.8),
-                        start_angle_degrees = 0,
-                        end_angle_degrees   = 360,
-                        width_mils          = round(r_um / 25.4),
-                        layer               = pcb_layer,
-                    )
+            for prim in shape_primitives(child):
+                if prim[0] == 'arc':
+                    _, cx, cy, r, a1, a2, w = prim
+                    rec = fp.add_arc(center_mils=[_milf(cx), _milf(cy)],
+                                     radius_mils=_milf(r),
+                                     start_angle_degrees=a1, end_angle_degrees=a2,
+                                     width_mils=_milf(w), layer=pcb_layer)
+                elif prim[0] == 'fill':
+                    _, x1, y1, x2, y2, rot = prim
+                    rec = fp.add_fill(corner1_mils=(_milf(x1), _milf(y1)),
+                                      corner2_mils=(_milf(x2), _milf(y2)),
+                                      layer=pcb_layer, rotation_degrees=rot)
                 else:
-                    fp.add_arc(
-                        center_mils         = [cx, cy],
-                        radius_mils         = round(r_um / 25.4),
-                        start_angle_degrees = 0,
-                        end_angle_degrees   = 360,
-                        width_mils          = _mils(child.get('outline', '0')),
-                        layer               = pcb_layer,
-                    )
-            else:
-                hw = round(float(child.get('w', '0')) / 50.8)
-                hh = round(float(child.get('h', '0')) / 50.8)
-                if outline_um == 0:
-                    fp.add_fill(
-                        corner1_mils = (cx - hw, cy - hh),
-                        corner2_mils = (cx + hw, cy + hh),
-                        layer        = pcb_layer,
-                    )
-                else:
-                    lw = _mils(str(outline_um)) or 4
-                    corners = [(cx-hw, cy-hh), (cx+hw, cy-hh),
-                               (cx+hw, cy+hh), (cx-hw, cy+hh)]
-                    for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1]):
-                        fp.add_track([ax, ay], [bx, by],
-                                     width_mils=lw, layer=pcb_layer)
+                    _, x1, y1, x2, y2, w = prim
+                    rec = fp.add_track([_milf(x1), _milf(y1)],
+                                       [_milf(x2), _milf(y2)],
+                                       width_mils=_milf(w), layer=pcb_layer)
+                if keepout:
+                    mark_keepout(rec)
 
         elif tag == 'arc' and pcb_layer is not None:
             p = arc_params(float(child.get('x1', 0)), float(child.get('y1', 0)),
@@ -953,11 +1129,11 @@ def _export_footprint(fp_el, pcblib, step_dir=None):
             cx_um, cy_um, r_um, start, sweep = p
             a1, a2 = _altium_arc_angles(start, sweep)
             fp.add_arc(
-                center_mils         = [_mils(cx_um), _mils(cy_um)],
-                radius_mils         = _mils(r_um),
+                center_mils         = [_milf(cx_um), _milf(cy_um)],
+                radius_mils         = _milf(r_um),
                 start_angle_degrees = a1,
                 end_angle_degrees   = a2,
-                width_mils          = _mils(child.get('width', 100)),
+                width_mils          = _milf(child.get('width', 100)),
                 layer               = pcb_layer,
             )
 
@@ -1024,8 +1200,13 @@ def export(ir_path, output_dir=None):
         (', %d gate-only skipped' % n_skipped) if n_skipped else '',
     ))
 
-    # 2. PcbLib — one entry per unique footprint name
+    # 2. PcbLib — one entry per unique footprint name.
+    # The mechanical-layer plan is declared IN the library, so the file says
+    # what each of its mechanical layers means (altium_layers.tsv is the one
+    # table; the board export plans from the same IR and gets the same slots).
     pcblib   = AltiumPcbLib()
+    layer_plan, layer_pairs = altium_layers.plan(altium_layers.layers_used(ir_root))
+    altium_layers.declare(pcblib, layer_plan, layer_pairs)
     seen_fp: set[str] = set()
     step_dir = Path(ir_path).parent / Path(ir_path).stem
     for comp_el in ir_root.findall('component'):
@@ -1033,7 +1214,8 @@ def export(ir_path, output_dir=None):
             fp_id = fp_el.get('name', '')
             if fp_id not in seen_fp:
                 seen_fp.add(fp_id)
-                _export_footprint(fp_el, pcblib, step_dir=step_dir)
+                _export_footprint(fp_el, pcblib, layer_plan,
+                                  step_dir=step_dir)
     pcblib.save(pcb_path)
     print(f'Written: {pcb_path}  ({len(seen_fp)} footprints)')
 

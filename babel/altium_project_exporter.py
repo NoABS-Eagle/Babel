@@ -38,6 +38,7 @@ from altium_monkey.altium_symbol_transform import generate_unique_id
 
 from babel import import_log
 from babel import altium_exporter
+from babel import altium_board_exporter
 from babel.altium_exporter import _mils, _lw, _justif, _orient, _font_pt
 from babel.ir_util import (component_gates, is_multi_gate, resolved_attrs)
 from babel.kicad_project_exporter import _collinear_between
@@ -684,6 +685,7 @@ def export_project(swprj_path, output_dir):
 
     # 4. Place instances
     part_page = {}
+    sch_link = {}
     supply_desigs = set()
     n_parts = n_power = 0
     frame_ids = {id(i) for i, _ in frame_insts}
@@ -724,6 +726,9 @@ def export_project(swprj_path, output_dir):
             part_id = gate_names.index(g) + 1
         comp = _place_instance(page, inst_el, comp_el, pool, schlib_path,
                                part_id, value, attrs, table_name, db_cols)
+        # what ties the board's components to THESE schematic components
+        sch_link[desig] = (comp.unique_id, comp.lib_reference,
+                           comp.source_library_name)
         n_parts += 1
 
     # 5. Nets
@@ -736,10 +741,21 @@ def export_project(swprj_path, output_dir):
     for page in pages:
         page.doc.save(out_dir / page.fname)
         print(f'Written: {out_dir / page.fname}')
+    # 8. Board
+    pcb_path = altium_board_exporter.export_board(
+        ir_root, out_dir, proj_name, out_dir / f'{proj_name}.PcbLib', sch_link)
+
     builder = AltiumPrjPcbBuilder(proj_name)
     for page in pages:
         builder.add_schdoc(page.fname)
+    if pcb_path is not None:
+        builder.add_pcbdoc(pcb_path.name)
+    # The library set is a SET: SchLib alone left the project with symbols
+    # and no footprints listed, and with no route to the xlsx the components
+    # actually resolve their parameters through.
     builder.add_schlib(schlib_path.name)
+    builder.add_pcblib(f'{proj_name}.PcbLib')
+    builder.add_document(f'{proj_name}.DbLib')
     prj_path = out_dir / f'{proj_name}.PrjPcb'
     builder.save(prj_path)
     print(f'Written: {prj_path}')
