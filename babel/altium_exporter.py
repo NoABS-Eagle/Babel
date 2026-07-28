@@ -139,18 +139,28 @@ def _sym_add_arc(sym, x, y, radius_mils, **kwargs):
     return arc
 
 
-def _font_id(schlib, size_um):
-    """IR text size (µm) → Altium font_id via the library's font table.
+# Altium's point size doesn't follow the standard 72pt/inch typographic
+# convention for rendered letter height: measured empirically, an 8pt font
+# renders ~1.2mm tall, i.e. 1pt corresponds to ~150 µm of actual height.
+_FONT_UM_PER_PT = 150
+# Even at that scale Altium still renders text visibly too large against the
+# source, so knock a flat 20% off the resulting point size. Hardcoded on
+# purpose: Altium's own size handling is what is wrong, and no data in the IR
+# can tell us by how much (user decision 2026-07-28, same issue as libraries).
+_FONT_SIZE_FACTOR = 0.8
 
-    Altium's point size doesn't follow the standard 72pt/inch typographic
-    convention for rendered letter height: measured empirically, an 8pt font
-    renders ~1.2mm tall, i.e. 1pt corresponds to ~150 µm of actual height.
-    """
+
+def _font_pt(size_um):
+    """IR text size (µm) → Altium point size."""
+    return max(1, round(float(size_um) / _FONT_UM_PER_PT * _FONT_SIZE_FACTOR))
+
+
+def _font_id(schlib, size_um):
+    """IR text size (µm) → Altium font_id via the library's font table."""
     fm = schlib.font_manager
     if fm is None:
         return 1
-    pt = max(1, round(float(size_um) / 150))
-    return fm.get_or_create_font('Times New Roman', pt)
+    return fm.get_or_create_font('Times New Roman', _font_pt(size_um))
 
 
 _DIR_TO_ELEC = {
@@ -438,7 +448,10 @@ def _export_schlib_symbol(sym_el, schlib, ir_root):
     d.justification = _justif(des_align)
     d.orientation   = _orient(des_rot)
 
-    p = sym.add_parameter('Comment', 'Comment', x=val_x, y=val_y, is_hidden=False,
+    # No >VALUE placeholder means the symbol never showed a value: Comment must
+    # exist (BOM, DB sync) but stay hidden, or it lands next to the designator.
+    p = sym.add_parameter('Comment', 'Comment', x=val_x, y=val_y,
+                          is_hidden=not val_found,
                           font_id=_font_id(schlib, val_size))
     p.owner_part_id = 1
     p.auto_position = False
@@ -539,13 +552,16 @@ def _export_schlib_multipart(comp_el, sym_pool, schlib):
 
     # Designator and Comment are shared across all parts (OwnerPartId=-1)
     des_prefix = comp_el.get('prefix') or 'U'
+    # No >VALUE placeholder means the symbol never showed a value: Comment must
+    # exist (BOM, DB sync) but stay hidden, or it lands next to the designator.
     d = sym.add_designator(f'{des_prefix}?', des_x, des_y, font_id=_font_id(schlib, des_size))
     d.owner_part_id = -1
     d.auto_position = False
     d.justification = _justif(des_align)
     d.orientation   = _orient(des_rot)
 
-    p = sym.add_parameter('Comment', 'Comment', x=val_x, y=val_y, is_hidden=False,
+    p = sym.add_parameter('Comment', 'Comment', x=val_x, y=val_y,
+                          is_hidden=not val_found,
                           font_id=_font_id(schlib, val_size))
     p.owner_part_id = -1
     p.auto_position = False

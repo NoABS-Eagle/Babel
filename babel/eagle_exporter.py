@@ -1329,9 +1329,9 @@ def _emit_segment(seg_out, seg_el, port_geom=None, multi_parts={}):
         ET.SubElement(seg_out, 'junction',
                       x=_tomm(j.get('x')), y=_tomm(j.get('y')))
     for l in seg_el.findall('label'):
+        # No mirror: IR labels have no such property (Eagle's own was a
+        # readability crutch, and Eagle draws label text readable regardless).
         rot_s = _rot_attr(float(l.get('rot', '0'))) or 'R0'
-        if l.get('mirror') == '1':
-            rot_s = 'M' + rot_s
         lab = ET.SubElement(seg_out, 'label',
                             x=_tomm(l.get('x')), y=_tomm(l.get('y')),
                             size=_tomm(l.get('size', '1270')),

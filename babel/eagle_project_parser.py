@@ -342,6 +342,17 @@ def _trim_portref_wire(seg, port_geom, part_name, port_name):
             return
 
 
+def _is_supply(comp_el, pool):
+    """A supply component — any gate symbol carrying a `sup` pin. Its
+    instances become native power ports on every export path."""
+    for _, sym_name in component_gates(comp_el):
+        sym_el = pool.get(sym_name)
+        if sym_el is not None and any(p.get('direction') == 'sup'
+                                      for p in sym_el.findall('pin')):
+            return True
+    return False
+
+
 def _collect_sheet(sheet_el, parts, pool, comp_by_name, comps_by_lib, ctx, port_geom=None):
     """One <sheet> -> accumulator dict: instances (list of dicts, IR-ready),
     nets (list of {'name', 'class', 'segments': [...]}). Straight structural
@@ -370,6 +381,17 @@ def _collect_sheet(sheet_el, parts, pool, comp_by_name, comps_by_lib, ctx, port_
 
             angle_deg, mirror = parse_rot(inst_el.get('rot'))
             x_um, y_um = _um(inst_el.get('x')), _um(inst_el.get('y'))
+
+            # A mirrored power port standing on its side has no mirrored
+            # geometry to speak of — it is a bare flag on a single sup pin —
+            # so Eagle's mirror there is really just "pointing the other way".
+            # Fold it into the rotation (user decision 2026-07-28) so the
+            # mirror fact is accounted for once, here, rather than in every
+            # exporter. Only 90/270: at 0/180 the mirror is left alone.
+            if (mirror and round(angle_deg) % 360 in (90, 270)
+                    and _is_supply(comp_el, pool)):
+                angle_deg = (angle_deg + 180) % 360
+                mirror = False
 
             inst = {
                 'component': comp_el.get('name'), 'library': part_name and part['library'],
@@ -534,15 +556,24 @@ def _collect_sheet(sheet_el, parts, pool, comp_by_name, comps_by_lib, ctx, port_
                     seg['junctions'].append((_um(j.get('x')), _um(j.get('y'))))
                 for l in seg_el.findall('label'):
                     deg, lmirror = parse_rot(l.get('rot'))
+                    # Eagle's mirrored label points the opposite way: fold
+                    # that into the angle so IR carries the direction once.
+                    if lmirror:
+                        deg = (deg + 180) % 360
                     # xref="yes" = Eagle's cross-reference FLAG -> flag
                     # style ('passive': рамка без стрелок — Eagle xref не
                     # кодирует направление); plain label = crummy, the
                     # legitimate wire caption (user: флажок на середине
-                    # провода выглядит плохо). Mirror carried, was dropped.
+                    # провода выглядит плохо).
+                    #
+                    # Eagle's own mirror is NORMALIZED AWAY (user decision
+                    # 2026-07-28): a label's four rot values already cover the
+                    # four flag directions, and Eagle always draws label text
+                    # readable anyway — its `M` prefix carries direction only,
+                    # which the +180 above now holds. One fact, one place.
                     seg['labels'].append((
                         _um(l.get('x')), _um(l.get('y')), _um(l.get('size', '1.778')),
                         str(round(deg)),
-                        '1' if lmirror else '',
                         'passive' if l.get('xref') == 'yes' else 'crummy',
                     ))
                 net['segments'].append(seg)
@@ -596,11 +627,9 @@ def _write_canvas(parent_el, instances, nets):
                 ET.SubElement(seg_el, 'line', x1=x1, y1=y1, x2=x2, y2=y2, width=width)
             for jx, jy in seg['junctions']:
                 ET.SubElement(seg_el, 'junction', x=jx, y=jy)
-            for lx, ly, size, rot, lmirror, style in seg['labels']:
-                l_el = ET.SubElement(seg_el, 'label', x=lx, y=ly, size=size,
-                                     rot=rot, style=style)
-                if lmirror:
-                    l_el.set('mirror', '1')
+            for lx, ly, size, rot, style in seg['labels']:
+                ET.SubElement(seg_el, 'label', x=lx, y=ly, size=size,
+                              rot=rot, style=style)
 
 
 # ---------------------------------------------------------------------------
@@ -729,6 +758,44 @@ def _synth_native_frame(frame_el, bbox_um, pool, ctx):
     return {'component': comp_name, 'library': '', 'designator': f'FRAME${n}',
             'x': str((x1 + x2) // 2), 'y': str((y1 + y2) // 2),
             'rot': '0', 'mirror': '0', 'attrs': []}
+
+
+def _collect_decorations(sheet_el, tile_x_offset, out):
+    """Sheet <plain> -> IR decorative graphics on the schematic canvas.
+
+    <plain> is Eagle's non-electrical layer: the dashed grouping boxes and
+    their captions every real schematic uses ("Vout = 0.765 * (R1+R2)/R2").
+    Connectivity lives in <nets>/<busses>, so nothing here can carry any, and
+    the whole lot maps to IR layer GRAPHIC — the same shape the Altium import
+    produces and the exporters already consume. <frame> is NOT handled here:
+    it defines the page itself (_validate_and_collect_frame).
+    """
+    plain_el = sheet_el.find('plain')
+    if plain_el is None:
+        return
+    for el in plain_el:
+        if el.tag == 'frame':
+            continue
+        if el.tag == 'text':
+            rot, _mirror = parse_rot(el.get('rot'))
+            t = ET.Element('text', x=str(int(_um(el.get('x'))) + tile_x_offset),
+                           y=str(int(_um(el.get('y')))),
+                           size=str(int(_um(el.get('size', '1.778')))),
+                           rot=f'{rot:g}', align=el.get('align', 'bottom-left'),
+                           layer='GRAPHIC')
+            t.text = el.text or ''
+            out.append(t)
+        elif el.tag == 'wire':
+            out.append(ET.Element(
+                'line', x1=str(int(_um(el.get('x1'))) + tile_x_offset),
+                y1=str(int(_um(el.get('y1')))),
+                x2=str(int(_um(el.get('x2'))) + tile_x_offset),
+                y2=str(int(_um(el.get('y2')))),
+                width=str(int(_um(el.get('width', '0.1524')))),
+                layer='GRAPHIC'))
+        else:
+            import_log.log('schematic', el.tag,
+                           'PLAIN decorative geometry type not imported yet')
 
 
 def _collect_tiled_pages(sheet_els, parts, pool, comp_by_name, comps_by_lib, ctx, page_label,
@@ -1011,8 +1078,10 @@ def convert_project_full(src, output_path):
     # on_page hook — a module canvas never has <moduleinsts> of its own
     # (nesting forbidden), only top-level pages do.
     module_instances = []
+    decorations = []
 
-    def _collect_moduleinsts(sheet_el, tile_x_offset):
+    def _collect_page_extras(sheet_el, tile_x_offset):
+        _collect_decorations(sheet_el, tile_x_offset, decorations)
         minsts_el = sheet_el.find('moduleinsts')
         if minsts_el is None:
             return None
@@ -1045,7 +1114,7 @@ def convert_project_full(src, output_path):
 
     component_instances, all_nets = _collect_tiled_pages(
         sheet_els, top_parts, pool, comp_by_name, comps_by_lib, ctx,
-        page_label=str, on_page=_collect_moduleinsts)
+        page_label=str, on_page=_collect_page_extras)
 
     # Module-instance <instance module=...> elements go on the canvas
     # alongside ordinary component instances (same parent_el, same content
@@ -1058,6 +1127,7 @@ def convert_project_full(src, output_path):
         ET.SubElement(schem_el, 'instance', **kwargs)
 
     _write_canvas(schem_el, component_instances, all_nets)
+    schem_el.extend(decorations)
 
     # --- Board half: a sibling .brd makes this project ONE <layout>
     # (Eagle can't have more than one board per schematic). Import is

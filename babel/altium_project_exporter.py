@@ -32,12 +32,13 @@ from altium_monkey.altium_record_sch__power_port import AltiumSchPowerPort
 from altium_monkey.altium_record_sch__label import AltiumSchLabel
 from altium_monkey.altium_record_sch__parameter import AltiumSchParameter
 from altium_monkey.altium_record_sch__polyline import AltiumSchPolyline
-from altium_monkey.altium_sch_enums import PowerObjectStyle, TextOrientation
+from altium_monkey.altium_sch_enums import (PowerObjectStyle, TextJustification,
+                                            TextOrientation)
 from altium_monkey.altium_symbol_transform import generate_unique_id
 
 from babel import import_log
 from babel import altium_exporter
-from babel.altium_exporter import _mils, _lw, _justif, _orient
+from babel.altium_exporter import _mils, _lw, _justif, _orient, _font_pt
 from babel.ir_util import (component_gates, is_multi_gate, resolved_attrs)
 from babel.kicad_project_exporter import _collinear_between
 
@@ -102,10 +103,10 @@ def _inst_point(inst_el, lx_um, ly_um):
 
 
 def _font(doc, size_um):
-    """IR text size (µm) -> font id on THIS doc (same 150 µm/pt empirical
-    scale as altium_exporter._font_id)."""
-    pt = max(1, round(float(size_um or 1270) / 150))
-    return doc.font_manager.get_or_create_font('Times New Roman', pt)
+    """IR text size (µm) -> font id on THIS doc (same scale as the library
+    exporter, so a symbol's text keeps its size once placed)."""
+    return doc.font_manager.get_or_create_font(
+        'Times New Roman', _font_pt(size_um or 1270))
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +253,7 @@ def _set_parameter(page, comp, name, text, db_owned):
     return p
 
 
-def _place_instance(page, inst_el, comp_el, schlib_path, part_id, value,
+def _place_instance(page, inst_el, comp_el, pool, schlib_path, part_id, value,
                     attrs, table_name, db_cols):
     """One IR <instance> -> placed AltiumSchComponent (geometry cloned from
     the SchLib entry by altium_monkey's own insert helper)."""
@@ -285,37 +286,131 @@ def _place_instance(page, inst_el, comp_el, schlib_path, part_id, value,
         if name.lower() in ('value', 'description'):
             continue
         _set_parameter(page, comp, name, text, name in db_cols)
+
+    # Last, so a parameter renamed to the IR spelling above is still found.
+    _place_child_texts(page, comp, inst_el, pool[component_gates(comp_el)
+                                                [part_id - 1][1]])
     return comp
+
+
+
+_MIRROR_JUSTIFICATION = {
+    TextJustification.BOTTOM_LEFT:  TextJustification.BOTTOM_RIGHT,
+    TextJustification.BOTTOM_RIGHT: TextJustification.BOTTOM_LEFT,
+    TextJustification.CENTER_LEFT:  TextJustification.CENTER_RIGHT,
+    TextJustification.CENTER_RIGHT: TextJustification.CENTER_LEFT,
+    TextJustification.TOP_LEFT:     TextJustification.TOP_RIGHT,
+    TextJustification.TOP_RIGHT:    TextJustification.TOP_LEFT,
+}
+
+
+# Vertical half of a justification -> centre, horizontal half kept
+_CENTER_VERT_JUSTIFICATION = {
+    TextJustification.BOTTOM_LEFT:   TextJustification.CENTER_LEFT,
+    TextJustification.BOTTOM_CENTER: TextJustification.CENTER_CENTER,
+    TextJustification.BOTTOM_RIGHT:  TextJustification.CENTER_RIGHT,
+    TextJustification.CENTER_LEFT:   TextJustification.CENTER_LEFT,
+    TextJustification.CENTER_CENTER: TextJustification.CENTER_CENTER,
+    TextJustification.CENTER_RIGHT:  TextJustification.CENTER_RIGHT,
+    TextJustification.TOP_LEFT:      TextJustification.CENTER_LEFT,
+    TextJustification.TOP_CENTER:    TextJustification.CENTER_CENTER,
+    TextJustification.TOP_RIGHT:     TextJustification.CENTER_RIGHT,
+}
+
+
+# Both axes flipped — a half turn about the anchor
+_OPPOSITE_JUSTIFICATION = {
+    TextJustification.BOTTOM_LEFT:   TextJustification.TOP_RIGHT,
+    TextJustification.BOTTOM_CENTER: TextJustification.TOP_CENTER,
+    TextJustification.BOTTOM_RIGHT:  TextJustification.TOP_LEFT,
+    TextJustification.CENTER_LEFT:   TextJustification.CENTER_RIGHT,
+    TextJustification.CENTER_RIGHT:  TextJustification.CENTER_LEFT,
+    TextJustification.TOP_LEFT:      TextJustification.BOTTOM_RIGHT,
+    TextJustification.TOP_CENTER:    TextJustification.BOTTOM_CENTER,
+    TextJustification.TOP_RIGHT:     TextJustification.BOTTOM_LEFT,
+}
+
+
+def _make_readable(obj):
+    """Altium honours a text's angle literally, so 180 deg renders upside
+    down. Turn such a text back to 0 deg and flip BOTH sides of its
+    justification, which keeps the anchor — and thus the layout — put.
+    A centred axis has no side to swap."""
+    if getattr(obj, 'orientation', None) != TextOrientation.DEGREES_180:
+        return
+    obj.orientation = TextOrientation.DEGREES_0
+    j = getattr(obj, 'justification', None)
+    if j in _OPPOSITE_JUSTIFICATION:
+        obj.justification = _OPPOSITE_JUSTIFICATION[j]
+
+
+def _text_target(page, comp, content):
+    """The record a symbol placeholder addresses: >NAME/>PART the designator,
+    >VALUE the Comment parameter, >SOMETHING the like-named parameter."""
+    kids = _component_children(page.doc, comp)
+    if content in ('>NAME', '>PART'):
+        return next((o for o in kids
+                     if type(o).__name__ == 'AltiumSchDesignator'), None)
+    name = 'Comment' if content == '>VALUE' else content[1:]
+    return next((o for o in kids
+                 if type(o).__name__ == 'AltiumSchParameter'
+                 and o.name.lower() == name.lower()), None)
+
+
+def _place_child_texts(page, comp, inst_el, sym_el):
+    """Position every child text of a placed component from its IR
+    placeholder: the symbol's by default, the instance's where it overrides.
+
+    Both carry SYMBOL-LOCAL coordinates, so each is transformed by the
+    instance's rot/mirror. Deriving the position here also sidesteps
+    add_component_from_library, which resolves parameters to absolute canvas
+    coordinates but leaves the designator in symbol-local space."""
+    placeholders = {}
+    for src in (sym_el, inst_el):
+        for t in src.findall('text'):
+            content = (t.text or '').strip()
+            if content.startswith('>'):
+                placeholders[content] = t
+
+    for content, t in placeholders.items():
+        target = _text_target(page, comp, content)
+        if target is None:
+            continue
+        # A suppressed placeholder: Eagle's display="off", or — on a smashed
+        # instance — a library placeholder with no <attribute> record at all,
+        # which Eagle simply does not draw. Either way it carries no geometry
+        # worth applying, only the fact that it must not show.
+        if t.get('hidden') == 'yes':
+            target.is_hidden = True
+            continue
+        cx, cy = _inst_point(inst_el, t.get('x', '0'), t.get('y', '0'))
+        target.location = CoordPoint.from_mils(*page.pt(cx, cy))
+        # The library's font_id is an index into the LIBRARY's font table;
+        # cloning it into a SchDoc silently reinterprets it against this
+        # document's table (which is why designators came out at its default
+        # 10pt). Resolve the size from the IR text instead.
+        target.font_id = _font(page.doc, t.get('size'))
+        # The text's own angle from IR, turned by the instance's rotation.
+        target.orientation = _orient(float(t.get('rot', '0'))
+                                     + float(inst_el.get('rot', '0')))
+        # Source justification, with the horizontal side swapped on a
+        # mirrored instance (user decision 2026-07-28).
+        just = _justif(t.get('align', 'bottom-left'))
+        if inst_el.get('mirror') == '1':
+            just = _MIRROR_JUSTIFICATION.get(just, just)
+            # A mirrored part on its side needs both sides swapped as well
+            if round(float(inst_el.get('rot', '0'))) % 360 in (90, 270):
+                just = _OPPOSITE_JUSTIFICATION.get(just, just)
+        target.justification = just
+        if hasattr(target, 'auto_position'):
+            target.auto_position = False
+        _make_readable(target)
 
 
 def _component_children(doc, comp):
     idx = doc.all_objects.index(comp)
     return [o for o in doc.all_objects
             if getattr(o, 'owner_index', None) == idx]
-
-
-def _apply_text_overrides(page, inst_el, comp):
-    """Per-instance IR <text> overrides (>NAME / >VALUE positions, absolute
-    canvas coords) -> move the cloned Designator/Comment records."""
-    for t in inst_el.findall('text'):
-        content = (t.text or '').strip()
-        x, y = page.pt(t.get('x', '0'), t.get('y', '0'))
-        rot = round(float(t.get('rot', '0'))) % 360
-        target = None
-        if content in ('>NAME', '>PART'):
-            target = next((o for o in _component_children(page.doc, comp)
-                           if type(o).__name__ == 'AltiumSchDesignator'), None)
-        elif content == '>VALUE':
-            target = next((o for o in _component_children(page.doc, comp)
-                           if type(o).__name__ == 'AltiumSchParameter'
-                           and o.name == 'Comment'), None)
-        if target is None:
-            continue
-        target.location = CoordPoint.from_mils(x, y)
-        target.orientation = _orient(rot)
-        target.justification = _justif(t.get('align', 'bottom-left'))
-        if hasattr(target, 'auto_position'):
-            target.auto_position = False
 
 
 # ---------------------------------------------------------------------------
@@ -371,14 +466,22 @@ def _emit_junction(page, j_el):
     page.doc.add_object(j)
 
 
-def _emit_net_label(page, net_name, x_um, y_um, rot, size_um):
+def _emit_net_label(page, net_name, x_um, y_um, rot, size_um, style='crummy'):
     nl = AltiumSchNetLabel()
     x, y = page.pt(x_um, y_um)
     nl.location = CoordPoint.from_mils(x, y)
     nl.text = _eagle_overbar_to_altium(net_name)
     nl.orientation = TextOrientation((round(float(rot or 0)) // 90) % 4)
     nl.font_id = _font(page.doc, size_um)
+    # A flag label (anything but `crummy`) sits ON the wire end, so centring
+    # it vertically puts the text where the source shows it; a plain wire
+    # caption keeps its baseline (user decision 2026-07-28).
+    if style != 'crummy':
+        nl.justification = _CENTER_VERT_JUSTIFICATION.get(
+            getattr(nl, 'justification', TextJustification.BOTTOM_LEFT),
+            TextJustification.CENTER_LEFT)
     nl.unique_id = generate_unique_id()
+    _make_readable(nl)
     page.doc.add_object(nl)
 
 
@@ -456,7 +559,8 @@ def _emit_nets(pages, sch_el, part_page, supply_desigs, supply_net_by_desig):
             for l in seg_el.findall('label'):
                 named_segs.add(id(seg_el))
                 _emit_net_label(page, net_name, l.get('x'), l.get('y'),
-                                l.get('rot', '0'), l.get('size', '1270'))
+                                l.get('rot', '0'), l.get('size', '1270'),
+                                l.get('style', 'crummy'))
             # a PowerPort names (and globally joins) ITS island
             if any(r.get('part') in supply_desigs
                    for r in seg_el.findall('pinref')):
@@ -513,6 +617,7 @@ def _emit_decorations(pages, sch_el):
             lab.justification = _justif(el.get('align', 'bottom-left'))
             lab.font_id = _font(page.doc, el.get('size', '1270'))
             lab.unique_id = generate_unique_id()
+            _make_readable(lab)
             page.doc.add_object(lab)
         elif el.tag in ('arc', 'shape', 'polygon'):
             import_log.log('schematic', el.tag,
@@ -617,9 +722,8 @@ def export_project(swprj_path, output_dir):
                 raise ValueError(f'instance {desig}: gate "{g}" not in '
                                  f'component "{comp_el.get("name")}"')
             part_id = gate_names.index(g) + 1
-        comp = _place_instance(page, inst_el, comp_el, schlib_path, part_id,
-                               value, attrs, table_name, db_cols)
-        _apply_text_overrides(page, inst_el, comp)
+        comp = _place_instance(page, inst_el, comp_el, pool, schlib_path,
+                               part_id, value, attrs, table_name, db_cols)
         n_parts += 1
 
     # 5. Nets
