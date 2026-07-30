@@ -22,7 +22,8 @@ from babel import import_log
 from babel import altium_layers
 from babel.ir_util import (LAYER_DIMENSION, arc_params, chain_loops,
                            component_gates, flatten_loop, is_multi_gate,
-                           parse_layer, resolve_model3d_file)
+                           offset_contour, parse_layer, resolve_model3d_file,
+                           sanitize_filename)
 
 
 def _mils(v):
@@ -339,10 +340,16 @@ def _pcb_layer(layer_plan, ln):
 
 # ─── pin mapping helpers ─────────────────────────────────────────────────────
 
-def _pin_des_map(comp_el, gate_name):
-    """Build {pin_name: [pad_designators]} for one gate from the first footprint."""
+def _pin_des_map(comp_el, gate_name, fp_el=None):
+    """Build {pin_name: [pad_designators]} for one gate of one footprint.
+
+    Defaults to the first footprint — the map used to be taken from it for
+    EVERY implementation, which silently mislabelled the pins of the second
+    and later footprints whenever their pad names differ.
+    """
     result = {}
-    fp_el  = comp_el.find('footprint')
+    if fp_el is None:
+        fp_el = comp_el.find('footprint')
     if fp_el is None:
         return result
     prefix = f'{gate_name}.' if gate_name else None
@@ -368,13 +375,22 @@ def _derive_pin_map(sym_name, ir_root):
     return {}
 
 
-def _derive_footprints_for_sym(sym_name, ir_root):
-    """Return list of footprint names for the first component that references sym_name."""
+def _owner_component_for_sym(sym_name, ir_root):
+    """The first component that references sym_name — the one whose footprints
+    and pin map a pool symbol borrows."""
     for comp_el in ir_root.findall('component'):
         for _, sname in component_gates(comp_el):
             if sname == sym_name:
-                return [fp.get('name', '') for fp in comp_el.findall('footprint')]
-    return []
+                return comp_el
+    return None
+
+
+def _gate_of_sym(comp_el, sym_name):
+    """The gate of comp_el drawn by sym_name ('' when single-gate)."""
+    for gate_name, sname in component_gates(comp_el):
+        if sname == sym_name:
+            return gate_name
+    return ''
 
 
 def _sym_used_standalone(sym_name, ir_root):
@@ -385,11 +401,96 @@ def _sym_used_standalone(sym_name, ir_root):
     return False
 
 
-def _footprint_impl_with_map(fp_name, pad_lists, is_current=True):
+def pin_pad_pairs(comp_el, fp_el, ir_root=None):
+    """[(schematic pin designator, pads of THIS footprint)], gates in order.
+
+    A MAP_DEFINER answers "which pads does the pin CALLED X sit on", so its
+    DesIntf must be the designator the SYMBOL gives the pin — and the symbol
+    takes its designators from the component's FIRST footprint, whatever
+    footprint the instance is placed with. Writing the current footprint's
+    pad on both sides made the map say `+ -> +` for a symbol whose pin is
+    called `2`, so Altium found no such pin and the first ECO offered to
+    take CON5 off VDC and GND (ground truth: the user's own Update PCB on
+    step4).
+    """
+    out = []
+    for gate_name, sym_name in component_gates(comp_el):
+        # WHOSE first footprint depends on what the SchLib entry is. A
+        # multi-gate component gets an entry of its own, so its own first
+        # footprint names the pins. A single-gate one is placed from the POOL
+        # SYMBOL, which several components may share — and the symbol was
+        # built from the FIRST of them (_derive_pin_map). Base's SB3 is a
+        # TACT_SWITCH-KLS whose pin `2` is pad `2`, but the shared symbol was
+        # named after TACT_SWITCH, where that pin is pad `3`: taking the
+        # instance's own component here made the map name a pin the symbol
+        # does not have.
+        if ir_root is not None and not is_multi_gate(comp_el):
+            named = _derive_pin_map(sym_name, ir_root)
+        else:
+            named = _pin_des_map(comp_el, gate_name, comp_el.find('footprint'))
+        here = _pin_des_map(comp_el, gate_name, fp_el)
+        for pin, pads in named.items():
+            if pads:
+                out.append((pads[0], here.get(pin) or pads))
+    return out
+
+
+def bake_footprint(comp, model_name, pcblib_name):
+    """Give a PLACED component its own footprint model.
+
+    A component that only points at a DbLib row carries no model, and Altium
+    reports "Footprint of component ... cannot be found" even with the
+    database connected and its driver installed — ground truth: the user's
+    Altium on step4, where a component placed BY HAND from the same DbLib
+    arrived with a footprint and ours did not. So the model is a property of
+    the instance on the sheet; the DbLib only supplies it at placement time.
+    The xlsx keeps its Footprint Ref column for "Update From Libraries".
+    """
+    return comp.add_footprint(model_name, library_name=pcblib_name,
+                              is_current=True)
+
+
+def write_pin_maps(doc, pending):
+    """Append the MAP_DEFINERs of already baked models — the LAST thing done
+    to a sheet, and by appending only.
+
+    `pending`: iterable of (implementation record, pad lists).
+
+    Two properties of the format force this. OwnerIndex is a POSITION in the
+    document's object list, so inserting a record in the middle silently
+    re-owns every child that follows. And add_object() on a component
+    re-synchronizes its children, walking the implementation's own children
+    but not theirs — a MAP_DEFINER, which sits one level deeper, is dropped
+    on the next parameter written. Appending after everything else is
+    immune to both.
+    """
+    from altium_monkey.altium_record_sch__implementation import (
+        AltiumSchMapDefinerList)
+    for impl, pairs in pending:
+        impl_idx = doc.all_objects.index(impl)
+        md_list = next(o for o in doc.all_objects
+                       if isinstance(o, AltiumSchMapDefinerList)
+                       and getattr(o, 'owner_index', None) == impl_idx)
+        md_pos = doc.all_objects.index(md_list)
+        for desig, pads in pairs:
+            if not pads:
+                continue
+            md = AltiumSchMapDefiner()
+            md.designator_interface       = desig
+            md.implementation_designators = pads
+            md._has_designator_interface       = True
+            md._has_implementation_designators = True
+            doc._bind_schematic_object(md)
+            md.owner_index = md_pos
+            doc.all_objects.append(md)
+            doc._categorize_object(md)
+
+
+def _footprint_impl_with_map(fp_name, pairs, is_current=True):
     """Build (impl_record, children) for a footprint implementation + MAP_DEFINERs.
 
-    pad_lists: iterable of pad-name lists, one list per schematic pin.
-    Each list's first element becomes DesIntf (pin designator on the schematic).
+    pairs: (schematic pin designator, pads of this footprint), from
+    pin_pad_pairs — DesIntf names the PIN, the designators name the PADS.
     """
     impl = {
         'RECORD':               '45',
@@ -401,10 +502,10 @@ def _footprint_impl_with_map(fp_name, pad_lists, is_current=True):
         'ModelDatafileKind0':   'PCBLib',
     }
     children = [AltiumSchMapDefinerList()]
-    for pads in pad_lists:
+    for desig, pads in pairs:
         if pads:
             md = AltiumSchMapDefiner()
-            md.designator_interface       = pads[0]
+            md.designator_interface       = desig
             md.implementation_designators = pads
             children.append(md)
     children.append(AltiumSchImplParams())
@@ -521,7 +622,7 @@ def _add_gate_to_symbol(sym, sym_el, des_map, schlib, owner_part_id=None):
 def _export_schlib_symbol(sym_el, schlib, ir_root):
     """Add one IR <symbol> as an Altium SchLib component (DbLib-style)."""
     sname = sym_el.get('name', '')
-    sym   = schlib.add_symbol(sname)
+    sym   = schlib.add_symbol(lib_ref(sname))
 
     # Locate >NAME/>PART, >VALUE and other > placeholders in symbol texts.
     # >SOMETHING (not NAME/PART/VALUE/GATE) → visible parameter at that position.
@@ -617,9 +718,12 @@ def _export_schlib_symbol(sym_el, schlib, ir_root):
     _add_gate_to_symbol(sym, sym_el, des_map, schlib)
 
     # Footprint implementations + MAP_DEFINERs (all footprints; first = IsCurrent)
-    fp_names = _derive_footprints_for_sym(sname, ir_root)
-    for i, fp_name in enumerate(fp_names):
-        impl, children = _footprint_impl_with_map(fp_name, des_map.values(), is_current=(i == 0))
+    owner = _owner_component_for_sym(sname, ir_root)
+    fp_els = owner.findall('footprint') if owner is not None else []
+    for i, fp_el in enumerate(fp_els):
+        impl, children = _footprint_impl_with_map(
+            fp_name(fp_el), pin_pad_pairs(owner, fp_el, ir_root),
+            is_current=(i == 0))
         sym.add_implementation(impl, children)
 
 
@@ -634,7 +738,7 @@ def _export_schlib_multipart(comp_el, sym_pool, schlib):
     """
     cname = comp_el.get('name', '')
     gates = component_gates(comp_el)
-    sym   = schlib.add_symbol(cname)
+    sym   = schlib.add_symbol(lib_ref(cname))
     sym.set_part_count(len(gates))
 
     # Anchor positions from first gate's pool symbol; collect > placeholders from all gates.
@@ -708,24 +812,174 @@ def _export_schlib_multipart(comp_el, sym_pool, schlib):
                                    font_id=_font_id(schlib, val_size))
             hp.owner_part_id = -1
 
-    # Each gate → one numbered part (1-indexed); collect pad lists in gate order
-    all_pad_lists = []
+    # Each gate → one numbered part (1-indexed)
     for i, (gate_name, sym_name) in enumerate(gates, 1):
         gate_sym_el = sym_pool.get(sym_name)
         if gate_sym_el is None:
             print('  ! multi-gate %s: pool symbol %r not found' % (cname, sym_name))
             continue
-        gate_des_map = _pin_des_map(comp_el, gate_name)
-        all_pad_lists.extend(gate_des_map.values())
-        _add_gate_to_symbol(sym, gate_sym_el, gate_des_map, schlib, owner_part_id=i)
+        _add_gate_to_symbol(sym, gate_sym_el, _pin_des_map(comp_el, gate_name),
+                            schlib, owner_part_id=i)
 
     # Footprint implementations with MAP_DEFINERs covering all gates in order (all footprints; first = IsCurrent)
     for i, fp_el in enumerate(comp_el.findall('footprint')):
-        impl, children = _footprint_impl_with_map(fp_el.get('name', ''), all_pad_lists, is_current=(i == 0))
+        impl, children = _footprint_impl_with_map(
+            fp_name(fp_el), pin_pad_pairs(comp_el, fp_el), is_current=(i == 0))
         sym.add_implementation(impl, children)
 
 
+# ─── footprint names: PcbLib stores them as single-byte ──────────────────────
+
+# Cyrillic letters that LOOK like Latin ones — the only non-ASCII characters
+# real library names carry in practice ("2х2" is a 2x2 header whose x is a
+# Cyrillic kha). Mapping them back to their Latin twin keeps the name
+# readable; anything else non-ASCII becomes '_'.
+_HOMOGLYPHS = str.maketrans({
+    'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M', 'Н': 'H', 'О': 'O',
+    'Р': 'P', 'С': 'C', 'Т': 'T', 'У': 'Y', 'Х': 'X',
+    'а': 'a', 'в': 'b', 'е': 'e', 'к': 'k', 'м': 'm', 'н': 'h', 'о': 'o',
+    'р': 'p', 'с': 'c', 'т': 't', 'у': 'y', 'х': 'x',
+})
+
+
+# ─── multi-line text ─────────────────────────────────────────────────────────
+
+# The two multi-line objects we emit are drawn with DIFFERENT fonts, so they
+# need different metrics — the schematic Text Frame with a real TrueType face,
+# the PCB String with Altium's own stroke font. Sizing both off the TrueType
+# metric made the PCB box a third too narrow and Altium cut the long lines
+# off — caught by the user on step4's note.
+
+# A line of text takes about 1.6 of its cap height together with the gap to
+# the next one — the ratio Altium's own multi-line objects come out at.
+_LINE_PITCH = 1.6
+
+# The stroke font's own step, measured by altium_monkey off imported document
+# text (_STROKE_MULTILINE_SPACING_FACTOR): noticeably airier than the
+# TrueType one, which is why an Altium PCB note stands taller than its Eagle
+# original. We follow Altium rather than pretend otherwise.
+_STROKE_LINE_PITCH = 1.68
+
+
+# A text's HEIGHT in the IR (and in Altium) is the cap height; a TrueType
+# metric measures at the EM size, which is bigger. Arial's cap height is
+# 0.716 em.
+_CAP_PER_EM = 0.72
+
+
+def multiline_box(lines, height_mils):
+    """Size (w, h) in mils of a TrueType text block at that cap height.
+
+    For the schematic Text Frame. The width is the LONGEST line.
+    """
+    from altium_monkey.altium_text_metrics import measure_text_width
+    em = height_mils / _CAP_PER_EM
+    width = max((measure_text_width(l, font_size_px=em)
+                 for l in lines), default=height_mils)
+    return width, len(lines) * height_mils * _LINE_PITCH
+
+
+def stroke_box(lines, height_mils):
+    """Size (w, h) in mils of a PCB stroke-font text block at that height.
+
+    Altium's stroke font is a vector font whose glyphs are defined in units of
+    the text height, so the width of a line is just the sum of its characters'
+    advances times the height — exact, no font resolution involved. The table
+    is altium_monkey's calibrated one for the Default stroke font, the only
+    one we emit.
+    """
+    from altium_monkey.altium_stroke_font_data import STROKE_ADVANCES_DEFAULT
+    fallback = STROKE_ADVANCES_DEFAULT[ord('X')]
+    width = max((sum(STROKE_ADVANCES_DEFAULT.get(ord(c), fallback) for c in l)
+                 for l in lines), default=1.0) * height_mils
+    return width, len(lines) * height_mils * _STROKE_LINE_PITCH
+
+
+# ─── multi-channel designators ───────────────────────────────────────────────
+
+# Altium's own default, written into the project's [Design] section and read
+# back by its compiler: the physical designator of a part in a channel is the
+# canonical one plus the room it sits in. Eagle's `offset` arithmetic
+# (C1 @ 100 -> C101) has no counterpart in this template language, so on the
+# Altium path the channel naming is Altium's, not Eagle's — user decision
+# 2026-07-29, taken with the alternative (padding the canonical designators to
+# fake the arithmetic) on the table.
+CHANNEL_DESIGNATOR_FORMAT = '$Component_$RoomName'
+
+
+def channel_designator(room, canonical):
+    """('DCDC1', 'C1') -> 'C1_DCDC1' — the ONE place this format is applied.
+
+    Both the schematic side (which writes the format string into the project)
+    and the board side (which must name the very same part identically, or
+    every component shows up as changed on the first ECO) go through here.
+    """
+    return (CHANNEL_DESIGNATOR_FORMAT
+            .replace('$Component', canonical)
+            .replace('$RoomName', room))
+
+
+def lib_ref(name):
+    """The name a SchLib ENTRY is written and looked up under.
+
+    Every entry is an OLE storage inside the .SchLib, and a storage name may
+    not contain the characters a path may not contain — altium_monkey cut
+    "CCDN2,5/18-G1P26THR" down to "CCDN2,5" and the placed component then
+    found no symbol at all. Same substitution as any other name that becomes
+    a file/storage name (ir_util.sanitize_filename), applied in ONE place so
+    the library, the xlsx row and the placement agree.
+    """
+    out = sanitize_filename(name or '')
+    if out != name:
+        import_log.log(name, '', f'LIBRARY entry name written as "{out}" '
+                                 '(a SchLib entry is an OLE storage, and its '
+                                 'name may not contain path characters)')
+    return out
+
+
+def fp_name(fp_el_or_str):
+    """The name a footprint is written under in EVERY Altium artifact.
+
+    A PcbLib footprint header is a byte pascal string — Altium has no Unicode
+    there — so a non-ASCII name cannot be stored at all. The single home of
+    the substitution is here: the PcbLib entry, the SchLib implementation
+    link, the xlsx row and the PcbDoc placement must all say the same word or
+    the placed component loses its footprint.
+    """
+    name = (fp_el_or_str if isinstance(fp_el_or_str, str)
+            else fp_el_or_str.get('name', ''))
+    if name.isascii():
+        return name
+    out = name.translate(_HOMOGLYPHS)
+    out = ''.join(c if c.isascii() else '_' for c in out)
+    import_log.log(name, '', f'FOOTPRINT name is not ASCII, written as '
+                             f'"{out}" (PcbLib stores names as single-byte)')
+    return out
+
+
 # ─── component table helpers ──────────────────────────────────────────────────
+
+def part_number(comp_el, fp_el):
+    """The DbLib row key ("Part Number" column) for one component/footprint.
+
+    One row per component when it has 0/1 footprints, one row per footprint
+    otherwise. The suffix is the footprint NAME — except when one package
+    backs several devices (Eagle CON-2P: `-B2B-XH` and `-DS1069M` are both
+    packaged B2B-XH-A), where the name is not an identity and the VARIANT
+    string is (the same rule eagle_project_parser records on
+    `<instance footprint=>`). Both the xlsx rows and the placed components
+    resolve their key HERE — two spellings of it would silently unlink every
+    placed part from its database row.
+    """
+    cname = comp_el.get('name', '')
+    fps = comp_el.findall('footprint')
+    if len(fps) <= 1 or fp_el is None:
+        return cname
+    name = fp_name(fp_el)
+    if [f.get('name') for f in fps].count(fp_el.get('name', '')) > 1:
+        return f'{cname}_{fp_el.get("variant") or name}'
+    return f'{cname}_{name}'
+
 
 def _custom_attrs(comp_el):
     """Return dict of custom attributes, skipping 'value' (mapped to Comment)
@@ -829,7 +1083,7 @@ def _build_component_rows(ir_root, schlib_name, pcblib_name):
             custom = _fp_custom(fp_el_) if fp_el_ is not None else comp_custom
             r = {
                 'Part Number':    part_num,
-                'Library Ref':    sym_name,
+                'Library Ref':    lib_ref(sym_name),
                 'Library Path':   schlib_name,
                 'Footprint Ref':  fp_name,
                 'Footprint Path': pcblib_name,
@@ -848,8 +1102,8 @@ def _build_component_rows(ir_root, schlib_name, pcblib_name):
             rows.append(_make_row(cname, fp_name, fp_el_one))
         else:
             for fp_el_i in fp_els:
-                fp_name = fp_el_i.get('name', '')
-                rows.append(_make_row(f'{cname}_{fp_name}', fp_name, fp_el_i))
+                rows.append(_make_row(part_number(comp_el, fp_el_i),
+                                      fp_el_i.get('name', ''), fp_el_i))
 
     return rows, all_cols
 
@@ -997,7 +1251,7 @@ def _board_cutouts(fp_el, fp):
 
 
 def _export_footprint(fp_el, pcblib, layer_plan, step_dir=None):
-    fp = pcblib.add_footprint(fp_el.get('name', ''))
+    fp = pcblib.add_footprint(fp_name(fp_el))
     cut = _board_cutouts(fp_el, fp)
 
     for child in fp_el:
@@ -1120,6 +1374,35 @@ def _export_footprint(fp_el, pcblib, layer_plan, step_dir=None):
                 if keepout:
                     mark_keepout(rec)
 
+        elif tag == 'polygon' and pcb_layer is not None:
+            # A filled area inside a footprint (an Eagle logo is 19 of them)
+            # is an Altium REGION — the placement copies regions like any
+            # other primitive. The contour is the IR pen centreline plus its
+            # width, offset outward exactly as the board pours are, and then
+            # flattened: a region outline is a plain point list.
+            verts = [(float(v.get('x')), float(v.get('y')),
+                      float(v.get('curve', 0) or 0))
+                     for v in child.findall('vertex')]
+            width = float(child.get('width', 0) or 0)
+            # A contour needs three corners to enclose anything; two-vertex
+            # "polygons" exist in real libraries (a degenerate leftover) and
+            # the pen model cannot offset them.
+            pts = []
+            if len(verts) >= 3:
+                loop = [(x1, y1, x2, y2, c) for _kind, x1, y1, x2, y2, c
+                        in offset_contour(verts, width / 2)]
+                pts = [(_milf(x), _milf(y))
+                       for x, y in flatten_loop(loop, _CUTOUT_SAG_UM)]
+            if len(pts) >= 3:
+                rec = fp.add_region(outline_points_mils=pts, layer=pcb_layer,
+                                    kind=PcbRegionKind.COPPER)
+                if keepout:
+                    mark_keepout(rec)
+            else:
+                import_log.log(fp_el.get('name', ''), tag,
+                               f'POLYGON has {len(verts)} vertices, nothing '
+                               'to fill — dropped')
+
         elif tag == 'arc' and pcb_layer is not None:
             p = arc_params(float(child.get('x1', 0)), float(child.get('y1', 0)),
                            float(child.get('x2', 0)), float(child.get('y2', 0)),
@@ -1136,6 +1419,13 @@ def _export_footprint(fp_el, pcblib, layer_plan, step_dir=None):
                 width_mils          = _milf(child.get('width', 100)),
                 layer               = pcb_layer,
             )
+
+        else:
+            # Nothing may leave the footprint in silence: <polygon> did for a
+            # long time, and two Eagle logos arrived in Altium as empty
+            # components because of it.
+            import_log.log(fp_el.get('name', ''), tag,
+                           'FOOTPRINT primitive not exported')
 
     # 3D model — embed STEP file if available
     m3d = fp_el.find('model3d')
@@ -1209,8 +1499,11 @@ def export(ir_path, output_dir=None):
     altium_layers.declare(pcblib, layer_plan, layer_pairs)
     seen_fp: set[str] = set()
     step_dir = Path(ir_path).parent / Path(ir_path).stem
-    for comp_el in ir_root.findall('component'):
-        for fp_el in comp_el.findall('footprint'):
+    # A board-only padless element (Eagle artwork/logo) has no component:
+    # its footprint hangs on the LAYOUT, and the PcbDoc still places it.
+    for owner in (list(ir_root.findall('component'))
+                  + list(ir_root.findall('layout'))):
+        for fp_el in owner.findall('footprint'):
             fp_id = fp_el.get('name', '')
             if fp_id not in seen_fp:
                 seen_fp.add(fp_id)

@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from babel.eagle_board_exporter import _instance_footprint
 from babel.ir_util import place_ir_element, instance_designator, parse_stack
 from babel.kicad_board_exporter import export_board_kicad, _Frame
+from babel.kicad_exporter import _eagle_overbar_to_kicad
 
 TOL = 0.002   # mm
 
@@ -165,7 +166,11 @@ def check(swprj):
             if n_bad <= 8:
                 print(f'  FAIL pos {key}: kicad=({ka[0]:.3f},{ka[1]:.3f}) '
                       f'ir=({ia[0]:.3f},{ia[1]:.3f})')
-        elif (ka[2] or None) != (ia[2] or None):
+        # a net NAME is rendered by KiCad, so the exporter converts the IR's
+        # Eagle-style overbar (`!NRST`) to KiCad's (`~{NRST}`) — in the
+        # schematic and the board alike, so the two documents still agree.
+        # Compare through the same conversion, not against the raw IR string.
+        elif (_eagle_overbar_to_kicad(ka[2]) or None) !=                 (_eagle_overbar_to_kicad(ia[2]) or None):
             n_bad += 1
             if n_bad <= 8:
                 print(f'  FAIL net {key}: kicad={ka[2]!r} ir={ia[2]!r}')

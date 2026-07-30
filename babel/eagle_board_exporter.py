@@ -17,7 +17,7 @@ from babel.eagle_exporter import (_LAYERS_FILE, _eagle_designator, _eagle_name,
                                   _emit_arc, _emit_geometry, _geom_sig,
                                   _pkg_eagle_layer, _resolved_attrs, _tomm,
                                   export_package)
-from babel.ir_util import parse_layer, parse_stack
+from babel.ir_util import parse_layer, parse_stack, designator_resolver
 
 _GEOM_TAGS = ('line', 'arc', 'shape', 'polygon', 'text', 'hole')
 
@@ -221,36 +221,14 @@ def export_board(ir_path, output_path=None, layout_name=None):
 
     schem = root.find('schematic')
     comp_by_name = {c.get('name'): c for c in root.findall('component')}
-    # first-wins: multi-gate parts share a designator across instances and
-    # the attribute home is the FIRST gate (importer convention)
-    inst_by_des = {}
-    if schem is not None:
-        for i in schem.findall('instance'):
-            inst_by_des.setdefault(i.get('name'), i)
-    module_by_name = {m.get('name'): m for m in root.findall('module')}
     local_fp = {f.get('name'): f for f in layout.findall('footprint')}
 
-    def _resolve_instance(des):
-        """IR element address -> (instance, eagle board designator).
-        'INST:REFDES' (module-instance part, ir_schema.md "<element>") uses
-        the module canvas instance; the Eagle spelling flattens numerically
-        when the moduleinst carries offset= (C1 @ offset 100 -> C101), and
-        keeps the native colon form otherwise — exact import inverse."""
-        if ':' not in des:
-            return inst_by_des.get(des), des
-        minst_name, part = des.split(':', 1)
-        minst = inst_by_des.get(minst_name)
-        mod = module_by_name.get(minst.get('module')) if minst is not None else None
-        if mod is None:
-            return None, des
-        part_inst = next((i for i in mod.findall('instance')
-                          if i.get('name') == part), None)
-        offset = minst.get('offset')
-        if offset and offset != '0':
-            m = re.match(r'^(.*?)(\d+)$', part)
-            if m:
-                return part_inst, f'{m.group(1)}{int(m.group(2)) + int(offset)}'
-        return part_inst, des
+    # IR element address -> (instance, board designator): first-wins on a
+    # designator (multi-gate parts share one across instances, the attribute
+    # home is the FIRST gate — importer convention), and the flattening of
+    # 'INST:REFDES' (module-instance part) is the SAME rule in every
+    # exporter — ir_util.flat_designator.
+    _resolve_instance = designator_resolver(root)
 
     stack = _stack(layout)
 

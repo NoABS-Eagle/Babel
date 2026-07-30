@@ -21,7 +21,9 @@ from babel.altium_board_exporter import _chain, _outline_bbox, _outline_segments
 from babel import altium_layers
 from babel.altium_exporter import (DRC_RULES, _pcb_layer, shape_primitives,
                                    target_layer)
-from babel.ir_util import (LAYER_DIMENSION, chain_loops, flatten_loop,
+from babel.altium_exporter import channel_designator
+from babel.ir_util import (LAYER_DIMENSION, chain_loops, designator_resolver,
+                           flatten_loop,
                            instance_footprint, parse_stack, place_footprint,
                            place_ir_element)
 
@@ -45,7 +47,25 @@ ox, oy = pcb.board.origin_x, pcb.board.origin_y
 
 layer_plan, _pairs = altium_layers.plan(altium_layers.layers_used(ir))
 comp_by_name = {c.get('name'): c for c in ir.findall('component')}
-inst_by_desig = {i.get('name'): i for i in ir.find('schematic').findall('instance')}
+# An element addresses a top-level instance or a part inside a module
+# instance ('INST:REFDES'); the flattened designator is the one Altium got.
+resolve_element = designator_resolver(ir)
+local_fp = {f.get('name'): f for f in layout.findall('footprint')}
+inst_of, fp_of = {}, {}
+for _e in layout.findall('element'):
+    _addr = _e.get('name')
+    _inst, _des = resolve_element(_addr)
+    if ':' in _addr:
+        # a channel part is named by the project's channel format, not by the
+        # IR's Eagle-style flattening (altium_exporter.channel_designator)
+        _room, _canon = _addr.split(':', 1)
+        _des = channel_designator(_room, _canon)
+    inst_of[_addr] = (_inst, _des)
+    # a board-only padless element (Eagle logo) has no schematic part: its
+    # footprint hangs on the layout itself
+    fp_of[_e.get('name')] = (local_fp[_e.get('footprint')] if _inst is None
+                             else instance_footprint(
+                                 comp_by_name[_inst.get('component')], _inst))
 
 # --- outline ---------------------------------------------------------------
 loop = _chain(_outline_segments(layout))
@@ -87,7 +107,7 @@ by_desig = {c.designator: c for c in pcb.components}
 print('COMPONENTS')
 check(len(pcb.components) == len(els),
       f'{len(pcb.components)} placed, IR has {len(els)} <element>')
-missing = [e.get('name') for e in els if e.get('name') not in by_desig]
+missing = [e.get('name') for e in els if inst_of[e.get('name')][1] not in by_desig]
 check(not missing, f'every IR element placed (missing: {missing[:5]})')
 sides = sum(1 for c in pcb.components if c.layer == 'BOTTOM')
 ir_bottom = sum(1 for e in els if e.get('side') == 'bottom')
@@ -105,9 +125,8 @@ worst_at = ''
 checked = 0
 absent = []
 for e in els:
-    desig = e.get('name')
-    inst = inst_by_desig[desig]
-    fp_el = instance_footprint(comp_by_name[inst.get('component')], inst)
+    inst, desig = inst_of[e.get('name')]
+    fp_el = fp_of[e.get('name')]
     bottom = e.get('side') == 'bottom'
     placed = place_footprint(fp_el, float(e.get('x', 0)), float(e.get('y', 0)),
                              float(e.get('rot', 0) or 0), bottom)
@@ -150,9 +169,8 @@ n_rect = 0
 unmapped = 0
 rect_bad = []
 for e in els:
-    desig = e.get('name')
-    inst = inst_by_desig[desig]
-    fp_el = instance_footprint(comp_by_name[inst.get('component')], inst)
+    inst, desig = inst_of[e.get('name')]
+    fp_el = fp_of[e.get('name')]
     bottom = e.get('side') == 'bottom'
     placed = place_footprint(fp_el, float(e.get('x', 0)), float(e.get('y', 0)),
                              float(e.get('rot', 0) or 0), bottom)
@@ -249,26 +267,46 @@ for prims, kind in ((pcb.tracks, 'track'), (pcb.arcs, 'arc'),
                                                      or p.is_comment)))
 want_all = {'track': 0, 'arc': 0, 'fill': 0, 'text': 0}
 for e in els:
-    inst = inst_by_desig[e.get('name')]
-    for k, v in _expected(instance_footprint(comp_by_name[inst.get('component')],
-                                             inst)).items():
+    for k, v in _expected(fp_of[e.get('name')]).items():
         want_all[k] += v
 print('FOOTPRINT GRAPHICS (nothing dropped)')
 for k in ('track', 'arc', 'fill', 'text'):
     check(got_all[k] == want_all[k],
           f'{got_all[k]} plain {k}s on placed components, IR expects '
           f'{want_all[k]}')
-check(sum(1 for t in pcb.texts if t.is_designator) == len(els),
-      f'{sum(1 for t in pcb.texts if t.is_designator)} designator strings, '
-      f'one per component')
+# Visibility is a FLAG on the component (NAMEON), not a missing object: a
+# component without a designator primitive makes Altium draw one of its own
+# ("Designator1"). So every component keeps its text, and exactly the ones
+# whose footprint declares a visible >NAME have it switched on.
+des_texts = [t for t in pcb.texts if t.is_designator]
+with_des = {t.component_index for t in des_texts}
+
+
+def _shows_name(e):
+    declared = any((t.text or '').strip() == '>NAME'
+                   for t in list(fp_of[e.get('name')].findall('text'))
+                   + list(e.findall('text')))
+    hidden = any((t.text or '').strip() == '>NAME' and t.get('hidden') == 'yes'
+                 for t in e.findall('text'))
+    return declared and not hidden
+
+
+want_des = {index_of[inst_of[e.get('name')][1]] for e in els if _shows_name(e)}
+shown_des = {i for i, c in enumerate(pcb.components) if c.name_on}
+check(with_des >= want_des,
+      f'{len(des_texts)} designator string(s) — every component keeps its own '
+      f'(missing: {sorted(want_des - with_des)[:4]})')
+check(shown_des == want_des,
+      f'{len(shown_des)} of them are VISIBLE — exactly the elements whose '
+      f'footprint declares a visible >NAME '
+      f'(wrong: {sorted(shown_des ^ want_des)[:4]})')
 
 # --- board cutouts a footprint brings with it ------------------------------
 # The expected outline is baked from the IR by the IR's own placement math,
 # so a wrong rotation or side shows up as a moved cutout, not as a pass.
 cut_want = []
 for e in els:
-    inst = inst_by_desig[e.get('name')]
-    fp_el = instance_footprint(comp_by_name[inst.get('component')], inst)
+    fp_el = fp_of[e.get('name')]
     if not _cut_segments(fp_el)[0]:
         continue
     placed = place_footprint(fp_el, float(e.get('x', 0)), float(e.get('y', 0)),
@@ -327,7 +365,7 @@ for e in els:
     if ov is None:
         continue
     n_ovr += 1
-    desig = e.get('name')
+    desig = inst_of[e.get('name')][1]
     bottom = e.get('side') == 'bottom'
     placed = place_ir_element(ov, float(e.get('x', 0)), float(e.get('y', 0)),
                               float(e.get('rot', 0) or 0), bottom)
@@ -344,7 +382,7 @@ for e in els:
 print('DESIGNATOR TEXT (per-instance overrides)')
 check(not no_text, f'every overridden element has a designator text '
                    f'(missing: {no_text[:5]})')
-check(n_ovr > 0 and worst_t <= TOL_MILS,
+check(worst_t <= TOL_MILS,
       f'{n_ovr} overrides compared with the IR-baked position, worst '
       f'deviation {worst_t:.4f} mils at {worst_t_at}')
 manual = sum(1 for c in pcb.components
@@ -358,9 +396,16 @@ ir_free = layout.findall('text')
 free = [t for t in pcb.texts if t.component_index is None]
 print('BOARD-LEVEL TEXT')
 check(len(free) == len(ir_free), f'{len(free)} free texts, IR has {len(ir_free)}')
-want_txt = sorted((t.text or '').strip() for t in ir_free)
-got_txt = sorted(t.text_content for t in free)
+# a multi-line text is a Text Frame in Altium and stores its lines CRLF-
+# separated, so both sides are compared line by line
+want_txt = sorted(tuple((t.text or '').strip().splitlines()) for t in ir_free)
+got_txt = sorted(tuple((t.text_content or '').splitlines()) for t in free)
 check(want_txt == got_txt, 'their contents match the IR')
+framed = [t for t in free if getattr(t, 'is_frame', False)]
+check(len(framed) == sum(1 for t in ir_free
+                         if len((t.text or '').strip().splitlines()) > 1),
+      f'{len(framed)} of them are Text Frames — exactly the multi-line ones '
+      '(a String draws one line, a newline in it is a stray glyph)')
 wt = pcb.widestrings_table or {}
 check(all(wt.get(t.widestring_index) == t.text_content for t in free),
       'the WideStrings entry of each agrees with the record')
@@ -373,19 +418,27 @@ check(all(wt.get(t.widestring_index) == t.text_content for t in free),
 sigs = layout.findall('signal')
 net_name = {i: n.name for i, n in enumerate(pcb.nets)}
 print('COPPER')
-check(sorted(net_name.values()) == sorted(s.get('name') for s in sigs),
+check(len(net_name) == len(sigs),
       f'{len(pcb.nets)} nets, IR has {len(sigs)} <signal>')
 
+# By PAD SET, not by name: a net inside a channel is written under the name
+# Altium's own compiler gives it (SW_DCDC1, not the IR's DCDC1:SW), so the
+# spelling legitimately differs while the partition may not.
 want_pads, got_pads = {}, {}
 for s in sigs:
-    want_pads[s.get('name')] = {(r.get('element'), r.get('pad'))
+    want_pads[s.get('name')] = {(inst_of[r.get('element')][1], r.get('pad'))
                                 for r in s.findall('contactref')}
 for p in pcb.pads:
     if p.net_index is None or p.net_index < 0 or p.component_index is None:
         continue
     got_pads.setdefault(net_name.get(p.net_index), set()).add(
         (pcb.components[p.component_index].designator, p.designator))
-bad_net = [n for n in want_pads if want_pads[n] != got_pads.get(n, set())]
+got_sets = {frozenset(v) for v in got_pads.values()}
+# A signal with no <contactref> at all (bare copper) binds no pad, so there
+# is nothing to find on the board side — matching it by pad set would fail on
+# the empty set alone.
+bad_net = [n for n, pads in want_pads.items()
+           if pads and frozenset(pads) not in got_sets]
 check(not bad_net,
       f'{sum(len(v) for v in want_pads.values())} pad-to-net bindings match '
       f'the IR contactrefs (wrong nets: {bad_net[:3]})')
@@ -562,10 +615,8 @@ for b in (pcb.component_bodies or []):
     if b.component_index is not None:
         bodies_of.setdefault(b.component_index, 0)
         bodies_of[b.component_index] += 1
-want_body = [e.get('name') for e in els
-             if instance_footprint(
-                 comp_by_name[inst_by_desig[e.get('name')].get('component')],
-                 inst_by_desig[e.get('name')]).get('name') in modelled]
+want_body = [inst_of[e.get('name')][1] for e in els
+             if fp_of[e.get('name')].get('name') in modelled]
 no_body = [d for d in want_body if not bodies_of.get(index_of[d])]
 print('3D BODIES')
 check(not no_body,
@@ -685,18 +736,66 @@ check(not bad_th,
       f'default (wrong: {bad_th[:3]})')
 
 # --- ECO link --------------------------------------------------------------
+# A component's id is a PATH from the top sheet down (BC2087 ground truth:
+# `\<sheet symbol>\<component>` on a child sheet, `\<component>` at the top),
+# and its room is named in SOURCEHIERARCHICALPATH.
+# ONE child document serves every channel, so a part is keyed by the name it
+# ends up with on the board — the channel format — and not by the canonical
+# designator it wears on the shared sheet (where the module's R1 and the top
+# level's R1 would otherwise collide).
 sch = AltiumSchDoc(str(OUT / f'{NAME}.SchDoc'))
+sch_uid, sch_room, sch_item = {}, {}, {}
 objs = sch.objects
-sch_uid = {d.text: objs[d.owner_index].unique_id for d in sch.designators}
+for d in sch.designators:
+    owner = objs[d.owner_index]
+    sch_uid[d.text] = '\\' + owner.unique_id
+    sch_room[d.text] = 'TopLevel'
+    sch_item[d.text] = owner.design_item_id
+_child_cache = {}
+for ss in sch.sheet_symbols:
+    fname = ss.file_name.text
+    child = _child_cache.setdefault(fname, AltiumSchDoc(str(OUT / fname)))
+    cobjs = child.objects
+    room = ss.sheet_name.text
+    for d in child.designators:
+        name = channel_designator(room, d.text)
+        owner = cobjs[d.owner_index]
+        sch_uid[name] = f'\\{ss.unique_id}\\{owner.unique_id}'
+        sch_room[name] = f'TopLevel\\{room}'
+        sch_item[name] = owner.design_item_id
 print('ECO LINK')
-linked = [c.designator for c in pcb.components if c.source_unique_id]
-check(len(linked) == len(pcb.components),
-      f'{len(linked)}/{len(pcb.components)} components carry SOURCEUNIQUEID')
+# A board-only element (Eagle logo: no part in the schematic) is a PCB-only
+# component in Altium and carries no link BY DEFINITION — the link is owed
+# by everything that does have a schematic instance.
+want_link = {inst_of[e.get('name')][1] for e in els
+             if inst_of[e.get('name')][0] is not None}
+linked = {c.designator for c in pcb.components if c.source_unique_id}
+check(want_link <= linked,
+      f'{len(linked)}/{len(pcb.components)} components carry SOURCEUNIQUEID, '
+      f'every schematic-born one among them '
+      f'(missing: {sorted(want_link - linked)[:5]})')
 bad = [c.designator for c in pcb.components
        if sch_uid.get(c.designator) and c.source_unique_id != sch_uid[c.designator]]
-check(not bad, f'SOURCEUNIQUEID matches the SchDoc component (bad: {bad[:5]})')
+check(not bad, f'SOURCEUNIQUEID is the path down to the SchDoc component '
+               f'(bad: {bad[:5]})')
+bad_room = [c.designator for c in pcb.components
+            if sch_room.get(c.designator)
+            and c.raw_record.get('SOURCEHIERARCHICALPATH') != sch_room[c.designator]]
+check(not bad_room,
+      f'SOURCEHIERARCHICALPATH names the sheet the component lives on '
+      f'(bad: {bad_room[:5]})')
 check(all(c.source_designator == c.designator for c in pcb.components),
       'SOURCEDESIGNATOR matches the designator')
+# Altium compares Design Item IDs on ECO, and the board states it in
+# SOURCELIBREFERENCE. Sending the SchLib entry name (`C`) instead of the
+# DbLib part number (`C_C0603`) made the first real ECO offer to change the
+# item id of every part on the board.
+bad_item = [c.designator for c in pcb.components
+            if c.designator in sch_item
+            and c.raw_record.get('SOURCELIBREFERENCE') != sch_item[c.designator]]
+check(not bad_item,
+      f'SOURCELIBREFERENCE is the schematic component\'s Design Item ID '
+      f'(bad: {bad_item[:5]})')
 
 print()
 print('BOARD VERIFY: ' + ('OK' if not fails else f'{len(fails)} FAILURE(S)'))

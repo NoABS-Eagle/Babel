@@ -51,6 +51,53 @@ def rotate_port_side(side, coord_um, rot_deg, mirror):
     return _ANGLE_SIDE[new_theta], sign * coord_um
 
 
+def flat_designator(minst_el, part_name):
+    """The GLOBAL designator of a component placed inside a module instance.
+
+    Two spellings, one rule (ir_schema.md "Модуль", `offset`): numeric when
+    the module instance carries `offset=` (C1 @ offset 100 -> C101, Eagle's
+    own mechanism), the native `INST:REFDES` colon form otherwise. Every
+    consumer MUST use this one function — the board designator, the
+    schematic designator and the flattened name each exporter writes have to
+    agree, or the target tool's own consistency check (Eagle) / ECO
+    (Altium) reports the same part twice under two names.
+    """
+    offset = (minst_el.get('offset') or '0') if minst_el is not None else '0'
+    if offset != '0':
+        m = re.match(r'^(.*?)(\d+)$', part_name)
+        if m:
+            return f'{m.group(1)}{int(m.group(2)) + int(offset)}'
+    return f'{minst_el.get("name")}:{part_name}'
+
+
+def designator_resolver(root):
+    """`f(address) -> (schematic <instance>, designator)` for one project.
+
+    An IR layout `<element name=>` addresses either a top-level instance
+    (`R1`) or a part inside a module instance (`INST:REFDES`); the returned
+    designator is the flattened spelling from flat_designator().
+    """
+    sch_el = root.find('schematic')
+    inst_by_name = {}
+    for i in (sch_el.findall('instance') if sch_el is not None else []):
+        inst_by_name.setdefault(i.get('name'), i)
+    module_by_name = {m.get('name'): m for m in root.findall('module')}
+
+    def resolve(address):
+        if ':' not in address:
+            return inst_by_name.get(address), address
+        minst_name, part_name = address.split(':', 1)
+        minst = inst_by_name.get(minst_name)
+        mod = module_by_name.get(minst.get('module')) if minst is not None else None
+        if mod is None:
+            return None, address
+        part_inst = next((i for i in mod.findall('instance')
+                          if i.get('name') == part_name), None)
+        return part_inst, flat_designator(minst, part_name)
+
+    return resolve
+
+
 # ---------------------------------------------------------------------------
 # Arc math (ir_schema.md "<arc>"): the CANONICAL arc form is ENDPOINTS +
 # curve angle (x1 y1 x2 y2 curve, degrees CCW+, positive = center to the

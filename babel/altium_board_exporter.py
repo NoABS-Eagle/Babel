@@ -53,11 +53,12 @@ from altium_monkey.altium_record_types import PcbLayer
 from babel import import_log
 from babel import altium_layers
 from babel.altium_exporter import (DRC_RULES, _altium_arc_angles,
-                                   _pcb_justif, _pcb_layer, mark_keepout,
+                                   _pcb_justif, _pcb_layer, fp_name,
+                                   mark_keepout, stroke_box,
                                    npth_pad_kwargs, shape_primitives,
                                    target_layer)
 from babel.ir_util import (LAYER_DIMENSION, arc_center, arc_params,
-                           chain_loops,
+                           chain_loops, designator_resolver,
                            instance_footprint, offset_contour, parse_stack,
                            resolved_attrs)
 
@@ -266,6 +267,32 @@ def _fix_placed_fills(builder, idx, footprint, position_mils, alt_rot, bottom):
 _PLACEHOLDER_SLOT = {'>NAME': 'is_designator', '>VALUE': 'is_comment'}
 
 
+# Which placeholder governs which visibility flag on the placed component.
+_PLACEHOLDER_FLAG = {'>NAME': 'NAMEON', '>VALUE': 'COMMENTON'}
+
+
+def _apply_text_visibility(builder, idx, el, fp_el):
+    """Show a component's designator/comment only where the IR says so.
+
+    What is DRAWN is what the FOOTPRINT declares as a placeholder
+    (`>NAME`/`>VALUE`); the element may hide it (Eagle smash + hide). Altium
+    expresses this as NAMEON/COMMENTON on the component, and the text object
+    itself STAYS: deleting it makes Altium invent a replacement and draw
+    "Designator1" next to the part (seen on step4's SCR1 — a screw whose
+    footprint declares nothing).
+    """
+    hidden_here = 0
+    for content, flag in _PLACEHOLDER_FLAG.items():
+        hidden = any((t.text or '').strip() == content and t.get('hidden') == 'yes'
+                     for t in el.findall('text'))
+        shown = (not hidden) and any(
+            (t.text or '').strip() == content
+            for t in list(fp_el.findall('text')) + list(el.findall('text')))
+        builder.components[idx].raw_record[flag] = 'TRUE' if shown else 'FALSE'
+        hidden_here += 0 if shown else 1
+    return hidden_here
+
+
 def _text_stroke_mils(t_el, height_mils):
     """IR `ratio` (stroke thickness as a % of height, Eagle's own field) ->
     Altium stroke width. No ratio -> Altium's usual 10%."""
@@ -306,8 +333,9 @@ def _apply_text_overrides(builder, idx, el, fp_el, position_mils, alt_rot,
         if target is None:
             continue
         if ov.get('hidden') == 'yes':
-            builder.texts.remove(target)
-            moved += 1
+            # visibility is a flag on the component (_apply_text_visibility),
+            # never a missing object — Altium replaces a missing designator
+            # with one of its own
             continue
         if ov.get('x') is None:            # nothing moved — the clone is right
             continue
@@ -413,6 +441,21 @@ def _emit_holes(builder, layout_el, dx_um, dy_um):
     return n
 
 
+def _multiline(text, height_mils):
+    """(content, frame size) for one IR text.
+
+    A PCB String draws ONE line: a newline inside it renders as a stray glyph,
+    not as a second line. Altium's multi-line object is the same String with
+    `is_frame` set, its lines separated by CRLF and a text box around them
+    (ground truth: PiMX8MPIODB_r0.1.PcbDoc, a licence notice stored exactly
+    that way). Single-line text keeps the plain String — nothing to frame.
+    """
+    lines = (text or '').strip().splitlines()
+    if len(lines) < 2:
+        return (text or '').strip(), None
+    return '\r\n'.join(lines), stroke_box(lines, height_mils)
+
+
 def _emit_free_texts(builder, layout_el, dx_um, dy_um, layer_plan):
     """Board-level <text> — silkscreen labels that belong to the board, not
     to any footprint."""
@@ -425,8 +468,9 @@ def _emit_free_texts(builder, layout_el, dx_um, dy_um, layer_plan):
                            f'text {(t.text or "").strip()!r} dropped')
             continue
         height = _mil(t.get('size', '1000'))
+        content, frame_size = _multiline(t.text, height)
         builder.add_text(
-            text=(t.text or '').strip(),
+            text=content,
             position_mils=(_mil(float(t.get('x', 0)) + dx_um),
                            _mil(float(t.get('y', 0)) + dy_um)),
             height_mils=height,
@@ -435,6 +479,8 @@ def _emit_free_texts(builder, layout_el, dx_um, dy_um, layer_plan):
             stroke_width_mils=_text_stroke_mils(t, height),
             is_mirrored=t.get('mirror') == '1',
             text_justification=int(_pcb_justif(t.get('align'))),
+            is_frame=frame_size is not None,
+            frame_size_mils=frame_size,
         )
         n += 1
     return n
@@ -482,12 +528,12 @@ def _clear_pour_membership(builder):
                 p.polygon_index = _NO_POLYGON
 
 
-def _pad_nets(layout_el):
+def _pad_nets(layout_el, net_names):
     """{designator: {pad: net}} — the <contactref> half of a signal, which is
     what actually binds a placed pad to its net in the PcbDoc."""
     out = {}
     for sig in layout_el.findall('signal'):
-        net = sig.get('name')
+        net = net_names(sig.get('name'))
         for ref in sig.findall('contactref'):
             out.setdefault(ref.get('element'), {})[ref.get('pad')] = net
     return out
@@ -531,14 +577,14 @@ def _polygon_vertices(vs, width_um, dx_um, dy_um, where):
     return out
 
 
-def _emit_copper(builder, layout_el, dx_um, dy_um, n_copper):
+def _emit_copper(builder, layout_el, dx_um, dy_um, n_copper, net_names):
     """Tracks, arcs, vias and pours of every <signal>. The nets themselves
     are created BEFORE the components are placed (a pad binds to a net by
     name), so this only draws."""
     n = {'track': 0, 'arc': 0, 'via': 0, 'poly': 0}
     pours = []
     for sig in layout_el.findall('signal'):
-        net = sig.get('name')
+        net = net_names(sig.get('name'))
         for el in sig:
             if el.tag == 'line':
                 builder.add_track(
@@ -702,23 +748,26 @@ def _build_rules(builder, layout_el, pour_names):
         kind = rec.get('RULEKIND')
         if kind not in DRC_RULES:
             continue
-        attr, field = DRC_RULES[kind]
-        if attr not in attrs or rec.get('SCOPE1EXPRESSION') != 'All' \
-                or rec.get('SCOPE2EXPRESSION') != 'All':
-            continue
-        rec[field] = _dr_mil(attrs[attr])
-        if kind == 'Clearance':
+        if kind == 'Clearance' and 'OBJECTCLEARANCES' in rec:
             # The stock rule carries a per-object-pair table in which EVERY
             # "...-to-Hole" pair is 0 — i.e. copper may touch a drilled hole.
             # That is what shorted the pours onto tolmach's four mounting
             # holes (netless unplated pads, so different nets by definition).
             # Neither real board in testData carries the field at all: it is
             # a later addition, and without it the plain GAP applies to holes
-            # like it does to everything else.
-            rec.pop('OBJECTCLEARANCES', None)
-        # A record whose fields we touched must NOT keep its original bytes:
-        # AltiumPcbRule passes the raw payload straight through whenever it
-        # still matches, and the edit would vanish silently.
+            # like it does to everything else. Dropped whether or not the IR
+            # supplies its own numbers — a source with no <rules> (every
+            # KiCad-born project today) must not inherit the short either.
+            rec.pop('OBJECTCLEARANCES')
+            # A record whose fields we touched must NOT keep its original
+            # bytes: AltiumPcbRule passes the raw payload straight through
+            # whenever it still matches, and the edit would vanish silently.
+            entry[2] = b''
+        attr, field = DRC_RULES[kind]
+        if attr not in attrs or rec.get('SCOPE1EXPRESSION') != 'All' \
+                or rec.get('SCOPE2EXPRESSION') != 'All':
+            continue
+        rec[field] = _dr_mil(attrs[attr])
         entry[2] = b''
         if kind == 'Clearance':
             rec['GENERICCLEARANCE'] = rec[field]
@@ -882,14 +931,28 @@ def _log_deferred(layout_el, loop_ids):
 # Entry point
 # ---------------------------------------------------------------------------
 
-def export_board(ir_root, out_dir, proj_name, pcblib_path, sch_link=None):
+def export_board(ir_root, out_dir, proj_name, pcblib_path, sch_link=None,
+                 hier=None, desig_of=None, net_names=None):
     """One IR <layout> -> <proj_name>.PcbDoc in out_dir. Returns the path, or
     None when the project carries no layout.
 
-    sch_link: {designator: (unique_id, lib_reference, library_name)} taken
-    from the components the SchDoc export actually placed — what makes Altium
-    treat the two documents as the SAME design rather than two unrelated
-    files."""
+    sch_link: {element address: (unique_id, lib_reference, library_name)}
+    taken from the components the SchDoc export actually placed — what makes
+    Altium treat the two documents as the SAME design rather than two
+    unrelated files.
+    hier: {room name: sheet symbol unique id} — a part on a channel is
+    identified by a PATH, not by its own id (BC2087 ground truth:
+    SOURCEUNIQUEID `\\<sheet symbol>\\<component>`, SOURCEHIERARCHICALPATH
+    `TopLevel\\<room>`); with ONE shared child sheet the component's own id is
+    the same in every channel, and the sheet symbol's id is what separates
+    them.
+    desig_of: {element address: designator} — on the Altium path a channel
+    part is named by the project's channel format
+    (altium_exporter.channel_designator), not by the IR's Eagle-style
+    flattening. Absent (standalone board export) the IR spelling stands.
+    net_names: {IR signal name: name to write} — same story for the nets of a
+    channel, taken from the compiler rather than guessed
+    (altium_project_exporter._compiled_net_names)."""
     layouts = ir_root.findall('layout')
     if not layouts:
         return None
@@ -900,6 +963,8 @@ def export_board(ir_root, out_dir, proj_name, pcblib_path, sch_link=None):
     layout_el = layouts[0]
     layout_name = layout_el.get('name', 'main')
     sch_link = sch_link or {}
+    hier = hier or {}
+    desig_of = desig_of or {}
 
     out_dir = Path(out_dir)
     pcblib_path = Path(pcblib_path)
@@ -907,10 +972,17 @@ def export_board(ir_root, out_dir, proj_name, pcblib_path, sch_link=None):
     fp_by_name = {fp.name: fp for fp in lib.footprints}
 
     comp_by_name = {c.get('name'): c for c in ir_root.findall('component')}
-    sch_el = ir_root.find('schematic')
-    inst_by_desig = {i.get('name'): i
-                     for i in (sch_el.findall('instance')
-                               if sch_el is not None else [])}
+    # Footprints the LAYOUT owns: a board-only padless element (Eagle logo)
+    # has no component to hold its footprint.
+    local_fp = {f.get('name'): f for f in layout_el.findall('footprint')}
+    # An element addresses either a top-level instance or a part inside a
+    # module instance ('INST:REFDES'); both the designator written here and
+    # the one the SchDoc export wrote come from the same rule.
+    resolve_element = designator_resolver(ir_root)
+    # Nets keep their IR spelling unless the caller hands over the compiler's
+    # names — a board exported on its own has no project to compile.
+    _renames = net_names or {}
+    net_names = lambda n: _renames.get(n, n)
 
     # --- outline first: it fixes the translation everything else uses
     segs = _outline_segments(layout_el)
@@ -932,26 +1004,38 @@ def export_board(ir_root, out_dir, proj_name, pcblib_path, sch_link=None):
 
     # --- nets BEFORE the components: a placed pad binds to its net by name
     for sig in layout_el.findall('signal'):
-        builder.add_net(sig.get('name'))
-    pad_nets = _pad_nets(layout_el)
+        builder.add_net(net_names(sig.get('name')))
+    pad_nets = _pad_nets(layout_el, net_names)
 
     # --- components
-    n_bottom = n_moved = 0
+    n_bottom = n_moved = n_hidden = 0
     for el in layout_el.findall('element'):
-        desig = el.get('name')
-        inst = inst_by_desig.get(desig)
+        address = el.get('name')
+        inst, desig = resolve_element(address)
+        desig = desig_of.get(address, desig)
         if inst is None:
-            raise ValueError(f'layout element {desig!r}: no <instance> with '
-                             'that designator — board and schematic disagree')
-        comp_el = comp_by_name.get(inst.get('component'))
-        if comp_el is None:
-            raise ValueError(f'element {desig!r}: component '
-                             f'{inst.get("component")!r} not in the pool')
-        fp_el = instance_footprint(comp_el, inst)
-        if fp_el is None:
-            raise ValueError(f'element {desig!r}: component '
-                             f'{comp_el.get("name")!r} has no footprint')
-        fp = fp_by_name.get(fp_el.get('name'))
+            # A BOARD-ONLY element (Eagle artwork/logo: padless, no part in
+            # the schematic) carries its footprint in the LAYOUT itself.
+            # Altium places it as a PCB-only component — no ECO link, which
+            # is exactly what it is.
+            fp_el = local_fp.get(el.get('footprint'))
+            if fp_el is None:
+                raise ValueError(
+                    f'layout element {address!r}: no <instance> with that '
+                    'designator and no layout-local <footprint '
+                    f'name="{el.get("footprint")}"> — board and schematic '
+                    'disagree')
+            comp_el = None
+        else:
+            comp_el = comp_by_name.get(inst.get('component'))
+            if comp_el is None:
+                raise ValueError(f'element {desig!r}: component '
+                                 f'{inst.get("component")!r} not in the pool')
+            fp_el = instance_footprint(comp_el, inst)
+            if fp_el is None:
+                raise ValueError(f'element {desig!r}: component '
+                                 f'{comp_el.get("name")!r} has no footprint')
+        fp = fp_by_name.get(fp_name(fp_el))
         if fp is None:
             raise ValueError(f'element {desig!r}: footprint '
                              f'{fp_el.get("name")!r} is not in '
@@ -963,7 +1047,8 @@ def export_board(ir_root, out_dir, proj_name, pcblib_path, sch_link=None):
         rot = (ir_rot + 180) % 360 if bottom else ir_rot
         if bottom:
             n_bottom += 1
-        value = resolved_attrs(comp_el, inst, fp_el).get('value', '')
+        value = ('' if comp_el is None
+                 else resolved_attrs(comp_el, inst, fp_el).get('value', ''))
         position_mils = (_mil(float(el.get('x', 0)) + dx_um),
                          _mil(float(el.get('y', 0)) + dy_um))
 
@@ -977,25 +1062,45 @@ def export_board(ir_root, out_dir, proj_name, pcblib_path, sch_link=None):
             comment_text=value or None,
             comment_visible=False,
             source_pcblib=lib,
-            pad_nets=pad_nets.get(desig),
+            pad_nets=pad_nets.get(address),   # <contactref> speaks addresses
         )
         _fix_placed_fills(builder, idx, fp, position_mils, rot, bottom)
         n_moved += _apply_text_overrides(builder, idx, el, fp_el,
                                          position_mils, rot, bottom)
+        n_hidden += _apply_text_visibility(builder, idx, el, fp_el)
 
         # --- the ECO link. place_footprint has no parameter for it (only the
         # geometry-less add_component has), so the fields are written onto the
         # component record the same way altium_monkey's own
         # set_component_description does — raw_record IS the serialized form.
-        uid, lib_ref, lib_name = sch_link.get(desig, ('', '', ''))
+        uid, lib_ref, lib_name = sch_link.get(address, ('', '', ''))
         rec = builder.components[idx].raw_record
         rec['SOURCEDESIGNATOR'] = desig
         if uid:
-            rec['SOURCEUNIQUEID'] = uid
+            # A part on a child sheet is identified by its PATH from the top:
+            # `\<sheet symbol uid>\<component uid>`, and its room is named in
+            # SOURCEHIERARCHICALPATH — BC2087 ground truth. Top-level parts
+            # keep the single-segment form Altium writes for them.
+            room = address.split(':', 1)[0] if ':' in address else None
+            ss_uid = hier.get(room)
+            path = [uid] if ss_uid is None else [ss_uid, uid]
+            rec['SOURCEUNIQUEID'] = ''.join('\\' + p for p in path)
+            rec['SOURCEHIERARCHICALPATH'] = ('TopLevel' if room is None
+                                             else f'TopLevel\\{room}')
         else:
-            import_log.log(desig, '', 'no schematic UniqueID for this '
-                           'element — Altium will see the component as '
-                           'PCB-only until the next ECO')
+            # Eagle lets an element live on the board alone; Altium's
+            # synchronization model does not, so every ECO will offer to
+            # remove it. The project-wide cure (ECO Generation -> Remove
+            # Components -> Ignore Differences) is worse than the disease: it
+            # silences EVERY component removal, so a part deleted from the
+            # schematic would silently stay on the board. Left to the user to
+            # untick — user decision 2026-07-30.
+            import_log.log(desig, '', 'PCB-ONLY element (no part in the '
+                           'schematic): Altium has no such concept, so every '
+                           '"Update PCB" will offer to remove it. Untick that '
+                           'line. Do NOT set ECO Generation -> Remove '
+                           'Components -> Ignore Differences to hide it: that '
+                           'switch also hides REAL deletions')
         if lib_ref:
             rec['SOURCELIBREFERENCE'] = lib_ref
         if lib_name:
@@ -1009,7 +1114,8 @@ def export_board(ir_root, out_dir, proj_name, pcblib_path, sch_link=None):
     n_free = _emit_free_texts(builder, layout_el, dx_um, dy_um, layer_plan)
     n_holes = _emit_holes(builder, layout_el, dx_um, dy_um)
     n_cu, pours = _emit_copper(builder, layout_el, dx_um, dy_um,
-                               len(parse_stack(layout_el.get('stack'))[0]))
+                               len(parse_stack(layout_el.get('stack'))[0]),
+                               net_names)
     n_rules, n_connect = _build_rules(builder, layout_el, pours)
 
     counts = _log_deferred(layout_el, outline_ids | drawn_ids)
@@ -1023,7 +1129,9 @@ def export_board(ir_root, out_dir, proj_name, pcblib_path, sch_link=None):
           f'{len(layout_el.findall("element"))} components '
           f'({n_bottom} on the bottom side), '
           f'stack {layout_el.get("stack")}')
-    print(f'  {n_moved} per-instance text override(s), '
+    print(f'  {n_moved} per-instance text override(s), {n_hidden} '
+          f'designator/comment text(s) hidden (no placeholder in the '
+          f'footprint), '
           f'{n_free} board-level text(s), {n_gfx} board-level graphic(s), '
           f'{n_holes} mounting hole(s)')
     print(f'  {len(layout_el.findall("signal"))} nets: {n_cu["track"]} track(s), '
