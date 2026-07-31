@@ -4,6 +4,7 @@ import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from babel.ir_util import (parse_layer, symbol_pool, component_gates,
+                           footprint_pool, model3d_dialog_rotation,
                            resolve_model3d_file, sanitize_filename, arc_mid,
                            instance_footprint)
 from babel.kicad_layers import ir_to_kicad
@@ -70,39 +71,15 @@ def model3d_kicad_xyz(m3):
     frame, so there is no Y mirror here (ground truth: maximus DD1 ty=+7
     / XS1 ty=+9.5 visually confirmed in KiCad, 2026-07-15).
 
-    Rotation: IR composes intrinsic Rx*Ry*Rz (ir_schema.md "Соглашение о
-    размещении модели"); KiCad's file stores the NEGATED angles of a
-    Rz*Ry*Rx composition (the footprint-properties dialog shows them
-    un-negated). Pure-Z rotations coincide in both orders — which is why a
-    naive per-axis sign flip looked right on every flat part and only a
-    genuinely two-axis model (maximus DD1: IR (0,-90,-90) must become
-    dialog (90,0,-90)) exposed the difference. General case: build the IR
-    matrix, re-decompose in KiCad's order.
+    Rotation: ir_util.model3d_dialog_rotation gives the angles a model
+    dialog shows (same law in KiCad and in Altium); KiCad's FILE stores them
+    NEGATED.
     """
     tx = float(m3.get('tx', 0)) / 1000
     ty = float(m3.get('ty', 0)) / 1000
     tz = float(m3.get('tz', 0)) / 1000
-    ex, ey, ez = (math.radians(float(m3.get(k, 0))) for k in ('rx', 'ry', 'rz'))
-    cx, sx = math.cos(ex), math.sin(ex)
-    cy, sy = math.cos(ey), math.sin(ey)
-    cz, sz = math.cos(ez), math.sin(ez)
-    # R = Rx(ex) @ Ry(ey) @ Rz(ez), row-major
-    r00 = cy * cz
-    r01 = -cy * sz
-    r10 = cx * sz + sx * sy * cz
-    r11 = cx * cz - sx * sy * sz
-    r20 = sx * sz - cx * sy * cz
-    r21 = sx * cz + cx * sy * sz
-    r22 = cx * cy
-    # decompose R = Rz(g) @ Ry(b) @ Rx(a):  R[2][0] = -sin b
-    if abs(r20) < 1 - 1e-9:
-        a = math.degrees(math.atan2(r21, r22))
-        b = math.degrees(math.asin(-r20))
-        g = math.degrees(math.atan2(r10, r00))
-    else:                        # gimbal lock: b = ±90, split a=0
-        a = 0.0
-        b = 90.0 if r20 < 0 else -90.0
-        g = math.degrees(math.atan2(-r01, r11))
+    a, b, g = model3d_dialog_rotation(m3)
+
     def _n(v):                   # negate for the file, normalize -180..180
         v = -v % 360
         return v - 360 if v > 180 else v
@@ -365,7 +342,11 @@ def export_symbol(comp_el, root, lib_name, variant_fp=None, sym_name=None):
     # duplicated identically across gates, see progress.md item 10).
     sym_el = gate_syms[0][1]
 
-    fp_ref     = f'{lib_name}:{sanitize_filename(fps[0].get("name", ""))}' if len(fps) == 1 else ''
+    # The entry NAME, not the IR name: diverging same-named land patterns
+    # get an `@N` suffix in the one project library (footprint_pool), and the
+    # symbol has to point at the copy this component actually uses.
+    _fp_pool = footprint_pool(root)
+    fp_ref = f'{lib_name}:{sanitize_filename(_fp_pool.get(id(fps[0]), fps[0].get("name", "")))}'         if len(fps) == 1 else ''
     pin_to_pad = _build_pin_map(fps[0] if fps else None, gate_syms[0][0])
 
     # Component-level attrs are FAMILY facts — uniform across variants by
@@ -832,10 +813,21 @@ def export(ir_path, output_dir=None, lib_name=None, skip_components=None):
 
     seen = set()
     n_models = 0
+    # ONE library for the whole project keys its entries by NAME, while the
+    # IR nests a private copy of the footprint under every component. Two
+    # source libraries can offer the same name with DIFFERENT land patterns
+    # (tolmach's R1206 in Eagle's own `rc` and `rc@1`), so the diverging
+    # copies take Eagle's own `@N` suffix instead of silently overwriting
+    # each other — same rule the symbol pool follows on import.
+    pool = footprint_pool(root)
 
     def _write_fp(fp_el):
         nonlocal n_models
-        fp_id = fp_el.get('name')
+        fp_id = pool.get(id(fp_el), fp_el.get('name'))
+        if fp_id != fp_el.get('name'):
+            import_log.log(fp_el.get('name'), '',
+                           'FOOTPRINT name collision (diverged land pattern), '
+                           'written as', fp_id)
         if fp_id in seen:
             return
         seen.add(fp_id)

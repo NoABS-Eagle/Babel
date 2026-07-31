@@ -21,7 +21,8 @@ from altium_monkey.altium_sch_svg_renderer import LINE_WIDTH_MILS
 from babel import import_log
 from babel import altium_layers
 from babel.ir_util import (LAYER_DIMENSION, arc_params, chain_loops,
-                           component_gates, flatten_loop, is_multi_gate,
+                           component_gates, flatten_loop, footprint_users,
+                           is_multi_gate, model3d_dialog_rotation,
                            offset_contour, parse_layer, resolve_model3d_file,
                            sanitize_filename)
 
@@ -1250,7 +1251,16 @@ def _board_cutouts(fp_el, fp):
     return consumed
 
 
-def _export_footprint(fp_el, pcblib, layer_plan, step_dir=None):
+def _export_footprint(fp_el, pcblib, layer_plan, step_dir=None, user=None):
+    """One IR <footprint> -> a PcbLib entry.
+
+    `user`: a designator that carries this footprint on the board, or None
+    when no element does (a library variant nothing selects). It rides along
+    only so a log line names a PLACE and not just a library entry — a
+    footprint name alone leaves you searching the board by eye.
+    """
+    where = '%s (used by %s)' % (fp_el.get('name', ''),
+                                 user or 'no element on the board')
     fp = pcblib.add_footprint(fp_name(fp_el))
     cut = _board_cutouts(fp_el, fp)
 
@@ -1269,7 +1279,7 @@ def _export_footprint(fp_el, pcblib, layer_plan, step_dir=None):
                 # Every branch below is guarded by `pcb_layer is not None`,
                 # so an IR layer missing from the table used to vanish in
                 # silence — the one thing this project does not do.
-                import_log.log(fp_el.get('name', ''), tag,
+                import_log.log(where, tag,
                                'no Altium layer for IR layer',
                                str(child.get('layer')))
 
@@ -1384,9 +1394,13 @@ def _export_footprint(fp_el, pcblib, layer_plan, step_dir=None):
                       float(v.get('curve', 0) or 0))
                      for v in child.findall('vertex')]
             width = float(child.get('width', 0) or 0)
-            # A contour needs three corners to enclose anything; two-vertex
-            # "polygons" exist in real libraries (a degenerate leftover) and
-            # the pen model cannot offset them.
+            # Two vertices enclose nothing only while BOTH edges are straight.
+            # One curved edge and the closing chord make a circular segment —
+            # a real area, and real libraries carry them (CAP_SMD_6.3X7.7 of
+            # Base draws its polarity mark that way: a 4300 µm chord and an
+            # 88.58° arc, 2.6 mm²). ir_util.offset_contour's pen model needs
+            # three corners, so such a contour is not exported yet; it is
+            # skipped as UNSUPPORTED, not as empty.
             pts = []
             if len(verts) >= 3:
                 loop = [(x1, y1, x2, y2, c) for _kind, x1, y1, x2, y2, c
@@ -1398,10 +1412,15 @@ def _export_footprint(fp_el, pcblib, layer_plan, step_dir=None):
                                     kind=PcbRegionKind.COPPER)
                 if keepout:
                     mark_keepout(rec)
+            elif len(verts) == 2 and any(c for _x, _y, c in verts):
+                import_log.log(where, tag,
+                               'POLYGON is an arc and its chord (2 vertices, '
+                               'one of them curved) — a real area the pen '
+                               'model cannot offset yet, NOT exported')
             else:
-                import_log.log(fp_el.get('name', ''), tag,
-                               f'POLYGON has {len(verts)} vertices, nothing '
-                               'to fill — dropped')
+                import_log.log(where, tag,
+                               f'POLYGON has {len(verts)} vertices and no '
+                               'curve — encloses nothing, dropped')
 
         elif tag == 'arc' and pcb_layer is not None:
             p = arc_params(float(child.get('x1', 0)), float(child.get('y1', 0)),
@@ -1424,7 +1443,7 @@ def _export_footprint(fp_el, pcblib, layer_plan, step_dir=None):
             # Nothing may leave the footprint in silence: <polygon> did for a
             # long time, and two Eagle logos arrived in Altium as empty
             # components because of it.
-            import_log.log(fp_el.get('name', ''), tag,
+            import_log.log(where, tag,
                            'FOOTPRINT primitive not exported')
 
     # 3D model — embed STEP file if available
@@ -1434,12 +1453,19 @@ def _export_footprint(fp_el, pcblib, layer_plan, step_dir=None):
         if step_path is not None:
             fname = step_path.name
             try:
+                # NOT the IR angles per axis: Altium's model dialog states a
+                # Rz*Ry*Rx composition, the IR an Rx*Ry*Rz one, and the two
+                # coincide only for pure-Z rotations. DD1 of Base (LQFP100)
+                # is IR (0, -90, -90) and stood wrong until the user entered
+                # (90, 0, -90) by hand — exactly what the shared law gives,
+                # and exactly what the KiCad path has used since 2026-07-15.
+                rot_x, rot_y, rot_z = model3d_dialog_rotation(m3d)
                 model = pcblib.add_embedded_model(
                     name               = fname,
                     model_data         = step_path.read_bytes(),
-                    rotation_x_degrees = float(m3d.get('rx', 0)),
-                    rotation_y_degrees = float(m3d.get('ry', 0)),
-                    rotation_z_degrees = float(m3d.get('rz', 0)),
+                    rotation_x_degrees = rot_x,
+                    rotation_y_degrees = rot_y,
+                    rotation_z_degrees = rot_z,
                     z_offset_mils      = round(float(m3d.get('tz', 0)) / 25.4),
                 )
                 fp.add_embedded_3d_model(
@@ -1498,6 +1524,7 @@ def export(ir_path, output_dir=None):
     layer_plan, layer_pairs = altium_layers.plan(altium_layers.layers_used(ir_root))
     altium_layers.declare(pcblib, layer_plan, layer_pairs)
     seen_fp: set[str] = set()
+    fp_users = footprint_users(ir_root)
     step_dir = Path(ir_path).parent / Path(ir_path).stem
     # A board-only padless element (Eagle artwork/logo) has no component:
     # its footprint hangs on the LAYOUT, and the PcbDoc still places it.
@@ -1508,7 +1535,8 @@ def export(ir_path, output_dir=None):
             if fp_id not in seen_fp:
                 seen_fp.add(fp_id)
                 _export_footprint(fp_el, pcblib, layer_plan,
-                                  step_dir=step_dir)
+                                  step_dir=step_dir,
+                                  user=fp_users.get(fp_id))
     pcblib.save(pcb_path)
     print(f'Written: {pcb_path}  ({len(seen_fp)} footprints)')
 

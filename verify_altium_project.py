@@ -48,7 +48,13 @@ def pin_key(desig, pin):
     return desig, str(pin)
 
 
-ir = ET.parse(OUT / f'{NAME}.swprj').getroot()
+# The IR is a separate result of the run, next to the project folder
+# (`ir_<name>/`); older runs left it inside, or beside the project files.
+_ir_path = next((p for p in (OUT.parent / f'ir_{NAME}' / f'{NAME}.swprj',
+                             OUT / 'ir' / f'{NAME}.swprj',
+                             OUT / f'{NAME}.swprj') if p.exists()),
+                OUT / f'{NAME}.swprj')
+ir = ET.parse(_ir_path).getroot()
 sch = ir.find('schematic')
 modules = {m.get('name'): m for m in ir.findall('module')}
 minsts = [i for i in sch.findall('instance') if i.get('module')]

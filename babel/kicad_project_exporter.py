@@ -39,9 +39,10 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from babel import import_log
-from babel.ir_util import (symbol_pool, component_gates, sanitize_filename,
-                            rotate_port_side, arc_mid, instance_designator,
-                            resolved_attrs, instance_footprint)
+from babel.ir_util import (symbol_pool, component_gates, footprint_pool,
+                            sanitize_filename, rotate_port_side, arc_mid,
+                            instance_designator, resolved_attrs,
+                            instance_footprint)
 from babel.kicad_schematic import _collinear_between, field_to_kicad
 from babel.kicad_exporter import (
     export as export_library, export_symbol,
@@ -259,7 +260,7 @@ def _emit_property(lines, name, value, ax, ay, rot, size_mm, align, hide,
 
 def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
                           ns, unit_n, gate_sym_name, sym_uuid_sink=None,
-                          module_placements=None):
+                          module_placements=None, fp_pool=None):
     """One IR component <instance> -> one placed `(symbol ...)` block.
 
     `module_placements` (module subsheet symbols only): a list of
@@ -271,6 +272,7 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
     INST:REFDES colon composite). None/empty → the flat single-path form."""
     designator = inst_el.get('name')
     comp_name = comp_el.get('name')
+    fp_pool = fp_pool or {}
     if needs_variant_split(comp_el):
         # divergent per-variant pin numbering: the placement references the
         # atomic split symbol of ITS OWN variant (see
@@ -327,16 +329,24 @@ def _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name, proj_name,
     # recorded, the single footprint otherwise, '' for footprint-less.
     fps = comp_el.findall('footprint')
     inst_fp = inst_el.get('footprint')
+    # The LIBRARY ENTRY name, not the IR name: two source libraries can offer
+    # the same footprint name with different land patterns, and the diverging
+    # copy is written under `@N` (ir_util.footprint_pool). The symbol has to
+    # name the entry its own copy became, or the board and the schematic
+    # disagree about which pattern this part uses.
+    def _entry(fp_el):
+        return sanitize_filename(fp_pool.get(id(fp_el), fp_el.get('name', '')))
+
     if inst_fp:
         # the recorded key is the footprint NAME or, for ambiguous package
         # names (one package backing several devices), the VARIANT — resolve
         # to the real package name either way
-        fp_name = next((fp.get('name') for fp in fps
-                        if inst_fp in (fp.get('variant'), fp.get('name'))),
-                       inst_fp)
-        fp_ref = f'{lib_name}:{sanitize_filename(fp_name)}'
+        fp_el = next((fp for fp in fps
+                      if inst_fp in (fp.get('variant'), fp.get('name'))), None)
+        fp_ref = f'{lib_name}:' + (_entry(fp_el) if fp_el is not None
+                                   else sanitize_filename(inst_fp))
     elif len(fps) == 1:
-        fp_ref = f'{lib_name}:{sanitize_filename(fps[0].get("name", ""))}'
+        fp_ref = f'{lib_name}:{_entry(fps[0])}'
     else:
         fp_ref = ''
         if len(fps) > 1:
@@ -1000,6 +1010,7 @@ def _pages_from_frames(canvas_el, frame_insts, comp_by_name, pool, name_fn, ns):
 
 def _emit_canvas(pages, canvas_el, part_insts, comp_by_name, pool, lib_name,
                  proj_name, ns, hier_ports=None, sym_uuid_sink=None,
+                 fp_pool=None,
                  module_placements=None):
     """Everything except sheets: placed symbols, nets, deco, notes.
 
@@ -1028,7 +1039,8 @@ def _emit_canvas(pages, canvas_el, part_insts, comp_by_name, pool, lib_name,
         _emit_symbol_instance(page, inst_el, comp_el, pool, lib_name,
                               proj_name, ns, unit_n, gate_sym,
                               sym_uuid_sink=sym_uuid_sink,
-                              module_placements=module_placements)
+                              module_placements=module_placements,
+                              fp_pool=fp_pool)
 
     for el in canvas_el:
         if el.tag in ('line', 'arc', 'shape', 'text', 'note'):
@@ -1253,6 +1265,9 @@ def export_project(ir_path, output_dir):
     ns = uuid.uuid5(uuid.NAMESPACE_URL, f'babel:{proj_name}')
 
     pool = symbol_pool(ir_root)
+    # Library entry name per footprint COPY — same rule the .pretty writer
+    # and the board use, so all three name the same file.
+    fp_entry_names = footprint_pool(ir_root)
     comp_by_name = {c.get('name'): c for c in ir_root.findall('component')}
     schem_el = ir_root.find('schematic')
     module_els = ir_root.findall('module')
@@ -1375,7 +1390,7 @@ def export_project(ir_path, output_dir):
             m_pages, mod_el, m_parts, comp_by_name, pool, lib_name,
             proj_name, ns, hier_ports=hier_ports,
             module_placements=modinst_table.get(stem, []),
-            sym_uuid_sink=mod_sym_uuids[stem])
+            sym_uuid_sink=mod_sym_uuids[stem], fp_pool=fp_entry_names)
         _emit_nets(m_pages, mod_el, part_page, comp_by_desig, pool, ns,
                    hier_ports=hier_ports)
 
@@ -1384,7 +1399,7 @@ def export_project(ir_path, output_dir):
     sym_uuids = {}
     part_page, comp_by_desig = _emit_canvas(
         top_pages, schem_el, part_insts, comp_by_name, pool, lib_name,
-        proj_name, ns, sym_uuid_sink=sym_uuids)
+        proj_name, ns, sym_uuid_sink=sym_uuids, fp_pool=fp_entry_names)
 
     # Module instances: the sheet-pin position IS the port's connection
     # point on the parent (the IR wires already end there), so sheets carry

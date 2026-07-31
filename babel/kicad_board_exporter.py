@@ -35,9 +35,11 @@ import zstandard
 
 from babel import import_log
 from babel.eagle_board_exporter import _instance_footprint
-from babel.ir_util import (arc_mid, is_copper, offset_contour, parse_layer,
-                           parse_stack, place_ir_element, sanitize_filename,
-                           instance_designator, resolve_model3d_file)
+from babel.ir_util import (arc_mid, footprint_pool, footprint_users,
+                           is_copper, offset_contour,
+                           parse_layer, parse_stack, place_ir_element,
+                           sanitize_filename, instance_designator,
+                           resolve_model3d_file)
 from babel.kicad_layers import ir_to_kicad
 from babel.kicad_exporter import (_eagle_overbar_to_kicad, _f, _justify,
                                   _mm, _q, model3d_kicad_xyz)
@@ -420,7 +422,7 @@ def _placeholder(fp_el, name):
 
 def _emit_footprint(out, e, fp, lib_name, value, frame, pad_nets, n_copper,
                     sym_path=None, net_code=None, refdes=None,
-                    net_display=None, model_name=None):
+                    net_display=None, model_name=None, fp_entry=None):
     des = e.get('name')
     # des is the IR element ADDRESS (module parts: INST:REFDES colon form) —
     # used for uuid/pad-net keys. The VISIBLE reference must match the
@@ -442,7 +444,7 @@ def _emit_footprint(out, e, fp, lib_name, value, frame, pad_nets, n_copper,
     # .pretty file — the project puts every footprint in ONE library under a
     # sanitized name (kicad_project_exporter), so a project export overrides
     # the per-part Eagle library with the project nickname
-    fp_id = f'{lib_name}:{sanitize_filename(fp.get("name", "?"))}'
+    fp_id = f'{lib_name}:{sanitize_filename(fp_entry or fp.get("name", "?"))}'
     out.append(f'\t(footprint {_q(fp_id)}')
     out.append(f'\t\t(layer "{"B.Cu" if bottom else "F.Cu"}")')
     out.append(f'\t\t(uuid "{_uuid("fp", des)}")')
@@ -781,6 +783,13 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
     sidecar_dir = ir_path.parent / ir_path.stem
     embedded = {}                 # file name -> Path
     _model_cache = {}             # id(fp) -> name | None
+    # A footprint-level message names a library entry, which says nothing
+    # about where to look on the board; one designator turns it into a place.
+    fp_users = footprint_users(root)
+    # The library entry each footprint copy lands under — same rule the
+    # .pretty writer uses, recomputed on THIS parse of the IR (the naming is
+    # a pure function of document order and content, so the two agree).
+    fp_pool = footprint_pool(root)
     def _model_for(fp):
         key = id(fp)
         if key not in _model_cache:
@@ -788,9 +797,13 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
             if fp.find('model3d') is not None:
                 src = resolve_model3d_file(fp, sidecar_dir)
                 if src is None:
-                    import_log.log('kicad_pcb', fp.get('name'),
-                                   'MODEL3D dropped',
-                                   f'no STEP file in {sidecar_dir.name}/')
+                    fp_id = fp.get('name', '')
+                    import_log.log(
+                        'kicad_pcb',
+                        '%s (used by %s)' % (fp_id, fp_users.get(fp_id)
+                                             or 'no element on the board'),
+                        'MODEL3D dropped',
+                        f'no STEP file in {sidecar_dir.name}/')
                 else:
                     name = src.name
                     embedded[name] = src
@@ -932,7 +945,8 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
                 continue
             _emit_footprint(out, e, fp, lib_nickname or lib, value, frame,
                             pad_nets, n_copper, net_code=net_code,
-                            net_display=net_display, model_name=_model_for(fp))
+                            net_display=net_display, model_name=_model_for(fp),
+                            fp_entry=fp_pool.get(id(fp)))
             continue
         inst = resolve_instance(des)
         comp = comp_by_name.get(inst.get('component')) if inst is not None else None
@@ -946,13 +960,16 @@ def export_board_kicad(ir_path, output_path, layout_name=None, sym_paths=None,
                         value, frame, pad_nets, n_copper,
                         sym_path=sym_paths.get(des), net_code=net_code,
                         refdes=_kicad_refdes(des), net_display=net_display,
-                        model_name=_model_for(fp))
+                        model_name=_model_for(fp), fp_entry=fp_pool.get(id(fp)))
 
     # --- layout-level mounting holes: KiCad has no bare-board NPTH
     # primitive — each becomes a one-pad synthetic footprint
     for i, h in enumerate(layout.findall('hole')):
         d = _mm(h.get('drill'))
-        out += [f'\t(footprint "babel:HOLE_{_f(d)}mm"',
+        # The nickname must be one fp-lib-table registers, or KiCad's DRC
+        # reports "the current configuration does not include the footprint
+        # library" for this synthetic part alone.
+        out += [f'\t(footprint "{lib_nickname or "babel"}:HOLE_{_f(d)}mm"',
                 f'\t\t(layer "F.Cu")',
                 f'\t\t(uuid "{_uuid("hole", i)}")',
                 f'\t\t(at {_f(frame.x(h.get("x")))} {_f(frame.y(h.get("y")))})',

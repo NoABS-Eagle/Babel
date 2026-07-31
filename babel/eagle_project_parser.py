@@ -750,8 +750,15 @@ def _synth_native_frame(frame_el, bbox_um, pool, ctx):
                       roundness='0', outline='150', rot='0', layer='FRAME')
         ctx['symbols_el'].append(sym_el)
         pool[comp_name] = sym_el
+        # A synthesized frame comes from no library — it is derived from the
+        # sheet's own border. `library=` is still mandatory (every component
+        # must say where it came from, and the per-library .swlib writer
+        # rejects a component without one), so it names the PROJECT. Caught
+        # by the Altium->IR->Eagle->IR circle on IND80S28, where the exported
+        # .sch has no frame part of its own and the importer synthesizes one.
         comp_el = ET.Element('component', name=comp_name, prefix='FRAME',
-                             symbol=comp_name, synth='frame')
+                             symbol=comp_name, synth='frame',
+                             library=ctx.get('proj_name', 'frames'))
         ctx['proj_el'].append(comp_el)
         cache[comp_name] = comp_el
     ctx['synth_frame_n'] = n = ctx.get('synth_frame_n', 0) + 1
@@ -1016,7 +1023,8 @@ def convert_project_full(src, output_path):
 
     class_name_by_num = _collect_classes(schematic_el, proj_el)
     ctx = {'class_name_by_num': class_name_by_num,
-           'symbols_el': symbols_el, 'proj_el': proj_el}
+           'symbols_el': symbols_el, 'proj_el': proj_el,
+           'proj_name': proj_el.get('name')}
 
     # Nesting depth check (ir_schema.md "Вложенность запрещена", format-
     # agnostic invariant): a <module>'s own <sheet> must never carry a

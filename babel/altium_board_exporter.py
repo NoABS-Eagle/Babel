@@ -58,7 +58,7 @@ from babel.altium_exporter import (DRC_RULES, _altium_arc_angles,
                                    npth_pad_kwargs, shape_primitives,
                                    target_layer)
 from babel.ir_util import (LAYER_DIMENSION, arc_center, arc_params,
-                           chain_loops, designator_resolver,
+                           chain_loops, component_gates, designator_resolver,
                            instance_footprint, offset_contour, parse_stack,
                            resolved_attrs)
 
@@ -711,7 +711,59 @@ _VIA_DIRECT = {'SCOPE1EXPRESSION': 'isVia', 'SCOPE2EXPRESSION': 'All',
 _RULE_LEADER = {
     'MinimumAnnularRing':    b'\x13\x00',
     'BoardOutlineClearance': b'\x3f\x00',
+    'SupplyNets':            b'\x29\x00',
 }
+
+
+# Body-to-body spacing: NO CONSTRAINT. Nothing in the IR states one — Eagle
+# has no such check at all, so a board imported from there was never designed
+# against it, and Altium's stock 10 mil lights up as violations on a board
+# that is perfectly fine. 8 mil was tried first and was the wrong shape of
+# answer (user, 2026-07-30): any positive number is our invention, it only
+# moves the threshold, and the violations come back wherever parts sit
+# tighter. Zero says what is actually true — the source states nothing.
+_COMPONENT_CLEARANCE_MILS = 0
+
+
+def _supply_nets(ir_root):
+    """Net names that carry a POWER SYMBOL — the ones Altium calls supply.
+
+    Altium derives a `Supply Nets` rule from the schematic for each of them
+    and offers it on every ECO until the board has one too, so the board
+    writes them itself. Ground truth for the record shape: the user's Base
+    after a real ECO (`DEFINEDBYLOGICALDOCUMENT=TRUE`, `VOLTAGE=' 0.000'`,
+    names `Schematic Supply Nets`, `_1`, `_2`, ...).
+    """
+    pool = {s.get('name'): s for s in ir_root.findall('symbols/symbol')}
+    sup_comps = set()
+    for comp_el in ir_root.findall('component'):
+        for _gate, sym_name in component_gates(comp_el):
+            sym_el = pool.get(sym_name)
+            if sym_el is not None and any(p.get('direction') == 'sup'
+                                          for p in sym_el.findall('pin')):
+                sup_comps.add(comp_el.get('name'))
+    out = set()
+
+    def _scan(canvas, prefix=''):
+        sup_desigs = {i.get('name') for i in canvas.findall('instance')
+                      if i.get('component') in sup_comps}
+        for net_el in canvas.findall('net'):
+            if any(r.get('part') in sup_desigs
+                   for seg in net_el.findall('segment')
+                   for r in seg.findall('pinref')):
+                out.add(prefix + net_el.get('name', ''))
+
+    sch_el = ir_root.find('schematic')
+    if sch_el is not None:
+        _scan(sch_el)
+        # A module's nets live on the board once per instance, under the
+        # channel address.
+        by_name = {m.get('name'): m for m in ir_root.findall('module')}
+        for inst in sch_el.findall('instance'):
+            mod = by_name.get(inst.get('module') or '')
+            if mod is not None:
+                _scan(mod, prefix=f'{inst.get("name")}:')
+    return out
 
 
 def _uid(seed):
@@ -726,7 +778,7 @@ def _dr_mil(um):
     return f'{float(um) / 25.4:.4f}mil'
 
 
-def _build_rules(builder, layout_el, pour_names):
+def _build_rules(builder, layout_el, pour_names, supply_nets=()):
     """Rewrite the Rules6 stream: the IR's 6 DRC numbers and the polygon
     connect styles.
 
@@ -798,6 +850,32 @@ def _build_rules(builder, layout_el, pour_names):
         if field == 'GAP':
             rec['GENERICCLEARANCE'] = rec[field]
         recs.append([rec, _RULE_LEADER[kind], b''])
+
+    # Supply Nets: Altium builds one per power net FROM THE SCHEMATIC and
+    # keeps offering it until the board carries its own. Record shape and the
+    # naming (plain name first, then _1, _2 …, priorities running the other
+    # way) are copied from a real ECO's output.
+    for i, net in enumerate(supply_nets):
+        name = 'Schematic Supply Nets' + (f'_{i}' if i else '')
+        recs.append([{
+            'SELECTION': 'FALSE', 'LAYER': 'UNKNOWN', 'LOCKED': 'FALSE',
+            'POLYGONOUTLINE': 'FALSE', 'USERROUTED': 'TRUE',
+            'KEEPOUT': 'FALSE', 'UNIONINDEX': '0', 'RULEKIND': 'SupplyNets',
+            'NETSCOPE': 'AnyNet', 'LAYERKIND': 'SameLayer',
+            'SCOPE1EXPRESSION': f"InNet('{net}')", 'SCOPE2EXPRESSION': 'All',
+            'NAME': name, 'ENABLED': 'TRUE',
+            'PRIORITY': str(len(supply_nets) - i),
+            'COMMENT': '', 'UNIQUEID': _uid(name),
+            'DEFINEDBYLOGICALDOCUMENT': 'TRUE', 'VOLTAGE': ' 0.000',
+        }, _RULE_LEADER['SupplyNets'], b''])
+
+    # Component clearance: the stock rule's 10 mil is Altium's, not the
+    # design's (see _COMPONENT_CLEARANCE_MILS).
+    for entry in recs:
+        if entry[0].get('RULEKIND') == 'ComponentClearance':
+            entry[0]['GAP'] = f'{_COMPONENT_CLEARANCE_MILS}mil'
+            entry[0]['VERTICALGAP'] = f'{_COMPONENT_CLEARANCE_MILS}mil'
+            entry[2] = b''
 
     _fit_rules_to_geometry(builder, recs)
 
@@ -1116,7 +1194,14 @@ def export_board(ir_root, out_dir, proj_name, pcblib_path, sch_link=None,
     n_cu, pours = _emit_copper(builder, layout_el, dx_um, dy_um,
                                len(parse_stack(layout_el.get('stack'))[0]),
                                net_names)
-    n_rules, n_connect = _build_rules(builder, layout_el, pours)
+    # Only nets the BOARD actually has: a supply net whose parts are all off
+    # this layout would give Altium a rule scoped to nothing.
+    board_nets = {net_names(s.get('name'))
+                  for s in layout_el.findall('signal')}
+    n_rules, n_connect = _build_rules(
+        builder, layout_el, pours,
+        supply_nets=sorted(net_names(n) for n in _supply_nets(ir_root)
+                           if net_names(n) in board_nets))
 
     counts = _log_deferred(layout_el, outline_ids | drawn_ids)
 

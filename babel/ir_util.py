@@ -615,7 +615,13 @@ def offset_contour(vertices, r):
     Raises ValueError on degenerate results (collapsed concave arc, failed
     concave trim, self-intersecting outcome) — hard reject, never a guess."""
     if len(vertices) < 3:
-        raise ValueError('contour offset: fewer than 3 vertices')
+        # Not necessarily empty: two vertices with a curve on one of them are
+        # an arc and its closing chord, which encloses a real area. The pen
+        # model has no corner to round there, so this is a LIMITATION, not a
+        # verdict about the contour — callers say so in their own words.
+        raise ValueError('contour offset: fewer than 3 vertices (an arc and '
+                         'its chord is a real area, just not offsettable '
+                         'here)')
     if contour_area(vertices) < 0:
         n = len(vertices)
         vertices = [(vertices[(i + 1) % n][0], vertices[(i + 1) % n][1],
@@ -1068,3 +1074,131 @@ def model3d_file_for_name(fp_name, search_dir):
             if p.exists():
                 return p
     return None
+
+
+def footprint_users(root):
+    """{footprint name: one designator that uses it}.
+
+    A library-level message names a FOOTPRINT, which says nothing about where
+    to look on the board; one designator turns it into a place. The example
+    is taken from the layout so the name is the one printed on the board, and
+    it is deterministic (first element in document order).
+    """
+    layout = root.find('layout')
+    if layout is None:
+        return {}
+    resolve = designator_resolver(root)
+    comp_by_name = {c.get('name'): c for c in root.findall('component')}
+    local = {f.get('name') for f in layout.findall('footprint')}
+    out = {}
+    for el in layout.findall('element'):
+        address = el.get('name', '')
+        inst, desig = resolve(address)
+        if inst is None:
+            # A board-only element names its footprint itself (it has no
+            # component to hold one).
+            name = el.get('footprint')
+            if name in local:
+                out.setdefault(name, desig)
+            continue
+        comp_el = comp_by_name.get(inst.get('component', ''))
+        fp_el = instance_footprint(comp_el, inst) if comp_el is not None else None
+        if fp_el is not None:
+            out.setdefault(fp_el.get('name', ''), desig)
+    return out
+
+
+def model3d_dialog_rotation(m3):
+    """IR <model3d> rotation -> the (x, y, z) triple a 3D-model DIALOG shows.
+
+    The IR composes intrinsic Rx*Ry*Rz (ir_schema.md "Соглашение о размещении
+    модели"). Both KiCad and Altium describe the same orientation as a
+    Rz*Ry*Rx composition, so the IR angles cannot be handed over per axis:
+    that only coincides for pure-Z rotations, which is why flat parts looked
+    right for months and a genuinely two-axis model exposed it — DD1 (LQFP100)
+    is IR (0, -90, -90) and must be entered as (90, 0, -90). Ground truth
+    twice over: visually in KiCad (2026-07-15) and by the user setting exactly
+    those three numbers by hand in Altium (2026-07-30).
+
+    KiCad's FILE stores these angles negated; its dialog and Altium's alike
+    show them as returned here.
+    """
+    ex, ey, ez = (math.radians(float(m3.get(k, 0))) for k in ('rx', 'ry', 'rz'))
+    cx, sx = math.cos(ex), math.sin(ex)
+    cy, sy = math.cos(ey), math.sin(ey)
+    cz, sz = math.cos(ez), math.sin(ez)
+    # R = Rx(ex) @ Ry(ey) @ Rz(ez), row-major
+    r00 = cy * cz
+    r01 = -cy * sz
+    r10 = cx * sz + sx * sy * cz
+    r11 = cx * cz - sx * sy * sz
+    r20 = sx * sz - cx * sy * cz
+    r21 = sx * cz + cx * sy * sz
+    r22 = cx * cy
+    # decompose R = Rz(g) @ Ry(b) @ Rx(a):  R[2][0] = -sin b
+    if abs(r20) < 1 - 1e-9:
+        a = math.degrees(math.atan2(r21, r22))
+        b = math.degrees(math.asin(-r20))
+        g = math.degrees(math.atan2(r10, r00))
+    else:                        # gimbal lock: b = ±90, split a=0
+        a = 0.0
+        b = 90.0 if r20 < 0 else -90.0
+        g = math.degrees(math.atan2(-r01, r11))
+    return a, b, g
+
+
+def footprint_pool(ir_root):
+    """{id(<footprint>) -> the name it must take in a FLAT library}.
+
+    A target that keeps one footprint library per project (KiCad's
+    `${KIPRJMOD}/<proj>.pretty`, Altium's single PcbLib) keys entries by
+    NAME, while the IR nests a private copy of the footprint under every
+    component that uses it. Two libraries of the source can therefore offer
+    the same name with different content — real: tolmach's `R1206` exists in
+    Eagle's own `rc` and `rc@1` with DIFFERENT PADS, and flattening by name
+    silently gave half the parts the wrong land pattern.
+
+    Same rule the symbol pool already uses on import (eagle_project_parser:
+    identical twins share one entry, diverged ones take Eagle's own `@N`
+    suffix), applied where footprints are actually flattened. Returns
+    identity-keyed names, so a caller renames only the copies that clash.
+    """
+    import copy as _copy
+    import xml.etree.ElementTree as _ET
+
+    # What a LIBRARY ENTRY is: the land pattern and its artwork. Everything
+    # else the IR keeps inside <footprint> belongs to the COMPONENT that owns
+    # this copy and legitimately differs between copies — `variant` names the
+    # device, <pin-mapping> the pins of that device, <attributes> its
+    # parameters (Base's R0402 copies differ in nothing but
+    # tolerance=1%/5%), <description> its prose.
+    _OWNER_ONLY = ('pin-mapping', 'attributes', 'description')
+
+    def canon(el):
+        c = _copy.deepcopy(el)
+        c.attrib.pop('variant', None)
+        for tag in _OWNER_ONLY:
+            for child in c.findall(tag):
+                c.remove(child)
+        # Indentation is not content: dropping a child leaves the previous
+        # sibling's tail behind, and two identical land patterns would differ by
+        # whitespace alone.
+        for node in c.iter():
+            node.text = node.tail = None
+        return _ET.tostring(c, encoding='unicode')
+
+    by_name = {}          # entry name -> canonical text
+    out = {}
+    for comp_el in list(ir_root.findall('component')) + \
+            list(ir_root.findall('layout')):
+        for fp_el in comp_el.findall('footprint'):
+            base = fp_el.get('name', '')
+            text = canon(fp_el)
+            name = base
+            n = 0
+            while name in by_name and by_name[name] != text:
+                n += 1
+                name = f'{base}@{n}'
+            by_name.setdefault(name, text)
+            out[id(fp_el)] = name
+    return out

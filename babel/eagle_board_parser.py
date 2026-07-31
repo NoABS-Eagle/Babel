@@ -451,9 +451,23 @@ def convert_board(brd_path, layout_name='main', name_map=None, known=None,
 
     signals = board.find('signals')
     if signals is not None:
+        n_empty = 0
         for s in signals:
+            # A signal with no contactref and no copper connects nothing to
+            # nothing — real .brd files carry piles of them (Base has 86,
+            # named 1AI1 … 16AI2, SW1 … SW8, 3V3, and none of them exists in
+            # the schematic). There is no fact in such an entry, so it does
+            # not enter the IR; Altium would otherwise show the whole pile as
+            # "Remove Nets" on the first ECO. User decision 2026-07-30.
+            if len(s) == 0:
+                n_empty += 1
+                continue
             _convert_signal(s, layout, layout_name, copper_map, stack,
                             brd_path, name_map=name_map, net_names=net_names)
+        if n_empty:
+            import_log.log(layout_name, '',
+                           f'{n_empty} EMPTY signal(s) dropped — no '
+                           'contactref and no copper, they connect nothing')
 
     # Opaque source metadata IR must give back on export to the SAME format
     # (ir_schema.md "<passthrough>"): design rules, autorouter setup, approved

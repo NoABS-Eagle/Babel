@@ -40,7 +40,13 @@ def check(ok, msg):
         fails.append(msg)
 
 
-ir = ET.parse(OUT / f'{NAME}.swprj').getroot()
+# The IR is a separate result of the run, next to the project folder
+# (`ir_<name>/`); older runs left it inside, or beside the project files.
+_ir_path = next((p for p in (OUT.parent / f'ir_{NAME}' / f'{NAME}.swprj',
+                             OUT / 'ir' / f'{NAME}.swprj',
+                             OUT / f'{NAME}.swprj') if p.exists()),
+                OUT / f'{NAME}.swprj')
+ir = ET.parse(_ir_path).getroot()
 layout = ir.find('layout')
 pcb = AltiumPcbDoc.from_file(str(OUT / f'{NAME}.PcbDoc'))
 ox, oy = pcb.board.origin_x, pcb.board.origin_y
