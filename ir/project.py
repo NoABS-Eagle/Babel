@@ -1,7 +1,6 @@
 """<project> — project.md. Root of `.siprj`: shared pools compiled in
-whole, plus the product's one electrical truth. The board pool (<layout>
-x N) is not modeled yet — the board chapter hasn't been built, so a
-Project today is schematic-only.
+whole, the product's one electrical truth, and any number of physical
+boards reading it (project.md #одна-схема-n-плат).
 """
 
 from __future__ import annotations
@@ -11,6 +10,7 @@ from dataclasses import dataclass, field
 from .class_ import Class
 from .component import Component
 from .footprint import Footprint
+from .layout import Layout
 from .module import Module
 from .schematic import Schematic
 from .symbol import Symbol
@@ -28,6 +28,7 @@ class Project:
     components: list[Component] = field(default_factory=list)
     classes: list[Class] = field(default_factory=list)
     modules: list[Module] = field(default_factory=list)
+    layouts: list[Layout] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -35,6 +36,10 @@ class Project:
         major, minor = self.version
         if major < 0 or minor < 0:
             raise ValueError(f"version must be non-negative: {self.version}")
+
+        layout_names = [layout.name.lower() for layout in self.layouts]
+        if len(layout_names) != len(set(layout_names)):
+            raise ValueError(f"project {self.name!r}: duplicate layout name")
 
         self._check_pool_uniqueness()
         self._validate_references()
@@ -89,6 +94,9 @@ class Project:
                 modules_by_name,
                 context=f"module {module.name!r}",
             )
+
+        for layout in self.layouts:
+            self._validate_layout(layout, components_by_key)
 
     def _validate_component(self, component, symbols_by_key, footprints_by_key) -> None:
         gate_symbols: dict[str, Symbol] = {}
@@ -181,3 +189,73 @@ class Project:
                         f"{context}: channel {modinst.name!r} selects unknown variant "
                         f"{modinst.variant!r} of module {module.name!r}"
                     )
+
+    def _validate_layout(self, layout: Layout, components_by_key: dict[tuple[str, str], Component]) -> None:
+        """Cross-checks a board against the product schematic: element.md
+        (an element resolves to exactly one part, a ghost may only cover a
+        part touching at most one net) and contactref.md (every contactref
+        must agree with the schematic's pinref+map).
+
+        Scoped to top-level parts only — an element placed from inside a
+        module channel (name like `IC101` or `DCDC1:IC1`) isn't resolved
+        against the module's own schematic here, since that requires
+        replaying the channel's name expansion; such elements are skipped
+        rather than rejected, which is permissive, not validated.
+        """
+        parts_by_name = {p.name.lower(): p for p in self.schematic.parts}
+
+        pin_net: dict[tuple[str, str, str], str] = {}
+        for net in self.schematic.nets:
+            for segment in net.segments:
+                for ref in segment.pinrefs:
+                    if ref.gate is None:
+                        continue
+                    pin_net[(ref.inst.lower(), ref.gate.lower(), ref.pin.lower())] = net.name
+
+        for element in layout.elements:
+            part = parts_by_name.get(element.name.lower())
+            if part is None:
+                continue
+
+            component = components_by_key.get(self._pool_key(part.library, part.component))
+            if component is None:
+                continue
+            device = next(
+                (d for d in component.devices if d.name.lower() == (part.device or "").lower()), None
+            )
+            if device is None:
+                continue
+
+            pad_to_net: dict[str, str] = {}
+            for m in device.maps:
+                net_name = pin_net.get((part.name.lower(), m.gate.lower(), m.pin.lower()))
+                if net_name is None:
+                    continue
+                for pad in m.pads:
+                    pad_to_net[pad.lower()] = net_name
+
+            if element.exclude:
+                distinct_nets = set(pad_to_net.values())
+                if len(distinct_nets) > 1:
+                    raise ValueError(
+                        f"layout {layout.name!r}: element {element.name!r} is a ghost, but its pads "
+                        f"reach {len(distinct_nets)} different nets on the schematic — only a part "
+                        "touching at most one net may be ghosted"
+                    )
+                continue
+
+            for signal in layout.signals:
+                for ref in signal.contactrefs:
+                    if ref.element.lower() != element.name.lower():
+                        continue
+                    expected_net = pad_to_net.get(ref.pad.lower())
+                    if expected_net is None:
+                        raise ValueError(
+                            f"layout {layout.name!r}, signal {signal.name!r}: contactref names pad "
+                            f"{ref.pad!r} of {element.name!r}, which the schematic does not wire to any net"
+                        )
+                    if expected_net.lower() != signal.name.lower():
+                        raise ValueError(
+                            f"layout {layout.name!r}: contactref ties {element.name!r} pad {ref.pad!r} "
+                            f"to signal {signal.name!r}, but the schematic wires it to net {expected_net!r}"
+                        )
