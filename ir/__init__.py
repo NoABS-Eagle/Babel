@@ -4,11 +4,14 @@ Built so far:
 - Component chapter (spec/README.md #1): units, naming, attr, graphics
   primitives, pad/smd/hole, model3d, pin, symbol, footprint,
   component/gate/device/map, library.
-- Schematic chapter (#2): class, part, component_instance, pinref, label,
-  net/segment, variant, note, schematic, module, module_instance.
+- Schematic chapter (#2), plus the project root: class, part,
+  component_instance, pinref, label, net/segment, variant, note,
+  schematic, module, module_instance, project.
 
-Board chapter (#3) and the project root (project.py) are not implemented
-yet — main.py still cannot produce real output.
+Board chapter (#3) is not implemented yet — a Project is schematic-only
+until <layout> exists, so main.py still cannot produce real output for
+any tool that requires a board (all three, per
+project_import_requirements_v2).
 """
 
 from .attr import Attr
@@ -28,6 +31,7 @@ from .pad import Hole, Pad, Smd
 from .part import Part
 from .pin import Direction, Pin
 from .pinref import PinRef
+from .project import Project
 from .schematic import Schematic
 from .symbol import Symbol
 from .units import Layer
@@ -66,6 +70,7 @@ __all__ = [
     "Direction",
     "Pin",
     "PinRef",
+    "Project",
     "Schematic",
     "Symbol",
     "Layer",
