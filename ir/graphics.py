@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 from .units import validate_angle, validate_bool01, validate_curve, validate_length, validate_range
 
-_ALIGN_GRID = {
+ALIGN_GRID = {
     f"{v}-{h}" for v in ("top", "center", "bottom") for h in ("left", "center", "right")
 }
 
@@ -130,5 +130,5 @@ class Text:
         validate_angle(self.rot)
         validate_bool01(self.mirror, name="mirror")
         validate_range(self.ratio, 0, 25, name="ratio")
-        if self.align not in _ALIGN_GRID:
+        if self.align not in ALIGN_GRID:
             raise ValueError(f"align out of the nine-cell grid: {self.align!r}")

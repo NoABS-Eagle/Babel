@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .attr import Attr
+from .attr import Attr, validate_unique_attrs
 from .component import Component
 from .footprint import Footprint
 from .symbol import Symbol
@@ -23,6 +23,7 @@ class Library:
     def __post_init__(self) -> None:
         if ":" in self.name:
             raise ValueError(f"library name must not contain ':': {self.name!r}")
+        validate_unique_attrs(self.attrs)
 
         sym_names = [s.name.lower() for s in self.symbols if s.name is not None]
         if len(sym_names) != len(set(sym_names)):

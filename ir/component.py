@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .attr import Attr
+from .attr import Attr, validate_unique_attrs
 from .naming import validate_catalog_name
 from .units import validate_length
 
@@ -66,6 +66,7 @@ class Device:
     def __post_init__(self) -> None:
         if any(ch.isspace() or ch in "{}" for ch in self.name):
             raise ValueError(f"device name out of domain: {self.name!r}")
+        validate_unique_attrs(self.attrs)
         all_pads = [pad for m in self.maps for pad in m.pads]
         lowered = [p.lower() for p in all_pads]
         if len(lowered) != len(set(lowered)):
@@ -91,6 +92,7 @@ class Component:
             raise ValueError(f"prefix out of the designator domain (no space, '@', '{{}}', ':'): {self.prefix!r}")
         if self.prefix != self.prefix.upper():
             raise ValueError(f"prefix must be upper-case, like a designator: {self.prefix!r}")
+        validate_unique_attrs(self.attrs)
 
         gate_names = [g.name.lower() for g in self.gates]
         if len(gate_names) != len(set(gate_names)):
