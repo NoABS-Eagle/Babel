@@ -26,7 +26,7 @@ def main(argv: list[str]) -> None:
         raise SystemExit(f"usage: {argv[0]} <path-to-project-file>")
     path = Path(argv[1])
     project = import_project(path)
-    out_path = Path("output") / f"{path.stem}.sprj"
+    out_path = Path("output") / f"{path.stem}.siprj"
     out_path.parent.mkdir(exist_ok=True)
     project.write(out_path)
 
