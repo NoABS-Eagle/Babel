@@ -38,6 +38,10 @@ class Line:
     layer: int | None = None
     """None inside <segment> (wire) and <plating> (path) — the container
     fixes the layer, writing one would be a second home for one fact."""
+    anti: bool = False
+    """The `!` prefix — layer-model.md #часть-3-анти-слои. A cutout: this
+    object is absent material, not present material, and subtracts from
+    polygons on its own layer wherever it overlaps them."""
 
     def __post_init__(self) -> None:
         for n, v in (("x1", self.x1), ("y1", self.y1), ("x2", self.x2), ("y2", self.y2)):
@@ -54,6 +58,7 @@ class Arc:
     curve: int
     width: int
     layer: int | None = None
+    anti: bool = False
 
     def __post_init__(self) -> None:
         for n, v in (("x1", self.x1), ("y1", self.y1), ("x2", self.x2), ("y2", self.y2)):
@@ -75,6 +80,7 @@ class Shape:
     roundness: int = 0
     outline: int = 0
     """0 = filled; any other value = outline-only stroke of that width."""
+    anti: bool = False
 
     def __post_init__(self) -> None:
         validate_length(self.x, name="x")
@@ -97,6 +103,12 @@ class Polygon:
     """0/1 — does this polygon grow thermal spokes at all. Not the pad-side
     0..100 insulation scale of the same name (pad.py/smd.py)."""
     clearance: int = 0
+    anti: bool = False
+    """An anti-polygon (`!N`) subtracts from every polygon on layer N
+    instead of being copper itself — rank/thermals/clearance are then
+    meaningless (layer-model.md), same "not written" family as elsewhere,
+    left as unchecked here since that check needs the parent (Signal vs.
+    bare layout child) to know whether they'd apply at all."""
 
     def __post_init__(self) -> None:
         validate_length(self.width, name="width")
@@ -120,6 +132,7 @@ class Text:
     rot: int = 0
     mirror: int = 0
     ratio: int = 10
+    anti: bool = False
 
     def __post_init__(self) -> None:
         validate_length(self.x, name="x")
