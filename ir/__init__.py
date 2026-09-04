@@ -4,11 +4,11 @@ Built so far:
 - Component chapter (spec/README.md #1): units, naming, attr, graphics
   primitives, pad/smd/hole, model3d, pin, symbol, footprint,
   component/gate/device/map, library.
-- Schematic chapter (#2), partial: class, part, component_instance,
-  pinref, label, net/segment, variant, note, schematic. Hierarchy
-  (module/modinst) and the project root are not implemented yet.
+- Schematic chapter (#2): class, part, component_instance, pinref, label,
+  net/segment, variant, note, schematic, module, module_instance.
 
-Board chapter (#3) is not implemented at all.
+Board chapter (#3) and the project root (project.py) are not implemented
+yet — main.py still cannot produce real output.
 """
 
 from .attr import Attr
@@ -20,6 +20,8 @@ from .graphics import Arc, Line, Polygon, Shape, Text, Vertex
 from .label import Label, LabelStyle
 from .library import Library
 from .model3d import Model3D
+from .module import Module
+from .module_instance import ModuleInstance, expand_designator, expand_net_name
 from .net import Net, Segment
 from .note import Note
 from .pad import Hole, Pad, Smd
@@ -50,6 +52,10 @@ __all__ = [
     "LabelStyle",
     "Library",
     "Model3D",
+    "Module",
+    "ModuleInstance",
+    "expand_designator",
+    "expand_net_name",
     "Net",
     "Segment",
     "Note",
