@@ -4,7 +4,14 @@
       "Bash",
       "PowerShell",
       "Bash(python -c ' *)",
-      "Bash(python -m babel.altium_project_parser testData/altium/IND/IND80S28.PrjPcb outputs/IND80S28.swprj)"
+      "Bash(python -m babel.altium_project_parser testData/altium/IND/IND80S28.PrjPcb outputs/IND80S28.swprj)",
+      "PowerShell(Start-Process -FilePath \"C:\\\\Program Files\\\\KiCad\\\\10.0\\\\bin\\\\kicad.exe\" -ArgumentList \"C:\\\\NoABS\\\\Babel\\\\outputs\\\\tolmach_kicad\\\\tolmach\\\\tolmach.kicad_pro\")",
+      "PowerShell(Get-Process kicad,pcbnew,eeschema -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Process pcbnew,kicad,eeschema -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force)",
+      "PowerShell(Start-Process -FilePath \"C:\\\\Program Files\\\\KiCad\\\\10.0\\\\bin\\\\pcbnew.exe\" -ArgumentList \"C:\\\\NoABS\\\\Babel\\\\outputs\\\\tolmach_kicad\\\\tolmach\\\\tolmach.kicad_pcb\")",
+      "PowerShell(Get-Process pcbnew -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Process eeschema,pcbnew,kicad,kicad-cli -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Milliseconds 1500; if \\(Test-Path C:\\\\NoABS\\\\Babel\\\\outputs\\) { Remove-Item -Recurse -Force C:\\\\NoABS\\\\Babel\\\\outputs }; if \\(Test-Path C:\\\\NoABS\\\\Babel\\\\outputs\\) { \"STILL THERE: \" + \\(\\(Get-ChildItem -Recurse C:\\\\NoABS\\\\Babel\\\\outputs | Measure-Object\\).Count\\) + \" items\" } else { \"outputs removed\" })"
     ]
   }
 }

@@ -67,12 +67,6 @@ class Library:
                         f"component {component.name!r}, device {device.name!r}: "
                         f"footprint {device.footprint!r} not found in library {self.name!r}"
                     )
-                has_pads = bool(footprint.pads)
-                if has_pads and not all_pins:
-                    raise ValueError(
-                        f"component {component.name!r}: footprint {footprint.name!r} has pads, "
-                        "but no gate's symbol carries a pin to reach them"
-                    )
                 mapped = {(m.gate.lower(), m.pin.lower()) for m in device.maps}
                 for gate_name, pin_name in all_pins:
                     if (gate_name, pin_name) not in mapped:

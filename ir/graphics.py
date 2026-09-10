@@ -5,6 +5,7 @@ signals and platings; the parent container decides the role, not the tag.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from .units import validate_angle, validate_bool01, validate_curve, validate_length, validate_range
@@ -67,6 +68,32 @@ class Arc:
         validate_length(self.width, name="width")
         if (self.x1, self.y1) == (self.x2, self.y2):
             raise ValueError("arc endpoints coincide: no chord, no center, no arc")
+
+    def center(self) -> tuple[float, float]:
+        """The arc's center, in µm (fractional — a chord+bulge arc has no
+        reason to land its center on a whole micron). arc.md stores the
+        chord and the swept angle; the center sits on the chord's
+        perpendicular bisector, offset along the chord's LEFT normal by
+        `half_chord / tan(curve/2)` — the sign of `curve` carries which
+        side, so no separate direction flag is needed."""
+        mx, my = (self.x1 + self.x2) / 2, (self.y1 + self.y2) / 2
+        dx, dy = self.x2 - self.x1, self.y2 - self.y1
+        half = math.hypot(dx, dy) / 2
+        nx, ny = -dy / (2 * half), dx / (2 * half)
+        offset = half / math.tan(math.radians(self.curve / 1000) / 2)
+        return mx + nx * offset, my + ny * offset
+
+    def midpoint(self) -> tuple[float, float]:
+        """The point halfway ALONG the arc, in µm — what a three-point arc
+        format wants (KiCad's `(arc (start) (mid) (end))`) in place of our
+        chord+bulge. Half the swept angle from the start, about the center:
+        exact for any `curve`, including the reflex (>180°) case, where
+        offsetting the chord's midpoint by a sagitta would pick the wrong
+        one of the two arcs."""
+        cx, cy = self.center()
+        radius = math.hypot(self.x1 - cx, self.y1 - cy)
+        angle = math.atan2(self.y1 - cy, self.x1 - cx) + math.radians(self.curve / 1000) / 2
+        return cx + radius * math.cos(angle), cy + radius * math.sin(angle)
 
 
 @dataclass

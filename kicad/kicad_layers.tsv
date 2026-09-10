@@ -1,0 +1,41 @@
+# conversion-kicad.md #слои — the non-copper layer table, meant to be edited.
+#
+# Copper is NOT here: its numbers come out of the stack formula and nowhere
+# else. Everything else is this table, one row per pairing.
+#
+# A KiCad name beginning with "F." is PAIRED: the same row also covers the
+# bottom side through the sign of the IR number, so "B.SilkS" is -121. A name
+# without that prefix is side-less and only matches a positive IR number.
+#
+# Several IR layers may land on one KiCad layer (names 125 and values 127 join
+# the assembly layer 151 on F.Fab). The reverse direction is decided by ORDER:
+# the FIRST row naming a KiCad layer wins it back. Hence 151 before 125/127.
+#
+# An IR layer absent from this table is dropped with its number named in the
+# log — to carry one more, add a row.
+#
+# 135 is Eagle's tGlue and KiCad's F.Adhes: the same thing under two names,
+# and KiCad declares that layer on every board anyway. 157 is Eagle's tCAD —
+# the component's mechanical body outline, which is what F.Fab is FOR (KiCad's
+# own libraries draw the body there), so it joins 151/125/127 rather than
+# landing on a comments layer. Both are paired: 36 bGlue and 58 bCAD ride the
+# same rows through the sign.
+#
+# Still absent on purpose, for want of an obvious home — add a row if you
+# want them: 137 tTest, 250 Notes, 299 Contour.
+#
+# kicad	ir
+F.Fab	151
+F.SilkS	121
+F.Mask	129
+F.Paste	131
+F.CrtYd	139
+F.Adhes	135
+Edge.Cuts	120
+Eco1.User	147
+Cmts.User	148
+Eco2.User	149
+Dwgs.User	150
+F.Fab	125
+F.Fab	127
+F.Fab	157

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from .class_ import Class
 from .component import Component
 from .footprint import Footprint
+from .layer_declaration import LayerDeclaration
 from .layout import Layout
 from .module import Module
 from .schematic import Schematic
@@ -27,6 +28,10 @@ class Project:
     footprints: list[Footprint] = field(default_factory=list)
     components: list[Component] = field(default_factory=list)
     classes: list[Class] = field(default_factory=list)
+    layers: list[LayerDeclaration] = field(default_factory=list)
+    """The schematic-space layer table — one per project, shared by the
+    product canvas, every module's schematic, and every symbol
+    (project.md #children, layer-model.md: one schematic space per project)."""
     modules: list[Module] = field(default_factory=list)
     layouts: list[Layout] = field(default_factory=list)
 
@@ -41,8 +46,17 @@ class Project:
         if len(layout_names) != len(set(layout_names)):
             raise ValueError(f"project {self.name!r}: duplicate layout name")
 
+        self._validate_layers()
         self._check_pool_uniqueness()
         self._validate_references()
+
+    def _validate_layers(self) -> None:
+        numbers = [ld.number for ld in self.layers]
+        if len(numbers) != len(set(numbers)):
+            raise ValueError(f"project {self.name!r}: duplicate schematic-space layer number")
+        names = [ld.name.lower() for ld in self.layers if ld.name is not None]
+        if len(names) != len(set(names)):
+            raise ValueError(f"project {self.name!r}: duplicate schematic-space layer name")
 
     @staticmethod
     def _pool_key(library: str | None, name: str) -> tuple[str, str]:
@@ -123,11 +137,6 @@ class Project:
                 raise ValueError(
                     f"component ({component.library!r}, {component.name!r}), device {device.name!r}: "
                     f"footprint {device.footprint!r} not found in library {component.library!r}"
-                )
-            if footprint.pads and not all_pins:
-                raise ValueError(
-                    f"component ({component.library!r}, {component.name!r}): footprint "
-                    f"{footprint.name!r} has pads, but no gate's symbol carries a pin to reach them"
                 )
             mapped = {(m.gate.lower(), m.pin.lower()) for m in device.maps}
             pad_names = {p.name.lower() for p in footprint.pads}
