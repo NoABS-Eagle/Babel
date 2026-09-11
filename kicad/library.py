@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 
 from ir.attr import Attr
-from ir.component import Component, Gate
+from ir.component import Component, Device, Gate, Map
 from ir.graphics import Text
 from ir.naming import sanitize_attr_key
 from ir.pin import Direction, Pin
@@ -410,6 +410,138 @@ def _stack_gates(gates: list[Gate], symbols: list[Symbol]) -> None:
         gate.x = 0
         gate.y = y - top
         y = gate.y + (top - height) - GATE_GAP
+
+
+def convert_libraries(sheets, log, default_um: int = geo.DEFAULT_LINE_UM
+                      ) -> tuple[list[Symbol], list[Component], dict]:
+    """The symbol cache of EVERY sheet, merged into one pool.
+
+    Each `.kicad_sch` carries its own copy of every symbol it places, so a
+    two-sheet project holds `GND` twice. One `lib_id` is one component:
+    the copies are the same library entry seen from two files. Where two
+    copies disagree, the first is kept and the case is logged — the cache
+    of one sheet was refreshed and the other was not."""
+    symbols: list[Symbol] = []
+    components: list[Component] = []
+    pin_pads: dict[str, dict] = {}
+    seen: dict[str, tuple] = {}
+    for tree in sheets:
+        cache = sexpr.kid(tree, "lib_symbols")
+        if cache is None:
+            continue
+        for node in sexpr.kids(cache, "symbol"):
+            lib_id = str(sexpr.atoms(node)[0])
+            result = convert_symbol_definition(node, log, default_um)
+            if result is None:
+                continue
+            syms, component, pads = result
+            key = _symbol_key(syms)
+            if lib_id in seen:
+                if seen[lib_id] != key:
+                    log(f"symbol {lib_id}: the sheets disagree on it — the first "
+                        f"copy is used ('Update Symbols from Library' in KiCad)")
+                continue
+            seen[lib_id] = key
+            symbols += syms
+            components.append(component)
+            pin_pads[lib_id] = pads
+    return symbols, components, pin_pads
+
+
+def _symbol_key(symbols: list[Symbol]) -> tuple:
+    """What makes two cached copies of one symbol the same symbol: its
+    pins and its body. Placeholder layout is left out — it is the
+    component's, and an instance moves it freely."""
+    from ir.graphics import Text as _Text
+    return tuple(
+        (s.name,
+         tuple(sorted((p.name, p.direction.value, p.x, p.y, p.rot, p.length)
+                      for p in s.pins)),
+         tuple(sorted(str((type(g).__name__, getattr(g, "layer", None),
+                           getattr(g, "x", None), getattr(g, "y", None),
+                           getattr(g, "x1", None), getattr(g, "y1", None)))
+                      for g in s.graphics if not isinstance(g, _Text))))
+        for s in symbols)
+
+
+def footprint_pairs(sheets, log) -> dict[str, list[str]]:
+    """`lib_id` -> the footprints its placements name, in first-seen order.
+
+    conversion-kicad.md #библиотеки: KiCad has no library-level device, so
+    the family is read off actual USE. `Device:C` placed twelve times,
+    three of them carrying `C_0805` and the rest `C_0603`, is one component
+    with two devices — and the board is not needed to see it."""
+    pairs: dict[str, list[str]] = {}
+    for tree in sheets:
+        for placement in sexpr.kids(tree, "symbol"):
+            lib_node = sexpr.kid(placement, "lib_id")
+            if lib_node is None:
+                continue
+            lib_id = str(sexpr.atoms(lib_node)[0])
+            seen = pairs.setdefault(lib_id, [])
+            value = _prop_value(placement, "Footprint")
+            if value and value not in seen:
+                seen.append(value)
+    return pairs
+
+
+def attach_devices(components: list[Component], pin_pads: dict,
+                   pairs: dict[str, list[str]], footprints: dict, log) -> dict[str, set]:
+    """Give every component the devices its placements actually used, and
+    record which library each footprint has to be filed under.
+
+    A footprint goes in the same library as the symbol that named it
+    (library.md: a device addresses its footprint by name WITHIN its own
+    library), so one named from two libraries is filed in both."""
+    filed: dict[str, set] = {}
+    by_lib_id = {f"{c.library}:{c.name}" if c.library else c.name: c for c in components}
+    for lib_id, names in pairs.items():
+        component = by_lib_id.get(lib_id)
+        if component is None:
+            continue
+        gates = pin_pads.get(lib_id, {})
+        devices = []
+        for full in names:
+            bare = full.rsplit(":", 1)[-1]
+            reference = footprints.get(bare)
+            if reference is None:
+                log(f"{lib_id}: footprint {full!r} is not in the project library — "
+                    f"device dropped")
+                continue
+            filed.setdefault(bare, set()).add(component.library)
+            # device.md: the suffix is appended to the family name. KiCad
+            # states no suffix of its own — there is no library-level
+            # device there to carry one — so the footprint's own name
+            # serves, and only when there is something to tell apart.
+            suffix = f"-{bare}" if len(names) > 1 else ""
+            maps = _build_maps(gates, reference, lib_id, full, log)
+            devices.append(Device(footprint=bare, name=suffix, maps=maps))
+        component.devices.extend(devices)
+    return filed
+
+
+def _build_maps(gates: dict, reference, lib_id: str, footprint_name: str, log) -> list[Map]:
+    """map.md: pin -> pad, explicitly. KiCad states it by the pin's
+    `number`, which IS the pad's name.
+
+    A pad drawn as several copper islands answers ONE pin, and map.md
+    gives the pad field a LIST for exactly that."""
+    islands: dict[str, list[str]] = {}
+    for pad in reference.pads:
+        islands.setdefault(pad.name.split("@", 1)[0].lower(), []).append(pad.name)
+
+    maps = []
+    for gate_name, pins in gates.items():
+        for pin_name, number in pins:
+            if not number:
+                continue
+            group = islands.get(number.lower())
+            if group is None:
+                log(f"{lib_id}/{footprint_name}: pin {pin_name!r} addresses pad "
+                    f"{number!r}, which the footprint does not have — mapping dropped")
+                continue
+            maps.append(Map(pin=pin_name, pad=" ".join(group), gate=gate_name))
+    return maps
 
 
 def convert_lib_symbols(tree: sexpr.Node, log, default_um: int = geo.DEFAULT_LINE_UM
