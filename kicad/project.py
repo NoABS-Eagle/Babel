@@ -107,6 +107,11 @@ def _read_footprint_lib(project_dir: Path) -> dict[str, Path]:
     called something else entirely."""
     lib: dict[str, Path] = {}
     for path in sorted(project_dir.rglob("*.kicad_mod")):
+        # `.history` is KiCad's local-history plugin: superseded copies of
+        # files still in the project. Reading one would silently hand back
+        # an older footprint than the board actually uses.
+        if any(part == ".history" for part in path.parts):
+            continue
         lib.setdefault(path.stem, path)
     return lib
 

@@ -39,6 +39,24 @@ def validate_catalog_name(name: str) -> None:
         raise ValueError(f"catalog name must not contain ':' (it separates the library:name pair): {name!r}")
 
 
+_ATTR_KEY_ILLEGAL = re.compile(r"[^A-Za-z0-9_#.]")
+
+
+def sanitize_attr_key(name: str) -> str | None:
+    """An out-of-domain attribute key, repaired by substitution
+    (naming.md #имя-вне-домена-чинится-подстановкой) — returns None when
+    the key was already legal, so the caller knows whether to log.
+
+    Every importer needs this: a source is free to name a field `AEC-Q`
+    (Eagle's own) or `LCSC Part` (KiCad's), and rejecting a whole project
+    over one stray character in one field would be out of all proportion
+    to the loss.
+    """
+    if _ATTR_KEY_RE.match(name):
+        return None
+    return _ATTR_KEY_ILLEGAL.sub("_", name)
+
+
 def sanitize_out_of_domain(name: str, forbidden: str) -> str:
     """naming.md #имя-вне-домена-чинится-подстановкой: every illegal
     character becomes '_', predictably, one for one.

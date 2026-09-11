@@ -30,19 +30,16 @@ import import_log
 _ROT_RE = re.compile(r"^(M)?(S)?R?([\d.]+)$")
 
 
-_ATTR_KEY_RE = re.compile(r"^[A-Za-z0-9_#]+(\.[A-Za-z0-9_#]+)*$")
-_ATTR_KEY_ILLEGAL = re.compile(r"[^A-Za-z0-9_#.]")
-
-
 def safe_attr(name: str, value: str, log):
     """Eagle attribute name -> IR `Attr`, sanitizing an out-of-domain key
     (naming.md #имя-вне-домена-чинится-подстановкой) instead of rejecting
     the whole file over one stray character (e.g. Eagle's own `AEC-Q`)."""
     from ir.attr import Attr
+    from ir.naming import sanitize_attr_key
 
-    if _ATTR_KEY_RE.match(name):
+    fixed = sanitize_attr_key(name)
+    if fixed is None:
         return Attr(name, value)
-    fixed = _ATTR_KEY_ILLEGAL.sub("_", name)
     log(f"attribute key {name!r} out of domain -> {fixed!r}")
     return Attr(fixed, value)
 
