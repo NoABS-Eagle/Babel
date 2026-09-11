@@ -123,9 +123,15 @@ def kid(node: Node, tag: str) -> Node | None:
     return None
 
 
-def atoms(node: Node) -> list[Atom]:
+def atoms(node: Node | None) -> list[Atom]:
     """A node's own values, with its tag and its child lists left out:
-    `(at 12.7 5.08 90)` gives `[12.7, 5.08, 90]`."""
+    `(at 12.7 5.08 90)` gives `[12.7, 5.08, 90]`.
+
+    A missing node gives no values. `kid` returns None for a node that
+    isn't there, and "absent" and "present but empty" mean the same thing
+    to every caller here — an optional `(at …)` is simply the origin."""
+    if node is None:
+        return []
     return [c for c in node[1:] if not isinstance(c, list)]
 
 

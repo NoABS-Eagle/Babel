@@ -17,6 +17,7 @@ from pathlib import Path
 
 from import_log import log
 
+from . import footprint as footprint_conv
 from . import sexpr
 
 # The format version that says "KiCad 10". Read off real files rather than
@@ -45,8 +46,11 @@ class Source:
     flattens into a page, several make a module — so this is the fact the
     hierarchy hangs on (conversion-kicad.md #схема)."""
     footprint_lib: dict[str, Path] = field(default_factory=dict)
-    """Footprint name -> its `.kicad_mod`, the default placeholder layout
-    and nothing else (conversion-kicad.md #что-приготовить)."""
+    """Footprint name -> its `.kicad_mod` file."""
+    footprints: dict = field(default_factory=dict)
+    """Footprint name -> the converted library footprint. This is the
+    geometry the project gets: it belongs to the library, and every
+    placement on the board has been checked against it."""
 
 
 def _sheet_file(sheet: sexpr.Node) -> str | None:
@@ -171,6 +175,23 @@ def read_source(path: Path) -> Source:
     lib = _read_footprint_lib(project_dir)
     _check_footprint_lib(board, lib)
 
+    # conversion-kicad.md #правка-на-размещении-отвергает-проект. The
+    # reference is the library file, never a neighbouring placement: a
+    # whole board's instances can agree with each other and still all be
+    # edited, if one hand did it once and copied the part around.
+    footprints = footprint_conv.load_library(lib, log)
+    complaints = footprint_conv.check_board(board, footprints, log)
+    if complaints:
+        shown = "\n".join(complaints[:15])
+        more = f"\n  … and {len(complaints) - 15} more" if len(complaints) > 15 else ""
+        raise SystemExit(
+            f"{len(complaints)} placed footprint(s) do not match the library they "
+            f"name — their copper or silkscreen was edited on the board:\n"
+            + shown + more +
+            "\nIn KiCad: 'Update Footprints from Library', or put the edit into "
+            "the library where it belongs. Geometry belongs to the footprint, "
+            "and a placement carries only where it sits.")
+
     return Source(
         name=path.stem,
         pro_path=path,
@@ -181,14 +202,16 @@ def read_source(path: Path) -> Source:
         sheets=sheets,
         placements=placements,
         footprint_lib=lib,
+        footprints=footprints,
     )
 
 
 def import_project(path: Path):
     source = read_source(path)
     log(f"{source.name}: {len(source.sheets)} sheet(s), "
-        f"{len(sexpr.kids(source.board, 'footprint'))} footprints on the board, "
-        f"{len(source.footprint_lib)} footprints in the project library")
+        f"{len(sexpr.kids(source.board, 'footprint'))} placements on the board, "
+        f"{len(source.footprints)} footprints in the project library, "
+        f"all matching")
     raise SystemExit(
         "KiCad: the project reads and passes its preconditions; conversion "
         "itself is not written yet.")

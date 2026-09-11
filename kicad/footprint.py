@@ -325,10 +325,44 @@ def convert_footprint(node: sexpr.Node, log) -> Footprint | None:
             if result is not None:
                 graphics.append(result)
 
+    graphics += _placeholders(node, back, theta, log, label)
     pads, aliases = _rename_repeats(pads, log, label)
     fp = Footprint(name=name, library=library or None,
                    graphics=graphics, pads=pads, holes=holes)
     return fp, aliases
+
+
+_PLACEHOLDER_KEY = {"Reference": "NAME", "Value": "VALUE"}
+
+
+def _placeholders(node: sexpr.Node, back: bool, theta: float, log, label: str) -> list:
+    """A footprint's visible fields -> `>KEY` texts.
+
+    placeholders.md: the SET of placeholders, and their default layout,
+    is the library's to state — and it is not only `>NAME`, the author of
+    a given footprint is free to place `>VALUE` or a field of their own.
+    The layer comes from the field itself, exactly as the export side
+    takes it back off the placeholder."""
+    texts = []
+    for prop in sexpr.kids(node, "property"):
+        atoms = sexpr.atoms(prop)
+        if not atoms:
+            continue
+        key = str(atoms[0])
+        if geo.is_hidden(prop):
+            continue
+        height, align, mirror = geo.text_effects(prop)
+        if not height:
+            continue
+        layer = _graphic_layer(prop, back, log, label)
+        if layer is None:
+            continue
+        x_mm, y_mm, angle = geo.at(prop)
+        x, y = un_xy(x_mm, y_mm, back)
+        texts.append(Text(x, y, height, layer, align,
+                          content=">" + _PLACEHOLDER_KEY.get(key, key.upper()),
+                          rot=un_text_rot(angle, theta, back), mirror=mirror))
+    return texts
 
 
 def _rename_repeats(pads: list, log, label: str) -> tuple[list, dict[str, list[str]]]:
@@ -365,13 +399,16 @@ def _renamed(pad, name: str):
     return replace(pad, name=name)
 
 
-def signature(fp: Footprint) -> tuple:
-    """What must be IDENTICAL across every instance of one footprint.
+# conversion-kicad.md #правка-на-размещении-отвергает-проект: what the
+# board is actually built from. Copper decides whether the part solders;
+# silkscreen is what a human reads off the board. The other layers a
+# footprint carries — assembly, courtyard, documentation — take no part:
+# a difference there costs nothing and has many innocent causes.
+_COMPARED_LAYERS = {1, -1, 121, -121}
 
-    conversion-kicad.md #правка-на-размещении-отвергает-проект: geometry
-    belongs to the library and the instance carries only where it sits.
-    The comparison is exact, with no tolerance — "how many microns is not
-    an edit" has no non-arbitrary answer.
+
+def signature(fp: Footprint) -> tuple:
+    """The copper and the silkscreen, as one comparable value.
 
     Compared after un-placing, so side and angle are already divided out.
     Ordering is not a difference: KiCad is free to write the same children
@@ -389,7 +426,9 @@ def signature(fp: Footprint) -> tuple:
                    p.rot % 180000, getattr(p, "roundness", 0))
                   for p in fp.pads)
     holes = sorted((h.x, h.y, h.drill) for h in fp.holes)
-    graphics = sorted(_graphic_key(g) for g in fp.graphics)
+    graphics = sorted(_graphic_key(g) for g in fp.graphics
+                      if getattr(g, "layer", None) in _COMPARED_LAYERS
+                      and not isinstance(g, Text))
     return tuple(pads), tuple(holes), tuple(graphics)
 
 
@@ -409,26 +448,70 @@ def _graphic_key(g) -> tuple:
             tuple((v.x, v.y) for v in getattr(g, "vertices", ())))
 
 
-def without_text(fp: Footprint) -> Footprint:
-    """The same footprint with its lettering removed.
+def first_difference(reference: Footprint, placed: Footprint) -> str | None:
+    """The first thing in which a placed footprint departs from its
+    library reference, named for the refusal message.
 
-    Lettering is not geometry: conversion-kicad.md lists "раскладка
-    надписей" among the things an instance carries itself, and in these
-    files every instance really has moved its own `Reference`. Comparing
-    it would report an edit on every board."""
-    from dataclasses import replace
-    return replace(fp, graphics=[g for g in fp.graphics if not isinstance(g, Text)])
-
-
-def first_difference(a: Footprint, b: Footprint) -> str | None:
-    """The first thing that differs, named for the refusal message."""
-    sa, sb = signature(without_text(a)), signature(without_text(b))
-    for what, xs, ys in zip(("pad", "hole", "graphic"), sa, sb):
+    Lettering takes no part: conversion-kicad.md lists "раскладка надписей"
+    among the things an instance carries itself, and in these files every
+    instance really has moved its own `Reference`."""
+    for what, xs, ys in zip(("pad", "hole", "copper/silk"),
+                            signature(reference), signature(placed)):
         if xs == ys:
             continue
         if len(xs) != len(ys):
-            return f"{what} count {len(xs)} vs {len(ys)}"
+            return f"{what} count {len(xs)} in the library vs {len(ys)} on the board"
         for x, y in zip(xs, ys):
             if x != y:
-                return f"{what} {x} vs {y}"
+                return f"{what} {x} in the library vs {y} on the board"
     return None
+
+
+def check_board(board: sexpr.Node, library: dict[str, Footprint], log) -> list[str]:
+    """Every placed footprint against its library reference. Returns the
+    complaints, one per departing placement — the caller decides that this
+    stops the conversion (conversion-kicad.md #что-отвергается)."""
+    complaints = []
+    for node in sexpr.kids(board, "footprint"):
+        atoms = sexpr.atoms(node)
+        if not atoms:
+            continue
+        lib_id = str(atoms[0])
+        reference = library.get(lib_id.rsplit(":", 1)[-1])
+        if reference is None:
+            continue  # the precondition check already named this one
+        result = convert_footprint(node, log)
+        if result is None:
+            continue
+        diff = first_difference(reference, result[0])
+        if diff:
+            complaints.append(f"  {_designator(node) or lib_id} ({lib_id}): {diff}")
+    return complaints
+
+
+def _designator(node: sexpr.Node) -> str:
+    for prop in sexpr.kids(node, "property"):
+        atoms = sexpr.atoms(prop)
+        if len(atoms) > 1 and str(atoms[0]) == "Reference":
+            return str(atoms[1])
+    return ""
+
+
+def load_library(paths: dict, log) -> dict[str, Footprint]:
+    """The project's own `.kicad_mod` files, converted. A library file is
+    a footprint that was never placed — front side, no rotation — so the
+    very same conversion reads it, with nothing to un-place."""
+    library: dict[str, Footprint] = {}
+    for name, path in paths.items():
+        try:
+            tree = sexpr.load(path)
+        except Exception as exc:
+            log(f"footprint library {path.name}: unreadable ({exc}) — skipped")
+            continue
+        if not tree or tree[0] != "footprint":
+            log(f"footprint library {path.name}: not a footprint file — skipped")
+            continue
+        result = convert_footprint(tree, log)
+        if result is not None:
+            library[name] = result[0]
+    return library
