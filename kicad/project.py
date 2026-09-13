@@ -19,6 +19,7 @@ from import_log import log
 from ir.attr import Attr
 from ir.project import Project
 
+from . import board as board_conv
 from . import footprint as footprint_conv
 from . import library as library_conv
 from . import schematic as schematic_conv
@@ -295,6 +296,35 @@ def build_schematic(source: Source, components: list, symbols: list, log):
                      attrs=[Attr(k, v) for k, v in sorted(shared.items())])
 
 
+def _net_by_pad(schematic, components: list) -> dict:
+    """(designator, pad) -> the net the SCHEMATIC wires it to.
+
+    The schematic speaks of pins and the board of pads; the device's own
+    <map> is what joins them (map.md), and a pin may answer several pads
+    when one land is drawn as several islands."""
+    by_name = {p.name: p for p in schematic.parts}
+    by_component = {(c.library, c.name): c for c in components}
+    out: dict = {}
+    for net in schematic.nets:
+        for segment in net.segments:
+            for ref in segment.pinrefs:
+                part = by_name.get(ref.inst)
+                if part is None:
+                    continue
+                component = by_component.get((part.library or None, part.component))
+                if component is None or not component.devices:
+                    continue
+                device = next((d for d in component.devices
+                               if d.name == (part.device or "")), None)
+                if device is None:
+                    continue
+                for m in device.maps:
+                    if m.gate == (ref.gate or "") and m.pin == ref.pin:
+                        for pad in m.pads:
+                            out[(part.name, pad)] = net.name
+    return out
+
+
 def _sheet_name(source: Source, path: Path) -> str:
     """What KiCad calls this page — the root pages are named in the project
     file, a flattened sheet by the `Sheetname` of the symbol placing it."""
@@ -337,9 +367,13 @@ def import_project(path: Path):
             footprints.append(replace(reference, library=library))
 
     schematic = build_schematic(source, components, symbols, log)
+    layout = board_conv.convert_board(source.board, source.name,
+                                       {n.name for n in schematic.nets}, log,
+                                       _net_by_pad(schematic, components))
     log(f"{source.name}: {len(source.sheets)} page(s), {len(schematic.parts)} parts, "
         f"{len(schematic.nets)} nets, {len(components)} components, "
-        f"{len(footprints)} footprints")
+        f"{len(footprints)} footprints; board: {len(layout.elements)} elements, "
+        f"{len(layout.signals)} signals, stack {layout.stack}")
     return Project(name=source.name, version=(1, 0), schematic=schematic,
                    symbols=symbols, footprints=footprints,
-                   components=components)
+                   components=components, layouts=[layout])
