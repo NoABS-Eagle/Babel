@@ -65,6 +65,15 @@ _PLACEHOLDER_LAYER = {"Reference": LAYER_NAME, "Value": LAYER_VALUE}
 _PLACEHOLDER_KEY = {"Reference": "NAME", "Value": "VALUE"}
 
 
+def _is_supply_symbol(node: sexpr.Node) -> bool:
+    """One pin, and that pin is `power_in`. See the note where it is used:
+    KiCad's `(power)` flag marks ERC directives too, and misses hand-drawn
+    supply symbols, so the pin is what decides."""
+    kinds = [str(sexpr.atoms(p)[0]) for sub in sexpr.kids(node, "symbol")
+             for p in sexpr.kids(sub, "pin") if sexpr.atoms(p)]
+    return len(kinds) == 1 and kinds[0] == "power_in"
+
+
 def _prop(node: sexpr.Node, name: str) -> sexpr.Node | None:
     for p in sexpr.kids(node, "property"):
         atoms = sexpr.atoms(p)
@@ -118,7 +127,7 @@ def convert_pin(node: sexpr.Node, log, label: str) -> tuple[Pin, str] | None:
     # literal tilde, not an overbar (that is `~{…}`, converted below).
     if name == "~":
         name = ""
-    name = geo.overbar(name)
+    name = geo.overbar(geo.unescape(name))
 
     # pin.md forbids a nameless pin, and KiCad allows one — a resistor's
     # pins are drawn with no name at all. The pad number is the only other
@@ -249,9 +258,16 @@ def convert_symbol_definition(node: sexpr.Node, log, default_um: int
     library = library or None
     label = f"symbol {lib_id}"
 
-    # power-symbol.md: a supply symbol is one whose pin carries the bus
-    # name onto its net. KiCad states the fact outright, on the symbol.
-    is_supply = sexpr.kid(node, "power") is not None
+    # power-symbol.md: a supply symbol is one whose single pin carries the
+    # bus name onto its net.
+    #
+    # KiCad's own `(power)` flag does NOT say that, and this project
+    # proves both halves: `PWR_FLAG` carries the flag and names nothing —
+    # it is an ERC directive (conversion-kicad.md) — while `VPP`, a real
+    # supply symbol drawn by hand, carries no flag at all. What separates
+    # them is the pin: a supply symbol RECEIVES power (`power_in`) and has
+    # exactly one pin; `PWR_FLAG` alone declares `power_out`.
+    is_supply = _is_supply_symbol(node)
 
     base = name
     by_unit: dict[int, list[sexpr.Node]] = {}

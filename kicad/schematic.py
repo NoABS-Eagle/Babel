@@ -1,0 +1,529 @@
+"""KiCad `.kicad_sch` -> the IR canvas — conversion-kicad.md #схема.
+
+Sheets in the IR do not exist: there is one canvas, and KiCad's top-level
+pages are laid out on it side by side, each bounded by a frame synthesized
+from its own paper size. So every page carries an ORIGIN — where its own
+top-left corner sits on the shared canvas — and page coordinates are
+resolved against it.
+
+That resolution is the one place the schematic side flips Y: a symbol's
+own space is Y-up in both formats, but the placed canvas is Y-down in
+KiCad. The law is the exact inverse of `schematic_export._page_x`/
+`_page_y`, which was ground-truthed on the 47 parts tolmach shares with
+KiCad's own import of it.
+"""
+
+from __future__ import annotations
+
+from ir.attr import Attr
+from ir.component_instance import ComponentInstance
+from ir.graphics import Line, Text
+from ir.naming import sanitize_attr_key
+from ir.note import Note
+from ir.part import Part
+
+from . import geometry as geo
+from . import sexpr
+
+# KiCad's own page sizes, in mm, landscape — width first. `(paper "A4")`
+# names one of these; `(paper "User" W H)` states its own.
+PAPER_MM = {
+    "A5": (210, 148), "A4": (297, 210), "A3": (420, 297), "A2": (594, 420),
+    "A1": (841, 594), "A0": (1189, 841),
+    "A": (279.4, 215.9), "B": (431.8, 279.4), "C": (558.8, 431.8),
+    "D": (863.6, 558.8), "E": (1117.6, 863.6),
+    "USLetter": (279.4, 215.9), "USLegal": (355.6, 215.9), "USLedger": (431.8, 279.4),
+}
+
+LAYER_SYMBOL = 94
+LAYER_NETS = 91
+LAYER_INFO = 97
+LAYER_BOUNDS = 98
+LAYER_GRAPHICS = 99
+
+# frame.md: the stamp fields a page carries.
+_STAMP_KEYS = ("title", "company", "rev", "date")
+
+
+def page_size(tree: sexpr.Node, log, label: str) -> tuple[int, int]:
+    """The page's width and height in µm. A named size may be turned on
+    its side by a trailing `portrait`."""
+    paper = sexpr.kid(tree, "paper")
+    atoms = sexpr.atoms(paper) if paper else []
+    if not atoms:
+        log(f"{label}: no paper size — A4 assumed")
+        return geo.um(297), geo.um(210)
+    name = str(atoms[0])
+    if name == "User" and len(atoms) >= 3:
+        return geo.um(atoms[1]), geo.um(atoms[2])
+    size = PAPER_MM.get(name)
+    if size is None:
+        log(f"{label}: unknown paper size {name!r} — A4 assumed")
+        size = PAPER_MM["A4"]
+    width, height = size
+    if any(str(a) == "portrait" for a in atoms[1:]):
+        width, height = height, width
+    return geo.um(width), geo.um(height)
+
+
+class Page:
+    """One `.kicad_sch` being read onto the shared canvas.
+
+    `origin` is (x0, y1): the canvas coordinates of this page's top-left
+    corner — its frame's left edge and its TOP edge, the larger Y in a
+    Y-up space."""
+
+    def __init__(self, origin: tuple[int, int], size: tuple[int, int]):
+        self.x0, self.y1 = origin
+        self.width, self.height = size
+
+    def x(self, value_mm) -> int:
+        return geo.um(value_mm) + self.x0
+
+    def y(self, value_mm) -> int:
+        return self.y1 - geo.um(value_mm)
+
+    def at(self, node: sexpr.Node) -> tuple[int, int, int]:
+        """An `(at …)` resolved onto the canvas, with the angle in mdeg.
+
+        The angle is NOT negated: KiCad's positive angle turns the same
+        way the IR's does as displayed (library_export.kicad_rot)."""
+        x_mm, y_mm, angle = geo.at(node)
+        return self.x(x_mm), self.y(y_mm), round(angle * 1000) % 360000
+
+    def point(self, node: sexpr.Node) -> tuple[int, int]:
+        a = sexpr.atoms(node)
+        return self.x(a[0]), self.y(a[1])
+
+
+def stamp_fields(tree: sexpr.Node) -> dict[str, str]:
+    """The page's title block — frame.md's stamp."""
+    block = sexpr.kid(tree, "title_block")
+    if block is None:
+        return {}
+    out = {}
+    for key in _STAMP_KEYS:
+        node = sexpr.kid(block, key)
+        atoms = sexpr.atoms(node) if node else []
+        if atoms and str(atoms[0]):
+            out[key] = str(atoms[0])
+    return out
+
+
+def _prop(node: sexpr.Node, name: str) -> sexpr.Node | None:
+    for p in sexpr.kids(node, "property"):
+        atoms = sexpr.atoms(p)
+        if atoms and str(atoms[0]) == name:
+            return p
+    return None
+
+
+def _prop_value(node: sexpr.Node, name: str) -> str:
+    p = _prop(node, name)
+    atoms = sexpr.atoms(p) if p is not None else []
+    return str(atoms[1]) if len(atoms) > 1 else ""
+
+
+def placement_transform(node: sexpr.Node) -> tuple[int, int]:
+    """A placement's rotation and mirror, in the IR's own terms.
+
+    The IR mirrors about the vertical axis and then rotates
+    (units.md #зеркало-применяется-до-поворота), which is KiCad's
+    `(mirror y)` exactly. KiCad also writes the equivalent `(mirror x)`
+    with the angle turned half round — `R(θ)·My == R(θ+180)·Mx` — and
+    that is the same placement said differently, so it folds into the one
+    rule rather than becoming a second one."""
+    _x, _y, angle = geo.at(node)
+    rot = round(angle * 1000) % 360000
+    mirror_node = sexpr.kid(node, "mirror")
+    axis = str(sexpr.atoms(mirror_node)[0]) if mirror_node else ""
+    if axis == "y":
+        return rot, 1
+    if axis == "x":
+        return (rot + 180000) % 360000, 1
+    return rot, 0
+
+
+def _gate_of(component, unit: int) -> str:
+    """KiCad's unit number -> the gate's name. Units are 1-based and gates
+    keep the order they were read in (library.convert_symbol_definition)."""
+    if component is None or not component.gates:
+        return ""
+    index = max(1, unit) - 1
+    if index >= len(component.gates):
+        return component.gates[0].name
+    return component.gates[index].name
+
+
+def _device_of(component, footprint: str) -> str | None:
+    """Which device this placement chose, by the footprint it names."""
+    if component is None or not component.devices:
+        return None
+    bare = footprint.rsplit(":", 1)[-1]
+    for d in component.devices:
+        if d.footprint == bare:
+            return d.name
+    return None
+
+
+def convert_placement(node: sexpr.Node, page: Page, components: dict, log,
+                      label: str) -> tuple[Part, ComponentInstance] | None:
+    """One placed `(symbol …)` -> the part it is and where it sits."""
+    lib_node = sexpr.kid(node, "lib_id")
+    if lib_node is None:
+        return None
+    lib_id = str(sexpr.atoms(lib_node)[0])
+    component = components.get(lib_id)
+    if component is None:
+        log(f"{label}: placement of {lib_id!r}, which no sheet caches — dropped")
+        return None
+
+    designator = _prop_value(node, "Reference")
+    if not designator:
+        log(f"{label}: a placement of {lib_id!r} has no reference — dropped")
+        return None
+    # A leading `#` is KiCad's mark for a VIRTUAL part — how a supply
+    # symbol stays out of the netlist and off the board. The IR reads that
+    # role off the `sup` pin instead (power-symbol.md), and the export
+    # side puts the `#` back on. Carried through, it would double.
+    designator = designator.lstrip("#")
+    # part.md: a designator is upper-case. KiCad does not enforce it.
+    if designator != designator.upper():
+        log(f"{label}: designator {designator!r} -> {designator.upper()!r}")
+        designator = designator.upper()
+    if not designator:
+        log(f"{label}: a placement of {lib_id!r} has no reference — dropped")
+        return None
+
+    unit_node = sexpr.kid(node, "unit")
+    unit = int(sexpr.atoms(unit_node)[0]) if unit_node else 1
+    footprint = _prop_value(node, "Footprint")
+
+    attrs = []
+    value = _prop_value(node, "Value")
+    if value:
+        attrs.append(Attr("value", value))
+    for prop in sexpr.kids(node, "property"):
+        atoms = sexpr.atoms(prop)
+        if len(atoms) < 2:
+            continue
+        key, text = str(atoms[0]), str(atoms[1])
+        if key in ("Reference", "Value", "Footprint") or not text:
+            continue
+        # conversion-kicad.md #атрибуты: a field that differs from the
+        # library's becomes an attribute of the PART; one that matches is
+        # inherited and not repeated.
+        if _library_field(component, key) == text:
+            continue
+        fixed = sanitize_attr_key(key)
+        if fixed is not None:
+            log(f"{label}: attribute key {key!r} out of domain -> {fixed!r}")
+            key = fixed
+        attrs.append(Attr(key, text))
+
+    part = Part(name=designator, component=component.name,
+                library=component.library or "", attrs=attrs,
+                device=_device_of(component, footprint))
+
+    x, y, _angle = page.at(node)
+    rot, mirror = placement_transform(node)
+    instance = ComponentInstance(part=designator, x=x, y=y,
+                                 gate=_gate_of(component, unit),
+                                 rot=rot, mirror=mirror,
+                                 texts=_instance_texts(node, page))
+    return part, instance
+
+
+def _library_field(component, key: str) -> str | None:
+    for a in component.attrs:
+        if a.name.lower() == key.lower():
+            return a.value
+    return None
+
+
+def _instance_texts(node: sexpr.Node, page: Page) -> list[Text]:
+    """component-instance.md: a placement's own placeholder layout, in
+    absolute canvas coordinates — and when present it is exhaustive, so
+    every visible field goes in, not only the moved ones."""
+    texts = []
+    for prop in sexpr.kids(node, "property"):
+        atoms = sexpr.atoms(prop)
+        if not atoms or geo.is_hidden(prop):
+            continue
+        key = str(atoms[0])
+        height, align, mirror = geo.text_effects(prop)
+        if not height:
+            continue
+        x, y, angle = page.at(prop)
+        content = ">" + {"Reference": "NAME", "Value": "VALUE"}.get(key, key.upper())
+        layer = {"Reference": 95, "Value": 96}.get(key, LAYER_INFO)
+        texts.append(Text(x, y, height, layer, align, content=content,
+                          rot=angle, mirror=mirror))
+    return texts
+
+
+class Connectivity:
+    """Connectivity read off coordinates — the thing KiCad has instead of
+    a declared net (conversion-kicad.md: "Связность выводится из
+    координат"). Union-find over points.
+
+    KiCad's own rules, which this follows:
+      - a wire joins its two ends;
+      - a wire END lying anywhere on another wire joins them (that is the
+        T, and KiCad draws a junction dot there by itself);
+      - two wires CROSSING with neither end on the other are NOT joined
+        unless a junction says so;
+      - a junction joins everything passing through its point;
+      - a pin joins whatever is at the point its tip lands on.
+    """
+
+    def __init__(self):
+        self.parent: dict[tuple[int, int], tuple[int, int]] = {}
+        self.wires: list[tuple[tuple[int, int], tuple[int, int], object]] = []
+
+    def find(self, p):
+        self.parent.setdefault(p, p)
+        root = p
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[p] != root:
+            self.parent[p], p = root, self.parent[p]
+        return root
+
+    def union(self, a, b) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[ra] = rb
+
+    def add_wire(self, a, b, line) -> None:
+        self.wires.append((a, b, line))
+        self.union(a, b)
+
+    def touch(self, p) -> None:
+        """Register a point (a pin tip, a label anchor) and join it to any
+        wire it lands on."""
+        self.find(p)
+        for a, b, _line in self.wires:
+            if p != a and p != b and _on_segment(p, a, b):
+                self.union(p, a)
+
+    def junction(self, p) -> None:
+        self.find(p)
+        for a, b, _line in self.wires:
+            if _on_segment(p, a, b):
+                self.union(p, a)
+
+
+def _on_segment(p, a, b) -> bool:
+    """Is p on the segment a-b? Schematic wires are orthogonal in
+    practice but not by rule, so this is the general test, in exact
+    integer arithmetic."""
+    (px, py), (ax, ay), (bx, by) = p, a, b
+    if (px - ax) * (by - ay) != (py - ay) * (bx - ax):
+        return False
+    return min(ax, bx) <= px <= max(ax, bx) and min(ay, by) <= py <= max(ay, by)
+
+
+def read_wires(tree: sexpr.Node, page: Page, conn: Connectivity) -> None:
+    for node in sexpr.kids(tree, "wire"):
+        pts = sexpr.kid(node, "pts")
+        points = [page.point(p) for p in sexpr.kids(pts, "xy")] if pts else []
+        width = geo.stroke_width(node, 0)
+        for a, b in zip(points, points[1:]):
+            if a == b:
+                continue
+            conn.add_wire(a, b, Line(a[0], a[1], b[0], b[1], width, LAYER_NETS))
+    for node in sexpr.kids(tree, "junction"):
+        conn.junction(page.point(sexpr.kid(node, "at") or node))
+
+
+_LABEL_TAGS = ("label", "global_label", "hierarchical_label")
+
+# label.md / feedback: a label that JOINS nets by name is always a flag,
+# and its shape is a hint about the signal, not an ERC rule. KiCad states
+# that shape outright on a global or hierarchical label.
+_LABEL_SHAPE = {
+    "input": "IN", "output": "OUT", "bidirectional": "IO",
+    "passive": "PASSIVE", "tri_state": "IO",
+}
+
+
+def _label_style(kind: str, node: sexpr.Node):
+    """A local label is plain text on its wire; a global or hierarchical
+    one is a flag, shaped by what KiCad says it carries."""
+    from ir.label import LabelStyle
+
+    if kind == "label":
+        return LabelStyle.CRUMMY
+    shape = sexpr.kid(node, "shape")
+    name = str(sexpr.atoms(shape)[0]) if shape else "passive"
+    return getattr(LabelStyle, _LABEL_SHAPE.get(name, "PASSIVE"))
+
+
+def read_labels(tree: sexpr.Node, page: Page, conn: Connectivity) -> list:
+    """Every label, anchored and joined to what it sits on. Returns
+    (point, name, kind, node) — the name is what will name the net."""
+    out = []
+    for tag in _LABEL_TAGS:
+        for node in sexpr.kids(tree, tag):
+            atoms = sexpr.atoms(node)
+            if not atoms:
+                continue
+            name = geo.overbar(geo.unescape(str(atoms[0])))
+            x, y, _angle = page.at(node)
+            conn.touch((x, y))
+            out.append(((x, y), name, tag, node))
+    return out
+
+
+def read_pins(instances, parts, components: dict, symbols: dict, page: Page,
+              conn: Connectivity, log, label: str) -> list:
+    """Where every pin of every placement lands on the canvas.
+
+    A pin's own `(at …)` IS its connection point — the free end — and the
+    body lies a `length` away along its angle. Ground truth in this very
+    project: the resistor's pin sits at y=3.81 with length 1.27, and its
+    body edge is at 2.54."""
+    from eagle.geometry import transform_point
+
+    out = []
+    by_name = {p.name: p for p in parts}
+    for inst in instances:
+        part = by_name.get(inst.part)
+        if part is None:
+            continue
+        component = components.get(f"{part.library}:{part.component}"
+                                   if part.library else part.component)
+        if component is None:
+            continue
+        gate = next((g for g in component.gates if g.name == inst.gate), None)
+        if gate is None:
+            continue
+        symbol = symbols.get((component.library, gate.symbol))
+        if symbol is None:
+            log(f"{label}: {inst.part} names symbol {gate.symbol!r}, which is not "
+                f"in the pool — its pins carry no connection")
+            continue
+        for pin in symbol.pins:
+            x, y = transform_point(pin.x, pin.y, inst.mirror, inst.rot, inst.x, inst.y)
+            conn.touch((x, y))
+            out.append(((x, y), inst.part, pin, inst.gate))
+    return out
+
+
+def convert_graphics(tree: sexpr.Node, page: Page, log, label: str
+                     ) -> tuple[list, list[Note]]:
+    """Decorative text and lines. A text box becomes a `<note>`; a
+    one-line box is ordinary text."""
+    graphics, notes = [], []
+    for node in sexpr.kids(tree, "text"):
+        atoms = sexpr.atoms(node)
+        content = str(atoms[0]) if atoms else ""
+        if not content:
+            continue
+        x, y, angle = page.at(node)
+        height, align, mirror = geo.text_effects(node)
+        if angle % 90000:
+            log(f"{label}: text {content[:20]!r} at {angle / 1000}° -> nearest 90°")
+            angle = round(angle / 90000) * 90000 % 360000
+        graphics.append(Text(x, y, height, LAYER_GRAPHICS, align,
+                             content=geo.overbar(content), rot=angle, mirror=mirror))
+    for node in sexpr.kids(tree, "text_box"):
+        atoms = sexpr.atoms(node)
+        content = str(atoms[0]) if atoms else ""
+        if not content:
+            continue
+        x, y, angle = page.at(node)
+        height, _align, mirror = geo.text_effects(node)
+        size = sexpr.atoms(sexpr.kid(node, "size"))
+        w = geo.um(size[0]) if size else 0
+        h = geo.um(size[1]) if len(size) > 1 else height
+        # note.md anchors a note by its box; KiCad gives the top-left
+        # corner, and the Y flip has already turned that into the top.
+        notes.append(Note(x=x, y=y, w=w, h=h, height=height, layer=LAYER_GRAPHICS,
+                          content=geo.overbar(content), rot=angle, mirror=mirror))
+    for node in sexpr.kids(tree, "polyline"):
+        pts = sexpr.kid(node, "pts")
+        points = [page.point(p) for p in sexpr.kids(pts, "xy")] if pts else []
+        width = geo.stroke_width(node, 0)
+        for a, b in zip(points, points[1:]):
+            if a != b:
+                graphics.append(Line(a[0], a[1], b[0], b[1], width, LAYER_GRAPHICS))
+    return graphics, notes
+
+
+def build_nets(conn: Connectivity, labels: list, pins: list, parts: list,
+               log, label: str) -> list:
+    """Connected groups -> `<net>`s.
+
+    Two names on one connected group is a refusal
+    (conversion-kicad.md #метки): the IR gives a net one name, and
+    KiCad's own priority resolution is not something to reproduce —
+    it would pick silently where the source is ambiguous."""
+    from ir.label import Label
+    from ir.net import Net, Segment
+    from ir.pin import Direction
+    from ir.pinref import PinRef
+
+    groups: dict = {}
+    for a, b, line in conn.wires:
+        groups.setdefault(conn.find(a), {"lines": [], "labels": [], "pinrefs": [],
+                                          "names": set(), "supply": []})["lines"].append(line)
+
+    def group_of(point):
+        return groups.get(conn.find(point))
+
+    value_by_part = {p.name: (p.attr("value") if hasattr(p, "attr") else None) for p in parts}
+    for p in parts:
+        for a in p.attrs:
+            if a.name.lower() == "value":
+                value_by_part[p.name] = a.value
+
+    for point, name, kind, node in labels:
+        group = group_of(point)
+        if group is None:
+            log(f"{label}: label {name!r} touches no wire — its net has no geometry, dropped")
+            continue
+        group["names"].add(name)
+        height, align, mirror = geo.text_effects(node)
+        _x_mm, _y_mm, angle = geo.at(node)
+        group["labels"].append(Label(x=point[0], y=point[1], height=height or 1270,
+                                     align=align, layer=LAYER_NETS,
+                                     style=_label_style(kind, node),
+                                     rot=round(angle * 1000) % 360000, mirror=mirror))
+
+    for point, designator, pin, gate in pins:
+        group = group_of(point)
+        if group is None:
+            continue
+        group["pinrefs"].append(PinRef(inst=designator, pin=pin.name, gate=gate or None))
+        if pin.direction is Direction.SUPPLY:
+            # power-symbol.md: the bus name is the part's own value, and
+            # it names the net this pin touches.
+            supply = value_by_part.get(designator)
+            if supply:
+                group["supply"].append(supply)
+
+    nets: dict[str, list] = {}
+    auto = 0
+    for root, group in groups.items():
+        names = set(group["supply"]) | group["names"]
+        if len(names) > 1:
+            raise SystemExit(
+                f"{label}: one connected net carries several names — "
+                f"{', '.join(sorted(names))}. A net has one name; give the extra "
+                f"ones their own nets, or remove the labels that disagree.")
+        if names:
+            name = names.pop()
+        else:
+            auto += 1
+            name = f"N${auto}"
+        nets.setdefault(name, []).append(group)
+
+    out = []
+    for name, members in nets.items():
+        segments = [Segment(lines=g["lines"], labels=g["labels"], pinrefs=g["pinrefs"])
+                    for g in members if g["lines"]]
+        if segments:
+            out.append(Net(name=name, segments=segments))
+    return out

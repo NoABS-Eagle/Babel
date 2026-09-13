@@ -37,6 +37,25 @@ def overbar(text: str) -> str:
     return _OVERBAR.sub(lambda m: f"!{m.group(1)}!" if m.group(1) else "", text)
 
 
+# KiCad escapes characters it cannot put in a file name into a net or
+# label name — `VPP/MCLR` is stored as `VPP{slash}MCLR`. This is the
+# table its own UnescapeString uses.
+_ESCAPES = {
+    "slash": "/", "backslash": "\\", "lbrace": "{", "rbrace": "}",
+    "colon": ":", "dblquote": '"', "lt": "<", "gt": ">", "bar": "|",
+    "asterisk": "*", "question": "?", "space": " ", "tab": "\t",
+    "return": "\r", "newline": "\n", "dollar": "$", "quote": "'",
+}
+_ESCAPE_RE = re.compile(r"\{(" + "|".join(_ESCAPES) + r")\}")
+
+
+def unescape(name: str) -> str:
+    """A KiCad name back to what it says. Braces are out of every IR name
+    domain (naming.md), so leaving them would refuse the file over a
+    character KiCad put there itself."""
+    return _ESCAPE_RE.sub(lambda m: _ESCAPES[m.group(1)], name)
+
+
 def um(value) -> int:
     """KiCad mm -> IR µm — units.md #1 (round once, on input)."""
     return round(float(value) * 1000)
