@@ -472,6 +472,13 @@ def check_board(board: sexpr.Node, library: dict[str, Footprint], log) -> list[s
     complaints, one per departing placement — the caller decides that this
     stops the conversion (conversion-kicad.md #что-отвергается)."""
     complaints = []
+    # Every simplification these placements carry — an oval drill made
+    # round, a custom pad squared off — was already reported once, when
+    # the library copy they are being compared against was converted.
+    # Saying it again per placement buries the log under the same lines.
+    def quiet(*_parts):
+        pass
+
     for node in sexpr.kids(board, "footprint"):
         atoms = sexpr.atoms(node)
         if not atoms:
@@ -480,7 +487,7 @@ def check_board(board: sexpr.Node, library: dict[str, Footprint], log) -> list[s
         reference = library.get(lib_id.rsplit(":", 1)[-1])
         if reference is None:
             continue  # the precondition check already named this one
-        result = convert_footprint(node, log)
+        result = convert_footprint(node, quiet)
         if result is None:
             continue
         diff = first_difference(reference, result[0])

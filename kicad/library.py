@@ -509,11 +509,18 @@ def attach_devices(components: list[Component], pin_pads: dict,
                     f"device dropped")
                 continue
             filed.setdefault(bare, set()).add(component.library)
-            # device.md: the suffix is appended to the family name. KiCad
-            # states no suffix of its own — there is no library-level
-            # device there to carry one — so the footprint's own name
-            # serves, and only when there is something to tell apart.
-            suffix = f"-{bare}" if len(names) > 1 else ""
+            # device.md: the name is a SUFFIX to the family name, unique
+            # within the component, and an empty one is legal — that is
+            # the usual case, one device. The symbol is never renamed by
+            # any of this: it stays `C` in the pool whatever footprints
+            # its placements chose.
+            #
+            # KiCad states no suffix at all (it has no library-level
+            # device to carry one), so where a symbol really did resolve
+            # to several footprints, the devices are simply numbered.
+            # Nothing is invented about them: which is which is stated by
+            # the footprint each one names.
+            suffix = f"-{len(devices) + 1}" if len(names) > 1 else ""
             maps = _build_maps(gates, reference, lib_id, full, log)
             devices.append(Device(footprint=bare, name=suffix, maps=maps))
         component.devices.extend(devices)
