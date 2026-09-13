@@ -587,7 +587,10 @@ def build_nets(conn: Connectivity, labels: list, pins: list, parts: list,
         group = group_of(point)
         if group is None:
             continue
-        group["pinrefs"].append(PinRef(inst=designator, pin=pin.name, gate=gate or None))
+        # pinref.md: `gate` is written IFF the target is a part — a
+        # module channel has no sections. None here would say "channel",
+        # and the schematic would look for a <modinst> by this name.
+        group["pinrefs"].append(PinRef(inst=designator, pin=pin.name, gate=gate))
         if pin.direction is Direction.SUPPLY:
             # power-symbol.md: the bus name is the part's own value, and
             # it names the net this pin touches.
@@ -659,4 +662,100 @@ def build_nets(conn: Connectivity, labels: list, pins: list, parts: list,
                     for g in members if g["lines"]]
         if segments:
             out.append(Net(name=name, segments=segments))
+    return out
+
+
+# ------------------------------------------------------------------ frames
+
+def frame_symbol(size: tuple[int, int], library: str | None):
+    """The page border, as the IR states one: a `<shape>` on layer 98 is
+    what MAKES a symbol a frame (frame.md, component.md #особые-роли).
+
+    KiCad has no frame object at all — it draws the border and the title
+    block itself, from the paper setting — so the frame is synthesized
+    here, at the size of the page it bounds. Its grid and stamp are not
+    recreated: they are not in the file (conversion-kicad.md #схема)."""
+    from ir.graphics import Shape
+    from ir.symbol import Symbol
+
+    width, height = size
+    name = f"FRAME_{round(width / 1000)}x{round(height / 1000)}"
+    shape = Shape(width // 2, height // 2, width, height, LAYER_BOUNDS, outline=0)
+    return Symbol(name=name, library=library, graphics=[shape])
+
+
+def frame_part(symbol_name: str, library: str | None, designator: str,
+               page: Page, number: int, sheetname: str, stamp: dict):
+    """The frame's part and its placement — one per page.
+
+    `sheet` is frame.md's own convention `номер. имя`: KiCad states both,
+    the page number keeps the order and the name is what a human reads."""
+    from ir.component import Component, Gate
+
+    component = Component(name=symbol_name, gates=[Gate(symbol=symbol_name)],
+                          prefix="FRAME", library=library)
+    attrs = [Attr("sheet", f"{number}. {sheetname}" if sheetname else str(number))]
+    for key, value in stamp.items():
+        attrs.append(Attr(key, value))
+    part = Part(name=designator, component=symbol_name,
+                library=library or "", attrs=attrs)
+    # shape.md puts a shape's own origin at its CENTRE, and the frame's
+    # shape was built around the page's own (0,0) corner — so the
+    # placement sits at that corner, not at the middle of the page.
+    instance = ComponentInstance(part=designator, x=page.x0,
+                                 y=page.y1 - page.height, gate="")
+    return component, part, instance
+
+
+def split_stamp(stamps: list[dict]) -> tuple[dict, list[dict]]:
+    """frame.md: a stamp field that reads the same on EVERY page belongs to
+    the schematic as a whole; one that differs belongs to its own page's
+    frame. No field gets a second home."""
+    if not stamps:
+        return {}, []
+    keys = set().union(*(s.keys() for s in stamps))
+    shared = {k: stamps[0].get(k) for k in keys
+              if all(s.get(k) == stamps[0].get(k) for s in stamps)
+              and stamps[0].get(k)}
+    per_page = [{k: v for k, v in s.items() if k not in shared} for s in stamps]
+    return shared, per_page
+
+
+def sheet_graphics(tree: sexpr.Node, page: Page, log, label: str) -> list:
+    """A sheet symbol, redrawn as plain graphics.
+
+    conversion-kicad.md #схема: the top page of such a project IS the block
+    diagram, and without the blocks nothing would be left of it but an
+    empty frame. The drawing carries no connectivity — that already lives
+    in the nets."""
+    from ir.graphics import Shape
+
+    out = []
+    for sheet in sexpr.kids(tree, "sheet"):
+        x, y, _angle = page.at(sheet)
+        size = sexpr.atoms(sexpr.kid(sheet, "size"))
+        if len(size) < 2:
+            continue
+        width, height = geo.um(size[0]), geo.um(size[1])
+        stroke = geo.stroke_width(sheet, 0)
+        out.append(Shape(x + width // 2, y - height // 2, width, height,
+                         LAYER_GRAPHICS, outline=stroke or 152))
+        for prop in sexpr.kids(sheet, "property"):
+            atoms = sexpr.atoms(prop)
+            if len(atoms) < 2 or not str(atoms[1]):
+                continue
+            px, py, angle = page.at(prop)
+            text_height, align, mirror = geo.text_effects(prop)
+            out.append(Text(px, py, text_height, LAYER_GRAPHICS, align,
+                            content=geo.unescape(str(atoms[1])), rot=angle,
+                            mirror=mirror))
+        for pin in sexpr.kids(sheet, "pin"):
+            atoms = sexpr.atoms(pin)
+            if not atoms:
+                continue
+            px, py, angle = page.at(pin)
+            text_height, align, mirror = geo.text_effects(pin)
+            out.append(Text(px, py, text_height or 1270, LAYER_GRAPHICS, align,
+                            content=geo.unescape(str(atoms[0])), rot=angle,
+                            mirror=mirror))
     return out

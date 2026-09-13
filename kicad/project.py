@@ -12,12 +12,16 @@ so the message names a file and not a half-built tree.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from import_log import log
+from ir.attr import Attr
+from ir.project import Project
 
 from . import footprint as footprint_conv
+from . import library as library_conv
+from . import schematic as schematic_conv
 from . import sexpr
 
 # The format version that says "KiCad 10". Read off real files rather than
@@ -206,12 +210,136 @@ def read_source(path: Path) -> Source:
     )
 
 
+# Blank canvas between two pages. They only need to not touch: the sheet
+# boundary is not geometry, and nothing of one page may reach another.
+_PAGE_GAP = 10000
+
+
+def build_schematic(source: Source, components: list, symbols: list, log):
+    """Every sheet of the project, laid out on the one canvas
+    (conversion-kicad.md #схема). A sheet placed once flattens into a page;
+    the root pages come first, in the order `.kicad_pro` lists them."""
+    from ir.schematic import Schematic
+
+    by_lib_id = {f"{c.library}:{c.name}" if c.library else c.name: c
+                 for c in components}
+    by_key = {(s.library, s.name): s for s in symbols}
+
+    order = list(source.root_pages) + [p for p in source.sheets
+                                       if p not in source.root_pages]
+    pages: dict = {}
+    x0 = 0
+    for path in order:
+        size = schematic_conv.page_size(source.sheets[path], log, path.name)
+        pages[path] = schematic_conv.Page((x0, size[1]), size)
+        x0 += size[0] + _PAGE_GAP
+
+    parts, instances, graphics, notes = [], [], [], []
+    seen_parts: dict = {}
+    conn = schematic_conv.Connectivity()
+    labels, sheet_pins, ports, stamps = [], [], {}, []
+
+    for path, page in pages.items():
+        tree = source.sheets[path]
+        depth = 0 if path in source.root_pages else 1
+        for node in sexpr.kids(tree, "symbol"):
+            got = schematic_conv.convert_placement(node, page, by_lib_id, log, path.name)
+            if got is not None:
+                # One part, many placements: a multi-section part puts one
+                # section on each page, and KiCad writes a full symbol for
+                # each. part.md has a single <part> per designator.
+                if got[0].name not in seen_parts:
+                    seen_parts[got[0].name] = got[0]
+                    parts.append(got[0])
+                instances.append(got[1])
+        schematic_conv.read_wires(tree, page, conn)
+        labels += schematic_conv.read_labels(tree, page, conn, depth)
+        for point, name, filename, _node in schematic_conv.read_sheet_pins(tree, page):
+            conn.touch(point)
+            sheet_pins.append((point, name, (path.parent / filename).resolve()))
+        ports[path] = schematic_conv.read_hierarchical_ports(tree, page)
+        for point in ports[path].values():
+            conn.touch(point)
+        page_graphics, page_notes = schematic_conv.convert_graphics(tree, page, log, path.name)
+        graphics += page_graphics + schematic_conv.sheet_graphics(tree, page, log, path.name)
+        notes += page_notes
+        stamps.append(schematic_conv.stamp_fields(tree))
+
+    bridges = [(point, ports.get(child, {}).get(name), name)
+               for point, name, child in sheet_pins
+               if ports.get(child, {}).get(name) is not None]
+
+    pins = schematic_conv.read_pins(instances, parts, by_lib_id, by_key,
+                                    None, conn, log, source.name)
+    nets = schematic_conv.build_nets(conn, labels, pins, parts, log,
+                                      source.name, bridges)
+
+    # frame.md: every page gets a frame, and the stamp splits by how many
+    # pages share each field.
+    shared, per_page = schematic_conv.split_stamp(stamps)
+    frame_symbols: dict[str, object] = {}
+    for number, (path, page) in enumerate(pages.items(), start=1):
+        symbol = schematic_conv.frame_symbol((page.width, page.height), source.name)
+        frame_symbols.setdefault(symbol.name, symbol)
+        component, part, instance = schematic_conv.frame_part(
+            symbol.name, source.name, f"FRAME{number}", page, number,
+            _sheet_name(source, path), per_page[number - 1])
+        if not any(c.name == component.name for c in components):
+            components.append(component)
+        parts.append(part)
+        instances.append(instance)
+    symbols += frame_symbols.values()
+
+    return Schematic(parts=parts, instances=instances, nets=nets,
+                     graphics=graphics, notes=notes,
+                     attrs=[Attr(k, v) for k, v in sorted(shared.items())])
+
+
+def _sheet_name(source: Source, path: Path) -> str:
+    """What KiCad calls this page — the root pages are named in the project
+    file, a flattened sheet by the `Sheetname` of the symbol placing it."""
+    for top in (source.settings.get("schematic") or {}).get("top_level_sheets") or []:
+        if (path.parent / top.get("filename", "")).resolve() == path:
+            return str(top.get("name") or path.stem)
+    for tree in source.sheets.values():
+        for sheet in sexpr.kids(tree, "sheet"):
+            found = name = ""
+            for prop in sexpr.kids(sheet, "property"):
+                atoms = sexpr.atoms(prop)
+                if len(atoms) < 2:
+                    continue
+                if str(atoms[0]) == "Sheetfile":
+                    found = str(atoms[1])
+                elif str(atoms[0]) == "Sheetname":
+                    name = str(atoms[1])
+            if found and (path.parent / found).resolve() == path:
+                return name or path.stem
+    return path.stem
+
+
 def import_project(path: Path):
     source = read_source(path)
-    log(f"{source.name}: {len(source.sheets)} sheet(s), "
-        f"{len(sexpr.kids(source.board, 'footprint'))} placements on the board, "
-        f"{len(source.footprints)} footprints in the project library, "
-        f"all matching")
-    raise SystemExit(
-        "KiCad: the project reads and passes its preconditions; conversion "
-        "itself is not written yet.")
+    symbols, components, pin_pads = library_conv.convert_libraries(
+        list(source.sheets.values()), log)
+    pairs = library_conv.footprint_pairs(list(source.sheets.values()), log)
+    filed = library_conv.attach_devices(components, pin_pads, pairs,
+                                         source.footprints, log)
+
+    footprints = []
+    for name, libraries in filed.items():
+        reference = source.footprints.get(name)
+        if reference is None:
+            continue
+        for library in sorted(libraries, key=lambda v: (v is None, v)):
+            # library.md: a device names its footprint within its OWN
+            # library, so a footprint named from two libraries is filed in
+            # both — one object each, since each carries its library.
+            footprints.append(replace(reference, library=library))
+
+    schematic = build_schematic(source, components, symbols, log)
+    log(f"{source.name}: {len(source.sheets)} page(s), {len(schematic.parts)} parts, "
+        f"{len(schematic.nets)} nets, {len(components)} components, "
+        f"{len(footprints)} footprints")
+    return Project(name=source.name, version=(1, 0), schematic=schematic,
+                   symbols=symbols, footprints=footprints,
+                   components=components)
