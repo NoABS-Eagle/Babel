@@ -360,9 +360,15 @@ def _label_style(kind: str, node: sexpr.Node):
     return getattr(LabelStyle, _LABEL_SHAPE.get(name, "PASSIVE"))
 
 
-def read_labels(tree: sexpr.Node, page: Page, conn: Connectivity) -> list:
+def read_labels(tree: sexpr.Node, page: Page, conn: Connectivity,
+                depth: int = 0) -> list:
     """Every label, anchored and joined to what it sits on. Returns
-    (point, name, kind, node) — the name is what will name the net."""
+    (point, name, kind, node, depth).
+
+    `depth` is how deep the page sits in the sheet tree — 0 at the top.
+    A local label names its net only within its own sheet, so flattening
+    can bring two different names onto one net; the shallower one wins
+    (see `build_nets`)."""
     out = []
     for tag in _LABEL_TAGS:
         for node in sexpr.kids(tree, tag):
@@ -372,7 +378,7 @@ def read_labels(tree: sexpr.Node, page: Page, conn: Connectivity) -> list:
             name = geo.overbar(geo.unescape(str(atoms[0])))
             x, y, _angle = page.at(node)
             conn.touch((x, y))
-            out.append(((x, y), name, tag, node))
+            out.append(((x, y), name, tag, node, depth))
     return out
 
 
@@ -452,8 +458,69 @@ def convert_graphics(tree: sexpr.Node, page: Page, log, label: str
     return graphics, notes
 
 
+def _pick_name(names: set, log, label: str) -> str | None:
+    """One name for one net, out of what the pages called it.
+
+    A local label names its net only inside its own sheet, so flattening
+    can bring two different names onto one net — this project does exactly
+    that, calling one net `VPP/MCLR` outside and `VPP-MCLR` inside. **The
+    shallower page wins**: it is the one that sees the whole net, while
+    the name inside was local to a sheet that no longer exists. The loss
+    goes in the log, named.
+
+    Two different names at the SAME depth is a genuine contradiction — no
+    page is above the other — and that is refused."""
+    if not names:
+        return None
+    best = min(depth for depth, _n in names)
+    top = sorted({n for depth, n in names if depth == best})
+    if len(top) > 1:
+        raise SystemExit(
+            f"{label}: one net carries several names on the same page — "
+            f"{', '.join(top)}. A net has one name; rename all but one in "
+            f"KiCad, then convert.")
+    for depth, n in sorted(names):
+        if depth != best and n != top[0]:
+            log(f"{label}: net {top[0]!r} is also labelled {n!r} on a flattened "
+                f"sheet — that name is lost, the parent's is kept")
+    return top[0]
+
+
+def read_sheet_pins(tree: sexpr.Node, page: Page) -> list:
+    """A sheet symbol's pins, as points on the PARENT page, with the file
+    each sheet names. Returns (point, pin name, sheet file, sheet node)."""
+    out = []
+    for sheet in sexpr.kids(tree, "sheet"):
+        filename = ""
+        for prop in sexpr.kids(sheet, "property"):
+            atoms = sexpr.atoms(prop)
+            if len(atoms) > 1 and str(atoms[0]) == "Sheetfile":
+                filename = str(atoms[1])
+        for pin in sexpr.kids(sheet, "pin"):
+            atoms = sexpr.atoms(pin)
+            if not atoms:
+                continue
+            x, y, _angle = page.at(pin)
+            out.append(((x, y), geo.unescape(str(atoms[0])), filename, sheet))
+    return out
+
+
+def read_hierarchical_ports(tree: sexpr.Node, page: Page) -> dict:
+    """The inside half of a sheet's interface: a hierarchical label
+    answers the sheet pin of the same name (conversion-kicad.md #схема —
+    "листовой вывод отвечает иерархической метке того же имени")."""
+    ports = {}
+    for node in sexpr.kids(tree, "hierarchical_label"):
+        atoms = sexpr.atoms(node)
+        if not atoms:
+            continue
+        x, y, _angle = page.at(node)
+        ports[geo.unescape(str(atoms[0]))] = (x, y)
+    return ports
+
+
 def build_nets(conn: Connectivity, labels: list, pins: list, parts: list,
-               log, label: str) -> list:
+               log, label: str, bridges: list | None = None) -> list:
     """Connected groups -> `<net>`s.
 
     Two names on one connected group is a refusal
@@ -479,18 +546,42 @@ def build_nets(conn: Connectivity, labels: list, pins: list, parts: list,
             if a.name.lower() == "value":
                 value_by_part[p.name] = a.value
 
-    for point, name, kind, node in labels:
+    for point, name, kind, node, depth in labels:
         group = group_of(point)
         if group is None:
             log(f"{label}: label {name!r} touches no wire — its net has no geometry, dropped")
             continue
-        group["names"].add(name)
+        # A hierarchical label is the INSIDE half of a sheet port, and a
+        # flattened sheet has no port left — so, like the sheet pin facing
+        # it, the name is only a candidate. What the author wrote on the
+        # wire itself is the name (`VPP/MCLR` here), and the interface
+        # name (`VPP-MCLR`) is what the two runs were joined by.
+        if kind == "hierarchical_label":
+            group.setdefault("port", name)
+        else:
+            group["names"].add((depth, name))
         height, align, mirror = geo.text_effects(node)
         _x_mm, _y_mm, angle = geo.at(node)
         group["labels"].append(Label(x=point[0], y=point[1], height=height or 1270,
                                      align=align, layer=LAYER_NETS,
                                      style=_label_style(kind, node),
                                      rot=round(angle * 1000) % 360000, mirror=mirror))
+
+    # line.md #провод-нулевой-длины: KiCad joins pins by ABUTMENT — a
+    # supply symbol set straight against a capacitor's lead, with no wire
+    # between them. The IR has no "connected by nothing": a connection is
+    # always a wire, and this one's length is zero. Without it the whole
+    # net would vanish, since a segment must carry a wire (segment.md).
+    at_point: dict = {}
+    for point, _designator, _pin, _gate in pins:
+        at_point.setdefault(point, 0)
+        at_point[point] += 1
+    for point, count in at_point.items():
+        if count < 2 or conn.find(point) in groups:
+            continue
+        groups[conn.find(point)] = {
+            "lines": [Line(point[0], point[1], point[0], point[1], 0, LAYER_NETS)],
+            "labels": [], "pinrefs": [], "names": set(), "supply": []}
 
     for point, designator, pin, gate in pins:
         group = group_of(point)
@@ -504,21 +595,63 @@ def build_nets(conn: Connectivity, labels: list, pins: list, parts: list,
             if supply:
                 group["supply"].append(supply)
 
+    # A flattened sheet's own wires are a separate connected piece — the
+    # sheet boundary is not geometry. What joins them is the interface:
+    # a sheet pin on the parent and the hierarchical label of the same
+    # name inside. Those two pieces are ONE net with two segments, so the
+    # join is made between GROUPS, never between points: merging points
+    # would put wires from two pages into one segment, and a segment is a
+    # connected run (segment.md).
+    logical: dict = {}
+
+    def lfind(key):
+        logical.setdefault(key, key)
+        while logical[key] != key:
+            key = logical[key]
+        return key
+
+    for point_a, point_b, port in bridges or ():
+        ga, gb = conn.find(point_a), conn.find(point_b)
+        if ga not in groups or gb not in groups:
+            log(f"{label}: sheet port {port!r} has no wire on one side — not joined")
+            continue
+        ra, rb = lfind(ga), lfind(gb)
+        if ra != rb:
+            logical[ra] = rb
+
+    # The port's own name is WEAK. A flattened sheet has no boundary left,
+    # so its pin is not a module pin any more — it is just where two runs
+    # of one net met. A real name on either side (a label, a supply
+    # symbol) is what the author wrote, and it wins; the port name is used
+    # only when the net would otherwise have none.
+    weak: dict = {}
+    for point_a, _point_b, port in bridges or ():
+        weak.setdefault(lfind(conn.find(point_a)), port)
+
+    merged: dict = {}
+    for root, group in groups.items():
+        merged.setdefault(lfind(root), []).append(group)
+
     nets: dict[str, list] = {}
     auto = 0
-    for root, group in groups.items():
-        names = set(group["supply"]) | group["names"]
-        if len(names) > 1:
-            raise SystemExit(
-                f"{label}: one connected net carries several names — "
-                f"{', '.join(sorted(names))}. A net has one name; give the extra "
-                f"ones their own nets, or remove the labels that disagree.")
-        if names:
-            name = names.pop()
-        else:
-            auto += 1
-            name = f"N${auto}"
-        nets.setdefault(name, []).append(group)
+    for root, members in merged.items():
+        group = {"lines": [], "labels": [], "pinrefs": [], "names": set(), "supply": []}
+        for g in members:
+            group["names"] |= g["names"]
+            group["supply"] += g["supply"]
+            if "port" in g:
+                weak.setdefault(root, g["port"])
+        # A supply symbol names its net wherever it sits, so it counts as
+        # a top-level name. Local labels carry the depth of their page.
+        names = {(0, n) for n in group["supply"]} | group["names"]
+        name = _pick_name(names, log, label)
+        if name is None:
+            if root in weak:
+                name = weak[root]
+            else:
+                auto += 1
+                name = f"N${auto}"
+        nets.setdefault(name, []).extend(members)
 
     out = []
     for name, members in nets.items():
