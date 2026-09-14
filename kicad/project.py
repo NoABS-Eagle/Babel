@@ -369,11 +369,23 @@ def import_project(path: Path):
     schematic = build_schematic(source, components, symbols, log)
     layout = board_conv.convert_board(source.board, source.name,
                                        {n.name for n in schematic.nets}, log,
-                                       _net_by_pad(schematic, components))
+                                       _net_by_pad(schematic, components),
+                                       source.settings)
     log(f"{source.name}: {len(source.sheets)} page(s), {len(schematic.parts)} parts, "
         f"{len(schematic.nets)} nets, {len(components)} components, "
         f"{len(footprints)} footprints; board: {len(layout.elements)} elements, "
         f"{len(layout.signals)} signals, stack {layout.stack}")
+    # class.md: the pool is the project's, and a net names its class by a
+    # `class` attr. KiCad states membership by name patterns instead.
+    classes = board_conv.read_classes(source.settings, log, source.name)
+    known = {c.name for c in classes}
+    membership = board_conv.class_membership(
+        source.settings, [n.name for n in schematic.nets], log, source.name)
+    for net in schematic.nets:
+        chosen = membership.get(net.name)
+        if chosen in known:
+            net.attrs.append(Attr("class", chosen))
+
     return Project(name=source.name, version=(1, 0), schematic=schematic,
                    symbols=symbols, footprints=footprints,
-                   components=components, layouts=[layout])
+                   components=components, classes=classes, layouts=[layout])

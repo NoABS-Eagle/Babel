@@ -341,7 +341,7 @@ def net_translation(board: sexpr.Node, net_by_pad: dict, log, label: str) -> dic
 
 
 def convert_board(board: sexpr.Node, name: str, schematic_nets: set, log,
-                  net_by_pad: dict | None = None) -> Layout:
+                  net_by_pad: dict | None = None, settings: dict | None = None) -> Layout:
     """The whole board. Net names come from the SCHEMATIC: KiCad's own
     auto-names (`Net-(R1-Pad2)`, `unconnected-…`) are generated afresh on
     each side and state nothing (conversion-kicad.md #плата)."""
@@ -422,7 +422,8 @@ def convert_board(board: sexpr.Node, name: str, schematic_nets: set, log,
                     signal_of(resolve(net_name)).copper.append(polygon)
 
     return Layout(name=name, stack=stack, elements=elements,
-                  signals=list(signals.values()), graphics=graphics, holes=holes)
+                  signals=list(signals.values()), graphics=graphics, holes=holes,
+                  rules=read_rules(settings or {}, log, label))
 
 
 def _zone_vertices(zone: sexpr.Node, space: Space) -> list[tuple[float, float, float]]:
@@ -578,3 +579,107 @@ def _rule_area(zone, keepout, verts, numbers, copper, log, label) -> list:
     shape = [Vertex(round(x), round(y), None) for x, y, _c in verts]
     return [(Polygon(-abs(n) if n < 0 else n, 0, list(shape), fill=100, anti=True), None)
             for n in on_copper]
+
+
+# conversion-kicad.md #плата: the six numbers a fab floor states, and
+# where each of them lives in a KiCad project.
+_RULE_KEYS = {
+    "edge_clearance": "min_copper_edge_clearance",
+    "min_drill": "min_through_hole_diameter",
+    "min_annular": "min_via_annular_width",
+    "min_drill_web": "min_hole_to_hole",
+}
+
+
+def read_rules(settings: dict, log, label: str):
+    """rules.md's six numbers, out of the project's design settings.
+
+    Two of them are taken as the LARGER of the fab minimum and the
+    `Default` class's own value. KiCad keeps the floor in `min_*`, but
+    those are filled in rarely — in live projects `min_clearance` is
+    often 0 while the working 0.15–0.2 sits in the class. Since the
+    `Default` class itself is not carried (its role in the IR is a net
+    having no class at all), reading only `min_*` would silently open the
+    whole board up to zero.
+
+    A zero in KiCad means "do not check", and then the attribute is not
+    written at all: absent is "unset", not nought (rules.md)."""
+    from ir.rules import Rules
+
+    design = (settings.get("board") or {}).get("design_settings") or {}
+    raw = design.get("rules") or {}
+    classes = ((settings.get("net_settings") or {}).get("classes") or [])
+    default = next((c for c in classes if c.get("name") == "Default"), {})
+
+    def number(value) -> int:
+        try:
+            return geo.um(value)
+        except (TypeError, ValueError):
+            return 0
+
+    values = {name: number(raw.get(key)) for name, key in _RULE_KEYS.items()}
+    values["clearance"] = max(number(raw.get("min_clearance")),
+                              number(default.get("clearance")))
+    values["min_width"] = max(number(raw.get("min_track_width")),
+                              number(default.get("track_width")))
+    kept = {k: v for k, v in values.items() if v > 0}
+    dropped = sorted(set(values) - set(kept))
+    if dropped:
+        log(f"{label}: no floor stated for {', '.join(dropped)} — left unset "
+            f"(a zero in KiCad means 'do not check')")
+    return Rules(**kept) if kept else None
+
+
+def read_classes(settings: dict, log, label: str) -> list:
+    """class.md's three numbers per class. The `Default` class is not
+    carried: in the IR its role is played by a net naming no class."""
+    from ir.class_ import Class
+
+    out = []
+    for entry in ((settings.get("net_settings") or {}).get("classes") or []):
+        name = str(entry.get("name") or "")
+        if not name or name == "Default":
+            continue
+        def number(key):
+            value = entry.get(key)
+            return geo.um(value) if isinstance(value, (int, float)) and value else None
+        out.append(Class(name=name, width=number("track_width"),
+                          clearance=number("clearance"), drill=number("via_drill")))
+    return out
+
+
+def class_membership(settings: dict, net_names, log, label: str) -> dict:
+    """Which class each net belongs to.
+
+    KiCad states membership by NAME PATTERNS, and one net can match
+    several. class.md gives a net one class, and there is no priority
+    aggregation to lean on — so the alphabetically first is kept and the
+    case goes to the log, exactly as the Altium path does."""
+    import fnmatch
+
+    patterns = ((settings.get("net_settings") or {}).get("netclass_patterns") or [])
+    assignments = ((settings.get("net_settings") or {}).get("netclass_assignments") or {})
+    matched: dict[str, set] = {}
+    for entry in patterns:
+        klass = str(entry.get("netclass") or "")
+        pattern = str(entry.get("pattern") or "")
+        if not klass or klass == "Default" or not pattern:
+            continue
+        # A pattern speaks in the board's own names, which carry the sheet
+        # path; the IR's names do not.
+        bare = pattern.lstrip("/")
+        for net in net_names:
+            if fnmatch.fnmatchcase(net, bare) or fnmatch.fnmatchcase("/" + net, pattern):
+                matched.setdefault(net, set()).add(klass)
+    for net, klass in assignments.items():
+        if klass and klass != "Default":
+            matched.setdefault(geo.unescape(str(net)).lstrip("/"), set()).add(str(klass))
+
+    out = {}
+    for net, classes in matched.items():
+        chosen = sorted(classes)[0]
+        if len(classes) > 1:
+            log(f"{label}: net {net!r} matches {len(classes)} classes "
+                f"({', '.join(sorted(classes))}) — {chosen!r} is kept, a net has one")
+        out[net] = chosen
+    return out
