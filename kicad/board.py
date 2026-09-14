@@ -509,10 +509,18 @@ def convert_zone(zone: sexpr.Node, space: Space, copper: dict, log, label: str) 
     thickness = sexpr.kid(zone, "min_thickness")
     width = geo.um(sexpr.atoms(thickness)[0]) if thickness else 0
     if width <= 0:
-        raise SystemExit(
-            f"{label}: a zone states min_thickness 0 — the pen's width cannot "
-            f"be recovered from it (polygon.md). Give it a width in KiCad and "
-            f"save again.")
+        # **Zero is a real width, not a missing one.** KiCad's own default
+        # for NEW zones lives in the project (`defaults.zones`), and it is
+        # not applied to a zone that states zero: `pcbnew` reads the zero
+        # back as zero, and the fill comes out larger and simpler than the
+        # same zone with a width — 10630.681 mm² over 40 points against
+        # 10619.574 over 49. So the copper runs exactly along the outline,
+        # which is a pen of no width at all: the centre line IS the
+        # outline, and nothing needs pulling in.
+        log(f"{label}: a zone states min_thickness 0 — its copper runs along "
+            f"the outline itself, carried as a polygon of zero width")
+        centre = [Vertex(round(x), round(y), None) for x, y, _c in verts]
+        return _zone_polygons(zone, centre, 0, numbers, log, label)
 
     try:
         edges = pen.offset_contour(verts, width / 2, inward=True)
@@ -526,6 +534,10 @@ def convert_zone(zone: sexpr.Node, space: Space, copper: dict, log, label: str) 
         log(f"{label}: a zone collapses when pulled in by half its pen — dropped")
         return []
 
+    return _zone_polygons(zone, centre, width, numbers, log, label)
+
+
+def _zone_polygons(zone, centre, width: int, numbers: list, log, label: str) -> list:
     net = sexpr.kid(zone, "net")
     net_names = [a for a in (sexpr.atoms(net) if net else []) if isinstance(a, str)]
     net_name = geo.unescape(net_names[0]) if net_names else ""
@@ -534,10 +546,8 @@ def convert_zone(zone: sexpr.Node, space: Space, copper: dict, log, label: str) 
     clearance = geo.um(sexpr.atoms(clearance_node)[0]) if clearance_node else 0
     fill = _hatch_fill(zone)
 
-    out = []
-    for number in numbers:
-        out.append((Polygon(number, width, list(centre), fill=fill,
-                            clearance=clearance), net_name))
+    out = [(Polygon(number, width, list(centre), fill=fill, clearance=clearance),
+            net_name) for number in numbers]
     if len(numbers) > 1:
         log(f"{label}: zone {net_name!r} is poured on {len(numbers)} layers — "
             f"one polygon each, since the pen model states one layer per outline")
