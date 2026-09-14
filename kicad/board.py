@@ -17,6 +17,7 @@ from ir.attr import Attr
 from ir.contactref import ContactRef
 from ir.element import Element, Side
 from ir.graphics import Arc, Line, Polygon, Shape, Text, Vertex
+from ir import pen
 from ir.layout import Layout
 from ir.signal import Signal
 from ir.via import Via
@@ -414,11 +415,156 @@ def convert_board(board: sexpr.Node, name: str, schematic_nets: set, log,
             if via is not None:
                 signal_of(resolve(net_name)).copper.append(via)
         elif tag == "zone":
-            # The zone outline is the edge of the copper, and the IR keeps
-            # the pen's centre line (polygon.md) — the inverse offset is
-            # its own piece of work, not yet done here.
-            log(f"{label}: a zone is not carried yet — its copper is missing "
-                f"from the result")
+            for polygon, net_name in convert_zone(child, space, copper, log, label):
+                if net_name is None:
+                    graphics.append(polygon)
+                else:
+                    signal_of(resolve(net_name)).copper.append(polygon)
 
     return Layout(name=name, stack=stack, elements=elements,
                   signals=list(signals.values()), graphics=graphics, holes=holes)
+
+
+def _zone_vertices(zone: sexpr.Node, space: Space) -> list[tuple[float, float, float]]:
+    pts = sexpr.kid(sexpr.kid(zone, "polygon") or [], "pts")
+    verts = []
+    for node in sexpr.kids(pts, "xy") if pts else []:
+        a = sexpr.atoms(node)
+        verts.append((float(space.x(a[0])), float(space.y(a[1])), 0.0))
+    deduped = [v for i, v in enumerate(verts)
+               if i == 0 or (v[0], v[1]) != (verts[i - 1][0], verts[i - 1][1])]
+    if len(deduped) > 2 and (deduped[0][0], deduped[0][1]) == (deduped[-1][0], deduped[-1][1]):
+        del deduped[-1]
+    return deduped
+
+
+def _edges_to_vertices(edges) -> list[Vertex]:
+    return [Vertex(round(x1), round(y1), round(curve * 1000) or None)
+            for _kind, x1, y1, _x2, _y2, curve in edges]
+
+
+def _hatch_fill(zone: sexpr.Node) -> int:
+    """polygon.md's `fill` percentage, out of KiCad's hatch pair.
+
+    A hatched zone states a stroke thickness and the gap between strokes;
+    the percentage is how much of the area the copper covers."""
+    hatch = sexpr.kid(zone, "fill")
+    mode = sexpr.kid(hatch, "mode") if hatch else None
+    if mode is None or str(sexpr.atoms(mode)[0]) != "hatch":
+        return 100
+    thickness = sexpr.kid(hatch, "hatch_thickness")
+    gap = sexpr.kid(hatch, "hatch_gap")
+    if thickness is None or gap is None:
+        return 100
+    t = float(sexpr.atoms(thickness)[0])
+    g = float(sexpr.atoms(gap)[0])
+    if t + g <= 0:
+        return 100
+    return max(1, min(99, round(100 * t / (t + g))))
+
+
+def convert_zone(zone: sexpr.Node, space: Space, copper: dict, log, label: str) -> list:
+    """One `(zone …)` -> polygons, one per layer it covers.
+
+    Three different things wear this tag in KiCad, and they part ways here:
+
+      - a TEARDROP is dropped. The IR has no place for one and no reason
+        to (project decision), and it is not geometry the author drew.
+      - a RULE AREA that forbids the pour is the IR's own subtraction: it
+        goes to `!N` of its own layer, and its outline is NOT shrunk —
+        a rule area has no pen, its border IS the border of the ban.
+      - an ordinary zone keeps the pen's centre line, so its outline —
+        which in KiCad is the edge of the copper — is pulled in by half
+        of `min_thickness`.
+    """
+    attr = sexpr.kid(zone, "attr")
+    if attr is not None and sexpr.kid(attr, "teardrop") is not None:
+        log(f"{label}: a teardrop zone is not carried — the IR has no teardrops")
+        return []
+
+    layers_node = sexpr.kid(zone, "layers") or sexpr.kid(zone, "layer")
+    names = [str(a) for a in sexpr.atoms(layers_node)] if layers_node else []
+    numbers = []
+    for name in names:
+        if name in copper:
+            numbers.append(copper[name])
+        elif name in ("*.Cu", "F&B.Cu"):
+            numbers += sorted(copper.values(), key=abs)
+        else:
+            number = ir_layer(name)
+            if number is None:
+                log(f"{label}: zone on layer {name!r}, which the table does not "
+                    f"carry — dropped")
+            else:
+                numbers.append(number)
+    verts = _zone_vertices(zone, space)
+    if len(verts) < 3 or not numbers:
+        log(f"{label}: a zone has no outline or no layer — dropped")
+        return []
+
+    keepout = sexpr.kid(zone, "keepout")
+    if keepout is not None:
+        return _rule_area(zone, keepout, verts, numbers, copper, log, label)
+
+    thickness = sexpr.kid(zone, "min_thickness")
+    width = geo.um(sexpr.atoms(thickness)[0]) if thickness else 0
+    if width <= 0:
+        raise SystemExit(
+            f"{label}: a zone states min_thickness 0 — the pen's width cannot "
+            f"be recovered from it (polygon.md). Give it a width in KiCad and "
+            f"save again.")
+
+    try:
+        edges = pen.offset_contour(verts, width / 2, inward=True)
+    except ValueError as exc:
+        log(f"{label}: zone outline does not shrink by half its pen ({exc}) — "
+            f"the centre line is used as drawn, so its copper comes out wider")
+        centre = [Vertex(round(x), round(y), None) for x, y, _c in verts]
+    else:
+        centre = _edges_to_vertices(edges)
+    if len(centre) < 3:
+        log(f"{label}: a zone collapses when pulled in by half its pen — dropped")
+        return []
+
+    net = sexpr.kid(zone, "net")
+    net_names = [a for a in (sexpr.atoms(net) if net else []) if isinstance(a, str)]
+    net_name = geo.unescape(net_names[0]) if net_names else ""
+    connect = sexpr.kid(zone, "connect_pads")
+    clearance_node = sexpr.kid(connect, "clearance") if connect else None
+    clearance = geo.um(sexpr.atoms(clearance_node)[0]) if clearance_node else 0
+    fill = _hatch_fill(zone)
+
+    out = []
+    for number in numbers:
+        out.append((Polygon(number, width, list(centre), fill=fill,
+                            clearance=clearance), net_name))
+    if len(numbers) > 1:
+        log(f"{label}: zone {net_name!r} is poured on {len(numbers)} layers — "
+            f"one polygon each, since the pen model states one layer per outline")
+    return out
+
+
+def _rule_area(zone, keepout, verts, numbers, copper, log, label) -> list:
+    """A Rule Area, as far as the IR expresses one: the ban on pouring."""
+    pour = sexpr.kid(keepout, "copperpour")
+    forbids_pour = bool(pour) and str(sexpr.atoms(pour)[0]) == "not_allowed"
+    others = [str(sexpr.atoms(sexpr.kid(keepout, k))[0]) for k in
+              ("tracks", "vias", "pads", "footprints")
+              if sexpr.kid(keepout, k) is not None]
+    if not forbids_pour:
+        log(f"{label}: a rule area that does not forbid the pour carries no "
+            f"subtraction — dropped (the IR's anti-layer only subtracts)")
+        return []
+    if any(v == "not_allowed" for v in others):
+        log(f"{label}: a rule area also forbids tracks/vias/pads — only the "
+            f"pour ban travels, the rest is lost")
+    on_copper = [n for n in numbers if abs(n) < 100]
+    if not on_copper:
+        log(f"{label}: a rule area outside copper has nothing to subtract from "
+            f"— dropped")
+        return []
+    # The outline is NOT shrunk and the width is zero: a rule area has no
+    # pen, and on an anti-layer the width is ignored anyway (polygon.md).
+    shape = [Vertex(round(x), round(y), None) for x, y, _c in verts]
+    return [(Polygon(-abs(n) if n < 0 else n, 0, list(shape), fill=100, anti=True), None)
+            for n in on_copper]
