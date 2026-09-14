@@ -347,7 +347,7 @@ def _sheet_name(source: Source, path: Path) -> str:
     return path.stem
 
 
-def import_project(path: Path):
+def import_project(path: Path, out_dir: Path | None = None):
     source = read_source(path)
     symbols, components, pin_pads = library_conv.convert_libraries(
         list(source.sheets.values()), log)
@@ -365,6 +365,29 @@ def import_project(path: Path):
             # library, so a footprint named from two libraries is filed in
             # both — one object each, since each carries its library.
             footprints.append(replace(reference, library=library))
+
+    # model3d.md does not store a model's file name — it follows from the
+    # footprint's. So an embedded file is written out under the name of
+    # the footprint that uses it, beside the result.
+    payloads = board_conv.embedded_files(source.board, log, source.name)
+    models = board_conv.read_models(source.board, log, source.name)
+    models_dir = (out_dir or Path("output")) / source.name
+    written = 0
+    for footprint in footprints:
+        for file_path, model in models.get(footprint.name, []):
+            footprint.models.append(model)
+            data = payloads.get(file_path.rsplit("/", 1)[-1])
+            if data is None:
+                log(f"{source.name}: {footprint.name} names 3D model "
+                    f"{file_path!r}, which is not embedded in the board — "
+                    f"the model does not travel")
+                continue
+            suffix = Path(file_path).suffix or ".step"
+            models_dir.mkdir(parents=True, exist_ok=True)
+            (models_dir / f"{footprint.name}{suffix}").write_bytes(data)
+            written += 1
+    if written:
+        log(f"{source.name}: {written} 3D model(s) written to {models_dir}")
 
     schematic = build_schematic(source, components, symbols, log)
     layout = board_conv.convert_board(source.board, source.name,

@@ -93,3 +93,30 @@ class Model3D:
             b = 90.0 if r20 < 0 else -90.0
             g = math.degrees(math.atan2(-r01, r11))
         return a, b, g
+
+
+def from_dialog_rotation(a: float, b: float, g: float) -> tuple[int, int, int]:
+    """Dialog angles (`Rz·Ry·Rx`, degrees) -> the IR's own `rx`/`ry`/`rz`
+    in mdeg — the exact inverse of `Model3D.dialog_rotation`.
+
+    Every importer needs it for the same reason the exporter needs the
+    forward one: KiCad and Altium describe an orientation as `Rz·Ry·Rx`
+    while model3d.md composes it as intrinsic `Rx·Ry·Rz`, and the three
+    numbers cannot be handed over axis by axis."""
+    ra, rb, rg = (math.radians(v) for v in (a, b, g))
+    ca, sa = math.cos(ra), math.sin(ra)
+    cb, sb = math.cos(rb), math.sin(rb)
+    cg, sg = math.cos(rg), math.sin(rg)
+    # R = Rz(g) @ Ry(b) @ Rx(a), row-major — the cells the decomposition
+    # below reads.
+    r00 = cg * cb
+    r01 = -sg * ca + cg * sb * sa
+    r02 = sg * sa + cg * sb * ca
+    r12 = -cg * sa + sg * sb * ca
+    r22 = cb * ca
+    # ...decomposed as R = Rx(ex) @ Ry(ey) @ Rz(ez), where R[0][2] = sin ey.
+    ey = math.degrees(math.asin(max(-1.0, min(1.0, r02))))
+    ex = math.degrees(math.atan2(-r12, r22))
+    ez = math.degrees(math.atan2(-r01, r00))
+    return (round(ex * 1000) % 360000, round(ey * 1000) % 360000,
+            round(ez * 1000) % 360000)

@@ -683,3 +683,81 @@ def class_membership(settings: dict, net_names, log, label: str) -> dict:
                 f"({', '.join(sorted(classes))}) — {chosen!r} is kept, a net has one")
         out[net] = chosen
     return out
+
+
+def embedded_files(board: sexpr.Node, log, label: str) -> dict[str, bytes]:
+    """The 3D models KiCad carries inside the board, unpacked.
+
+    conversion-kicad.md #что-приготовить requires them embedded, since a
+    `${KICAD6_3DMODEL_DIR}/…` path does not resolve on another machine.
+    The payload is base64 over zstd, split into `|…|` chunks.
+
+    zstd is not in the standard library, and Babel has no dependencies of
+    its own — so this is a SOFT requirement: without the module the models
+    simply do not travel, which the same page already allows (models are
+    the one precondition whose failure is not a refusal)."""
+    node = sexpr.kid(board, "embedded_files")
+    files = sexpr.kids(node, "file") if node else []
+    if not files:
+        return {}
+    try:
+        import zstandard
+    except ImportError:
+        log(f"{label}: {len(files)} embedded 3D model(s) cannot be unpacked — "
+            f"the `zstandard` module is not installed; everything else is "
+            f"carried, the models are not")
+        return {}
+
+    import base64
+
+    out: dict[str, bytes] = {}
+    decompressor = zstandard.ZstdDecompressor()
+    for entry in files:
+        name_node = sexpr.kid(entry, "name")
+        data_node = sexpr.kid(entry, "data")
+        if name_node is None or data_node is None:
+            continue
+        name = str(sexpr.atoms(name_node)[0])
+        blob = "".join(str(a) for a in sexpr.atoms(data_node)).replace("|", "")
+        try:
+            out[name] = decompressor.decompress(base64.b64decode(blob))
+        except Exception as exc:
+            log(f"{label}: embedded file {name!r} does not unpack ({exc}) — skipped")
+    return out
+
+
+def read_models(board: sexpr.Node, log, label: str) -> dict[str, list]:
+    """Footprint name -> its `<model3d>`s, as the board states them.
+
+    The model lives on the placed footprint in KiCad and on the FOOTPRINT
+    in the IR, so the board is where it has to be read from — and every
+    instance of one footprint says the same thing."""
+    from ir.model3d import Model3D, from_dialog_rotation
+
+    out: dict[str, list] = {}
+    for node in sexpr.kids(board, "footprint"):
+        atoms = sexpr.atoms(node)
+        if not atoms:
+            continue
+        name = str(atoms[0]).rsplit(":", 1)[-1]
+        if name in out:
+            continue
+        models = []
+        for model in sexpr.kids(node, "model"):
+            model_atoms = sexpr.atoms(model)
+            if not model_atoms:
+                continue
+            path = str(model_atoms[0])
+            offset = sexpr.atoms(sexpr.kid(sexpr.kid(model, "offset") or [], "xyz"))
+            rotate = sexpr.atoms(sexpr.kid(sexpr.kid(model, "rotate") or [], "xyz"))
+            # The offset passes through unchanged, Y included: it is stated
+            # in the MODEL's own frame, not in the footprint's Y-down one.
+            tx, ty, tz = (geo.um(v) for v in (list(offset) + [0, 0, 0])[:3])
+            # The file stores the NEGATION of what KiCad's own dialog
+            # shows, and the dialog speaks Rz·Ry·Rx (model3d.md).
+            a, b, g = ((-float(v)) for v in (list(rotate) + [0, 0, 0])[:3])
+            rx, ry, rz = from_dialog_rotation(a, b, g)
+            models.append((path, Model3D(tx=tx, ty=ty, tz=tz, rx=rx, ry=ry, rz=rz)))
+        if models:
+            out[name] = models
+    return out
