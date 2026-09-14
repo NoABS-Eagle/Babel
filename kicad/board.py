@@ -761,3 +761,16 @@ def read_models(board: sexpr.Node, log, label: str) -> dict[str, list]:
         if models:
             out[name] = models
     return out
+
+
+def note_unsupported_rules(project_dir, log, label: str) -> None:
+    """conversion-kicad.md #плата: a `.kicad_dru` states rules with an area
+    of effect, and the IR's DRC core is flat (rules.md) — there is nowhere
+    to put them. The file is not read; its presence is reported, because a
+    rule quietly not travelling is worse than one reported missing."""
+    from pathlib import Path
+
+    for path in sorted(Path(project_dir).glob("*.kicad_dru")):
+        log(f"{label}: {path.name} states custom design rules, which do not "
+            f"travel — the IR's DRC core is flat, with no areas of effect. "
+            f"Re-state what that file required.")

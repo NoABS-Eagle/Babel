@@ -390,6 +390,7 @@ def import_project(path: Path, out_dir: Path | None = None):
         log(f"{source.name}: {written} 3D model(s) written to {models_dir}")
 
     schematic = build_schematic(source, components, symbols, log)
+    board_conv.note_unsupported_rules(source.pro_path.parent, log, source.name)
     layout = board_conv.convert_board(source.board, source.name,
                                        {n.name for n in schematic.nets}, log,
                                        _net_by_pad(schematic, components),
