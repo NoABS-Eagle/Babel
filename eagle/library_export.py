@@ -270,17 +270,31 @@ def write_component(el_parent: ET.Element, c, symbols_by_key, values_by_componen
                 techs_el = ET.SubElement(dev_el, "technologies")
                 tech_el = ET.SubElement(techs_el, "technology", name="")
                 ET.SubElement(tech_el, "attribute", name="VALUE", value=value, constant="no")
+                _write_component_attrs(tech_el, c)
         else:
-            ET.SubElement(devices_el, "device", name="")
+            dev_el = ET.SubElement(devices_el, "device", name="")
+            # **A component with no device still gets one here**, because
+            # in Eagle you never place a SYMBOL — you place a device, and a
+            # supply symbol is a device too, just without a package. So the
+            # family's own attributes have somewhere to go after all.
+            if c.attrs:
+                techs_el = ET.SubElement(dev_el, "technologies")
+                tech_el = ET.SubElement(techs_el, "technology", name="")
+                _write_component_attrs(tech_el, c)
     for d in c.devices:
         devices_el.append(write_device(d, log))
-    if c.attrs:
-        # Ground-truthed against all 5 test projects: no real <deviceset>
-        # ever carries a direct <attribute> — Eagle has no family-level
-        # attribute slot at all, only per-device/per-technology ones.
-        log(f"deviceset {c.name!r}: {len(c.attrs)} component-level attr(s) have no Eagle "
-            f"equivalent (only device/technology attributes exist there) — dropped")
     return ds_el
+
+
+def _write_component_attrs(tech_el: ET.Element, c) -> None:
+    """The component's own attributes, onto a synthesized device.
+
+    Eagle has no family-level attribute slot — ground-truthed across all
+    five test projects, no real `<deviceset>` carries a direct
+    `<attribute>`. But every deviceset has at least one device, and a
+    device does have the slot, so nothing needs to be lost."""
+    for a in c.attrs:
+        ET.SubElement(tech_el, "attribute", name=a.name, value=a.value)
 
 
 def write_library(el_parent: ET.Element, name: str, symbols, footprints, components, log,
