@@ -24,7 +24,7 @@ from ir.via import Via
 
 from . import geometry as geo
 from . import sexpr
-from .layers import ir_layer
+from .layers import ir_layer, kicad_layer
 
 # Copper as KiCad numbers it: F.Cu is 0, B.Cu the last. The IR numbers
 # copper from the stack instead (1 is the top, -1 the bottom), so the
@@ -421,9 +421,15 @@ def convert_board(board: sexpr.Node, name: str, schematic_nets: set, log,
                 else:
                     signal_of(resolve(net_name)).copper.append(polygon)
 
+    used = {g.layer for g in graphics if getattr(g, "layer", None) is not None}
+    used |= {c.layer for s in signals.values() for c in s.copper
+             if getattr(c, "layer", None) is not None}
+    mask, paste = read_expansions(board, log, label)
     return Layout(name=name, stack=stack, elements=elements,
                   signals=list(signals.values()), graphics=graphics, holes=holes,
-                  rules=read_rules(settings or {}, log, label))
+                  rules=read_rules(settings or {}, log, label),
+                  layers=declare_layers(board, used, copper, log, label),
+                  mask_expansion=mask, paste_expansion=paste)
 
 
 def _zone_vertices(zone: sexpr.Node, space: Space) -> list[tuple[float, float, float]]:
@@ -774,3 +780,67 @@ def note_unsupported_rules(project_dir, log, label: str) -> None:
         log(f"{label}: {path.name} states custom design rules, which do not "
             f"travel — the IR's DRC core is flat, with no areas of effect. "
             f"Re-state what that file required.")
+
+
+# layer-model.md fixes the meaning of the canonical numbers, so naming
+# those again would only repeat the format at itself. Everything outside
+# the set arrives NAMED, the way KiCad spells it — `147` on its own says
+# nothing, `147 Eco1` says where it came from.
+_CANONICAL_LAYERS = {120, 121, 123, 125, 127, 129, 131, 135, 139, 151}
+
+
+def declare_layers(board: sexpr.Node, used: set, copper: dict, log, label: str) -> list:
+    """conversion-kicad.md #слои: the name travels with the number.
+
+    Only layers the result actually uses are declared, and only those
+    whose number is not already self-explanatory."""
+    from ir.layer_declaration import LayerDeclaration
+
+    by_number: dict[int, str] = {}
+    layers = sexpr.kid(board, "layers")
+    for child in (layers[1:] if layers else []):
+        if not isinstance(child, list):
+            continue
+        atoms = sexpr.atoms(child)
+        if not atoms:
+            continue
+        name = str(atoms[0])
+        if name in copper:
+            continue
+        number = ir_layer(name)
+        if number is None:
+            continue
+        # `F.`-named layers are a pair sharing one row, and the sign of
+        # the IR number picks the side — so each side is named apart.
+        by_number.setdefault(number, name)
+
+    out = []
+    for number in sorted(used, key=lambda n: (abs(n), n)):
+        if abs(number) in _CANONICAL_LAYERS:
+            continue
+        # The board's own `(layers …)` lists only the layers the project
+        # has switched ON — `Eco1` and `Dwgs.User` are simply absent from
+        # a board that does not use them — so the name comes from the
+        # table, and the board only refines it when it does say something.
+        name = by_number.get(number) or kicad_layer(number, lambda *_a: None, "")
+        if name is None:
+            continue
+        out.append(LayerDeclaration(number=number, name=name))
+    if out:
+        log(f"{label}: {len(out)} layer(s) outside the canonical set carry their "
+            f"KiCad name — {', '.join(f'{d.number} {d.name}' for d in out)}")
+    return out
+
+
+def read_expansions(board: sexpr.Node, log, label: str) -> tuple[int, int]:
+    """layout.md's `mask_expansion` / `paste_expansion`, out of the board's
+    own setup. KiCad states them as a clearance around the pad, which is
+    the same quantity under another name."""
+    setup = sexpr.kid(board, "setup")
+    if setup is None:
+        return 50, 0
+    def value(key: str, default: int) -> int:
+        node = sexpr.kid(setup, key)
+        atoms = sexpr.atoms(node) if node else []
+        return geo.um(atoms[0]) if atoms else default
+    return value("pad_to_mask_clearance", 50), value("pad_to_paste_clearance", 0)
