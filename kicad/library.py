@@ -538,8 +538,17 @@ def attach_devices(components: list[Component], pin_pads: dict,
             # number in its place would say strictly less.
             suffix = f"-{bare}" if len(names) > 1 else ""
             maps = _build_maps(gates, reference, lib_id, full, log)
-            devices.append(Device(footprint=bare, name=suffix, maps=maps))
+            devices.append(Device(footprint=bare, name=suffix, maps=maps,
+                                   attrs=[Attr(a.name, a.value) for a in component.attrs]))
         component.devices.extend(devices)
+        if devices:
+            # The symbol's own fields belong to the LIBRARY definition, and
+            # the library definition is the DEVICE — that is the thing a
+            # part is placed from. They are copied onto each device of the
+            # family (device.md: a device inherits the component's fields),
+            # rather than left one storey up where Eagle, which has no
+            # family-level attribute at all, could not follow them.
+            component.attrs.clear()
     return filed
 
 
